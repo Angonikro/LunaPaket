@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.32"
+VERSION="0.1.33"
 
 def privileged(args):
     """Führt Systembefehle direkt aus, wenn LunaPaket als root läuft."""
@@ -146,10 +146,40 @@ class Window(QMainWindow):
         b=QPushButton("Suchen"); b.clicked.connect(self.search_pkgs); bar.addWidget(b); l.addLayout(bar)
         self.table=QTableWidget(0,5); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QAbstractItemView.AllEditTriggers); self.table.setSortingEnabled(False); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.sortItems(1, Qt.AscendingOrder); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.itemSelectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); l.addWidget(self.table,4)
         row=QHBoxLayout()
-        for label,fn in [("Installieren",self.install_action),("Entfernen",self.remove_action),("Vormerkung löschen",self.clear_queue)]:
-            b=QPushButton(label); b.clicked.connect(fn); row.addWidget(b)
+        clear_queue_btn=QPushButton("Vormerkung löschen")
+        clear_queue_btn.clicked.connect(self.clear_queue)
+        row.addWidget(clear_queue_btn)
+        apply_queue_btn=QPushButton("Vorgemerkte Änderungen anwenden")
+        apply_queue_btn.clicked.connect(self.apply_queued_changes)
+        row.addWidget(apply_queue_btn)
         l.addLayout(row); self.details=QTextEdit(); self.details.setReadOnly(True); self.details.setMaximumHeight(170); l.addWidget(self.details,1)
         self.queue_label=QLabel("Keine vorgemerkten Änderungen"); l.addWidget(self.queue_label); self.status=QLabel("Bereit"); l.addWidget(self.status)
+        # Hauptmenü „Datei“ mit den wichtigsten Datei- und Programmaktionen.
+        file_menu = self.menuBar().addMenu("Datei")
+
+        open_deb_action = QAction("DEB-Pakete öffnen …", self)
+        open_deb_action.setShortcut("Ctrl+O")
+        open_deb_action.setToolTip("Eine oder mehrere lokale Debian-Paketdateien auswählen und installieren")
+        open_deb_action.triggered.connect(lambda checked=False: self.install_local_deb())
+        file_menu.addAction(open_deb_action)
+
+        apply_queue_action = QAction("Vorgemerkte Änderungen anwenden", self)
+        apply_queue_action.setShortcut("Ctrl+Return")
+        apply_queue_action.setToolTip("Vorgemerkte Paketinstallationen und -entfernungen ausführen")
+        apply_queue_action.triggered.connect(self.apply_queued_changes)
+        file_menu.addAction(apply_queue_action)
+
+        refresh_action = QAction("Paketlisten aktualisieren", self)
+        refresh_action.setShortcut("Ctrl+R")
+        refresh_action.triggered.connect(self.update_lists)
+        file_menu.addAction(refresh_action)
+
+        file_menu.addSeparator()
+        exit_action = QAction("Beenden", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
         m=self.menuBar().addMenu("Paketquellen")
         manage_sources_action=QAction("Paketquellen verwalten …",self)
         manage_sources_action.triggered.connect(self.manage_sources)
@@ -162,10 +192,6 @@ class Window(QMainWindow):
         view_sources_action.triggered.connect(self.sources)
         m.addAction(view_sources_action)
         settings_menu=self.menuBar().addMenu("Einstellungen")
-        repo_settings_action=QAction("Paketquellen verwalten …",self)
-        repo_settings_action.triggered.connect(self.manage_sources)
-        settings_menu.addAction(repo_settings_action)
-        settings_menu.addSeparator()
         distribution_action = QAction("Distribution …", self)
         distribution_action.triggered.connect(self.distribution_settings)
         settings_menu.addAction(distribution_action)
@@ -658,10 +684,53 @@ class Window(QMainWindow):
         lay = QVBoxLayout(d); t = QTextEdit(); t.setReadOnly(True); t.setPlainText(out); lay.addWidget(t)
         bb = QDialogButtonBox(QDialogButtonBox.Close); bb.rejected.connect(d.reject); lay.addWidget(bb); d.exec()
 
+    def sync_queue_from_checkboxes(self):
+        """Gleicht die interne Vormerkliste vor dem Anwenden mit allen Checkboxen ab.
+
+        Dadurch gehen Klicks nicht verloren, falls Qt ein itemChanged-Signal
+        während eines Tabellen-Updates unterdrückt oder verzögert hat.
+        Spezielle Vormerkungen wie Purge, Neuinstallation, Versionswahl und
+        Versionssperren bleiben unverändert erhalten.
+        """
+        special_actions = {"reinstall", "purge", "hold", "unhold"}
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            name = item.data(Qt.UserRole)
+            if not name:
+                continue
+            current = self.queue.get(name)
+            if current in special_actions or (isinstance(current, str) and current.startswith("version:")):
+                continue
+
+            installed = bool(item.data(Qt.UserRole + 1))
+            checked = item.checkState() == Qt.Checked
+            if checked and not installed:
+                self.queue[name] = "install"
+            elif not checked and installed:
+                self.queue[name] = "remove"
+            else:
+                self.queue.pop(name, None)
+
+        self.update_queue_label()
+
+    def apply_queued_changes(self):
+        """Führt ausschließlich die ausdrücklich vorgemerkten Paketaktionen aus."""
+        self.sync_queue_from_checkboxes()
+        if not self.queue:
+            QMessageBox.information(
+                self,
+                "Vorgemerkte Änderungen",
+                "Es sind keine Änderungen vorgemerkt. Bitte Pakete zuerst über die Kontrollkästchen auswählen."
+            )
+            return
+        self.commit()
+
     def install_action(self):
+        # Kompatible interne Einzelaktion; die Hauptoberfläche verwendet
+        # ausschließlich apply_queued_changes().
         name = self.selected()
-        # Checkbox-Vormerkungen haben Vorrang; nicht versehentlich eine bereits
-        # vorgemerkte Entfernung in eine Installation umwandeln.
         if not self.queue and name:
             self.queue[name] = "install"
             self.update_queue_label()

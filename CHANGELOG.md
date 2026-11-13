@@ -1,5 +1,14 @@
 # Änderungsprotokoll
 
+## 0.1.33
+- Menüaktion „DEB-Pakete öffnen …“ korrigiert: Qt-Signalparameter wird nicht mehr versehentlich als Dateiliste an den Dateiauswahldialog übergeben.
+- Vormerkliste wird beim Anwenden nochmals aus sämtlichen Kontrollkästchen mit dem Installationsstatus abgeglichen; verhindert verlorene Checkbox-Klicks und berücksichtigt Installieren sowie Entfernen gemeinsam.
+- Hauptoberfläche vereinfacht: Einzelbuttons „Installieren“ und „Entfernen“ entfernt.
+- „Vormerkung löschen“ und „Vorgemerkte Änderungen anwenden“ bleiben als zentrale Aktionen erhalten.
+- Der Anwenden-Button führt ausschließlich bereits vorgemerkte Aktionen aus und markiert nicht unbeabsichtigt das aktuell ausgewählte Paket.
+- Eintrag „Paketquellen verwalten“ aus dem Menü „Einstellungen“ entfernt; die Verwaltung bleibt im eigenen Menü „Paketquellen“ erreichbar.
+- Vorgemerkte Installationen und Entfernungen werden gemeinsam über die bestehende APT-Simulation und Bestätigung ausgeführt.
+
 ## 0.1.32
 - Paketliste verwendet wieder exakt die eindeutigen Paketnamen aus `apt-cache pkgnames` als Referenz (70518 laut Systemmessung); Paketdetails werden über python-apt/libapt-pkg gelesen. Architekturvarianten werden nicht zusätzlich gezählt.
 

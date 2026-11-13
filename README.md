@@ -1,12 +1,8 @@
-# LunaPaket 0.1.32
+# LunaPaket 0.1.33
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
 LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates über eine
 grafische Oberfläche auf Basis von Python 3 und PySide6.
-
-![LunaPaket](lunapaket.png)
-
-[Github Seite](https://github.com/Angonikro/LunaPaket/)
 
 ## 1. Voraussetzungen
 
@@ -46,7 +42,7 @@ Die ZIP-Datei zunächst in einen Ordner entpacken, zum Beispiel:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.32_GITHUB.zip -d ~/Programme
+unzip LunaPaket_0.1.33_GITHUB.zip -d ~/Programme
 ```
 
 In den entpackten Projektordner wechseln:
@@ -86,7 +82,7 @@ werden. Beispiel:
 
 ```bash
 cd ~/Downloads
-sudo apt install ./LunaPaket_0.1.32_all.deb
+sudo apt install ./LunaPaket_0.1.33_all.deb
 ```
 
 Nach der Installation lässt sich LunaPaket über das Anwendungsmenü oder mit
@@ -112,7 +108,7 @@ chmod +x build_deb.sh
 Das Skript erstellt die Paketdatei im Unterordner `dist/`:
 
 ```text
-dist/lunapaket_0.1.32_all.deb
+dist/lunapaket_0.1.33_all.deb
 ```
 
 Zum Bauen wird `dpkg-deb` benötigt (Paket `dpkg`). Die Laufzeit-Abhängigkeiten
@@ -128,7 +124,11 @@ werden in `debian/control` beschrieben.
 - Sicherheitsupdates anzeigen und einzeln bearbeiten
 - Sicherheitsupdates versionsbezogen zurückstellen und später reaktivieren
 - automatische Sicherheitsupdate-Prüfung mit einstellbarem Intervall
-- lokale `.deb`-Dateien öffnen und Installationsoptionen anzeigen
+- lokale DEB-Dateien über „Datei → DEB-Pakete öffnen …“ auswählen und installieren
+- Dateimenü mit Anwenden vorgemerkter Änderungen, Paketlistenaktualisierung und Beenden
+- Hauptoberfläche mit den Schaltflächen „Vormerkung löschen“ und „Vorgemerkte Änderungen anwenden“
+- Installationen und Entfernungen über Kontrollkästchen vormerken und gemeinsam über APT ausführen; die Auswahl wird vor dem Anwenden nochmals mit dem Installationsstatus abgeglichen
+- Paketquellen über das eigene Menü „Paketquellen“ verwalten; nicht über „Einstellungen“
 
 Installationen und Änderungen am System werden über APT ausgeführt. Vor einer
 Paketinstallation zeigt LunaPaket eine APT-Simulation an und verlangt eine
@@ -204,7 +204,7 @@ normalen Deinstallation erhalten und können bei Bedarf separat entfernt werden.
 
 ## 10. Versionshinweis
 
-Diese Dokumentation gehört zu LunaPaket **0.1.32**. Die Versionsnummer des
+Diese Dokumentation gehört zu LunaPaket **0.1.33**. Die Versionsnummer des
 Programms und des Debian-Pakets wird durch diese README-Überarbeitung nicht
 geändert.
 
