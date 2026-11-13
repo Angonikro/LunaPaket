@@ -59,7 +59,7 @@ ZIP-Datei entpacken und in den Projektordner wechseln:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.35_QUELLCODE.zip -d ~/Programme
+unzip LunaPaket_0.1.35_GITHUB.zip -d ~/Programme
 cd ~/Programme/LunaPaket
 ```
 
