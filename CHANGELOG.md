@@ -1,5 +1,20 @@
 # Änderungsprotokoll
 
+## 0.1.34
+- „Goldisoft 2026“ in den Dialog „Über LunaPaket“ integriert; separater Hilfe-Menüeintrag entfernt.
+- Sprachwechsel funktioniert jetzt direkt in beide Richtungen (Deutsch/Englisch), ohne Neustart; Fenstertitel, Menüs, Tabellenstatus und Untertitel werden mit umgestellt.
+- Einstellungsfenster: Checkbox-Texte, Tooltip und Schließen-Schaltfläche werden bei englischer Sprache zuverlässig auf Englisch gesetzt.
+- Korrekturpaket für die vollständige englische Übersetzung des Einstellungsdialogs.
+- Versionsnummer erhöht, damit Debian das aktualisierte Paket eindeutig als neuere Version installiert.
+- Letzte deutsche Texte im Einstellungsfenster werden bei englischer Sprache ebenfalls übersetzt; einschließlich Fensteroptionen, Tooltip und Schließen-Schaltfläche.
+- Englische Oberfläche vervollständigt: Untertitel, Paketstatus und Lade-/Filterstatus werden ebenfalls übersetzt.
+- Im Menü „Hilfe“ den Eintrag „Goldisoft 2026“ mit Infofenster ergänzt.
+- Englische Oberflächensprache ergänzt; Deutsch bleibt Standardsprache.
+- Hell- und Dunkel-Theme ergänzt.
+- Sprache und Theme werden in `~/.config/LunaPaket/LunaPaket.conf` gespeichert.
+- Versionsnummer in Programm, Debian-Metadaten, Build-Skript und Dokumentation auf 0.1.34 angehoben.
+
+
 ## 0.1.33
 - Menüaktion „DEB-Pakete öffnen …“ korrigiert: Qt-Signalparameter wird nicht mehr versehentlich als Dateiliste an den Dateiauswahldialog übergeben.
 - Vormerkliste wird beim Anwenden nochmals aus sämtlichen Kontrollkästchen mit dem Installationsstatus abgeglichen; verhindert verlorene Checkbox-Klicks und berücksichtigt Installieren sowie Entfernen gemeinsam.
@@ -38,3 +53,8 @@
 - MIME- und Desktop-Datenbank werden bei Installation und Entfernung aktualisiert.
 - Normaler Programmstart bleibt unverändert: Die Paketübersicht öffnet sich ohne Dateiauswahl.
 - Versionsnummer bleibt 0.1.26.
+
+### Korrektur am Infofenster (Version bleibt 0.1.34)
+- Fehlerhafte sichtbare `\\n`-Zeichen im Dialog „Über LunaPaket“ beseitigt.
+- Infofenster übersichtlicher mit Programmname, Versionsnummer, Goldisoft 2026 und Beschreibung formatiert.
+- Keine Änderung der Versionsnummer.

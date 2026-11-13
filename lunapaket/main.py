@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.33"
+VERSION="0.1.34"
 
 def privileged(args):
     """Führt Systembefehle direkt aus, wenn LunaPaket als root läuft."""
@@ -111,7 +111,7 @@ class Window(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("LunaPaket – Paketverwaltung · "+VERSION); self.resize(1100,720); self.queue={}
         self.catalog_cache = None
-        self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#171821;border:2px solid #aaa3bd;border-radius:3px}")
+        self._theme_placeholder = True
         # Auch bei pkexec muss LunaPaket die Einstellungen des angemeldeten
         # Desktop-Benutzers verwenden und nicht /root/.config.
         desktop_uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
@@ -122,6 +122,9 @@ class Window(QMainWindow):
         settings_dir = os.path.join(config_home, "LunaPaket")
         os.makedirs(settings_dir, mode=0o700, exist_ok=True)
         self.settings = QSettings(os.path.join(settings_dir, "LunaPaket.conf"), QSettings.IniFormat)
+        self.language = str(self.settings.value("language", "de"))
+        self.theme = str(self.settings.value("theme", "dark"))
+        self.apply_theme()
         self.font_size = int(self.settings.value("font_size", 11))
         app_font = QApplication.font(); app_font.setPointSize(self.font_size); QApplication.setFont(app_font)
         w=QWidget(); self.setCentralWidget(w); outer=QHBoxLayout(w)
@@ -130,7 +133,7 @@ class Window(QMainWindow):
         self.sidebar.setCurrentRow(0); self.sidebar.currentRowChanged.connect(self.sidebar_changed)
         outer.addWidget(self.sidebar)
         content=QWidget(); outer.addWidget(content,1); l=QVBoxLayout(content)
-        h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>Debian-Paketverwaltung"); h.addWidget(title); h.addStretch()
+        h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>" + ("Debian package manager" if self.language == "en" else "Debian-Paketverwaltung")); self._main_subtitle_label = title; h.addWidget(title); h.addStretch()
         self.repo_btn=QPushButton("Paketquellen verwalten")
         self.repo_btn.setToolTip("APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren")
         self.repo_btn.clicked.connect(self.manage_sources)
@@ -202,7 +205,24 @@ class Window(QMainWindow):
         settings_menu.addAction(settings_action)
         self.remember_window_enabled = self.settings.value("window/remember", True, type=bool)
         self.clean_cache_enabled = self.settings.value("package/clean_cache_after_install", True, type=bool)
-        self.menuBar().addMenu("Hilfe").addAction("Über LunaPaket",lambda:QMessageBox.about(self,"LunaPaket",f"LunaPaket {VERSION}\nGrafische Paketverwaltung für Debian."))
+        help_menu = self.menuBar().addMenu("Hilfe")
+        def show_about():
+            title = "Über LunaPaket" if self.language == "de" else "About LunaPaket"
+            description = ("Grafische Paketverwaltung für Debian." if self.language == "de"
+                           else "Graphical package manager for Debian.")
+            about_html = (
+                "<div style='min-width:300px;'>"
+                "<div style='font-size:20pt;font-weight:700;color:#a98bff;'>LunaPaket</div>"
+                f"<div style='font-size:10pt;margin-top:3px;'>Version {VERSION}</div>"
+                "<hr style='border:0;border-top:1px solid #666;margin:12px 0;'>"
+                "<div style='font-size:12pt;font-weight:600;'>Goldisoft 2026</div>"
+                f"<div style='font-size:10pt;margin-top:7px;'>{description}</div>"
+                "</div>"
+            )
+            QMessageBox.about(self, title, about_html)
+
+        help_menu.addAction("Über LunaPaket", show_about)
+        self.translate_main_window()
         self.load_installed()
         if self.remember_window_enabled and self.settings.contains("window/geometry"):
             geometry = self.settings.value("window/geometry")
@@ -213,6 +233,80 @@ class Window(QMainWindow):
         self._settings_dir = settings_dir
         self._settings_file = os.path.join(settings_dir, "LunaPaket.conf")
         self._sync_settings_permissions()
+
+    def apply_theme(self):
+        if self.theme == "light":
+            self.setStyleSheet("QMainWindow,QWidget{background:#f3f4f8;color:#252638;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#ffffff;color:#252638;border:1px solid #c9cbd8;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#e4e2ee;color:#37334b;padding:7px} QListWidget#packageSidebar{background:#e9e8f0;border:1px solid #c9c6d6;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px}")
+        else:
+            self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#171821;border:2px solid #aaa3bd;border-radius:3px}")
+    def translate_main_window(self):
+        translations = {
+            "LunaPaket – Paketverwaltung":"LunaPaket – Package Manager",
+            "Alle Pakete":"All packages","Installiert":"Installed","Nicht installiert":"Not installed",
+            "Aufräumen":"Cleanup","Vorgemerkt":"Queued","Paketquellen verwalten":"Manage repositories",
+            "APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren":"Add, edit, enable or disable APT repositories",
+            "Paketlisten aktualisieren":"Refresh package lists","System aktualisieren":"Upgrade system",
+            "Sicherheitsupdates verwalten":"Manage security updates","Pakete suchen …":"Search packages …",
+            "Suchergebnisse":"Search results","Installierte Pakete":"Installed packages","Suchen":"Search",
+            "Paket":"Package","Version":"Version","Status":"Status","Beschreibung":"Description",
+            "Vormerkung löschen":"Clear queue","Vorgemerkte Änderungen anwenden":"Apply queued changes",
+            "Keine vorgemerkten Änderungen":"No queued changes","Bereit":"Ready","Datei":"File",
+            "DEB-Pakete öffnen …":"Open DEB packages …",
+            "Eine oder mehrere lokale Debian-Paketdateien auswählen und installieren":"Select and install one or more local Debian package files",
+            "Vorgemerkte Paketinstallationen und -entfernungen ausführen":"Execute queued package installations and removals",
+            "Beenden":"Quit","Paketquellen":"Repositories","Paketquellen verwalten …":"Manage repositories …",
+            "Paketquellen prüfen / Paketlisten aktualisieren":"Check repositories / refresh package lists",
+            "Paketquellen anzeigen":"Show repositories","Einstellungen":"Settings",
+            "Distribution …":"Distribution …","Schriftgröße …":"Font size …",
+            "Allgemeine Einstellungen …":"General settings …","Hilfe":"Help","Über LunaPaket":"About LunaPaket",
+            "Debian-Paketverwaltung":"Debian package manager",
+            "Fenstergröße und Fensterposition merken":"Remember window size and position",
+            "Heruntergeladene Paketdateien nach erfolgreicher Installation löschen":"Delete downloaded package files after successful installation",
+            "Schließen":"Close"
+        }
+        mapping = translations if self.language == "en" else {v: k for k, v in translations.items()}
+
+        current_title = self.windowTitle()
+        german_prefix = "LunaPaket – Paketverwaltung"
+        english_prefix = "LunaPaket – Package Manager"
+        if self.language == "en" and current_title.startswith(german_prefix):
+            current_title = current_title.replace(german_prefix, english_prefix, 1)
+        elif self.language == "de" and current_title.startswith(english_prefix):
+            current_title = current_title.replace(english_prefix, german_prefix, 1)
+        self.setWindowTitle(current_title)
+
+        for obj in self.findChildren(QWidget):
+            if isinstance(obj, (QPushButton, QLabel, QCheckBox, QRadioButton, QGroupBox)):
+                value = obj.text()
+                # The main subtitle is rich text, so translate its embedded phrase.
+                if obj is getattr(self, "_main_subtitle_label", None):
+                    obj.setText(value.replace("Debian-Paketverwaltung", mapping.get("Debian-Paketverwaltung", "Debian-Paketverwaltung"))
+                                    .replace("Debian package manager", mapping.get("Debian package manager", "Debian package manager")))
+                elif value in mapping:
+                    obj.setText(mapping[value])
+            if isinstance(obj, QLineEdit):
+                value = obj.placeholderText()
+                if value in mapping: obj.setPlaceholderText(mapping[value])
+            if isinstance(obj, QListWidget):
+                for i in range(obj.count()):
+                    item = obj.item(i)
+                    item.setText(mapping.get(item.text(), item.text()))
+            if isinstance(obj, QComboBox):
+                for i in range(obj.count()):
+                    value = obj.itemText(i)
+                    obj.setItemText(i, mapping.get(value, value))
+            if isinstance(obj, QTableWidget):
+                for i in range(obj.columnCount()):
+                    item = obj.horizontalHeaderItem(i)
+                    if item: item.setText(mapping.get(item.text(), item.text()))
+                for row in range(obj.rowCount()):
+                    status_item = obj.item(row, 3)
+                    if status_item:
+                        status_item.setText(mapping.get(status_item.text(), status_item.text()))
+        for action in self.findChildren(QAction):
+            action.setText(mapping.get(action.text(), action.text()))
+        for menu in self.findChildren(QMenu):
+            menu.setTitle(mapping.get(menu.title(), menu.title()))
 
     def _sync_settings_permissions(self):
         # Settings belong to the logged-in desktop user even when the GUI
@@ -290,13 +384,36 @@ class Window(QMainWindow):
 
     def show_settings(self):
         dlg = QDialog(self)
-        dlg.setWindowTitle("LunaPaket – Einstellungen")
+        dlg.setWindowTitle("LunaPaket – Einstellungen" if self.language == "de" else "LunaPaket – Settings")
         dlg.setMinimumWidth(520)
         layout = QVBoxLayout(dlg)
-        remember = QCheckBox("Fenstergröße und Fensterposition merken")
+        language_row = QHBoxLayout()
+        language_label = QLabel("Sprache / Language")
+        language_combo = QComboBox()
+        language_combo.addItem("Deutsch", "de")
+        language_combo.addItem("English", "en")
+        language_combo.setCurrentIndex(0 if self.language == "de" else 1)
+        language_row.addWidget(language_label); language_row.addWidget(language_combo, 1)
+        layout.addLayout(language_row)
+        theme_row = QHBoxLayout()
+        theme_label = QLabel("Farbschema / Theme")
+        theme_combo = QComboBox()
+        theme_combo.addItem("Dunkel / Dark", "dark")
+        theme_combo.addItem("Hell / Light", "light")
+        theme_combo.setCurrentIndex(0 if self.theme == "dark" else 1)
+        theme_row.addWidget(theme_label); theme_row.addWidget(theme_combo, 1)
+        layout.addLayout(theme_row)
+        remember = QCheckBox()
         remember.setChecked(self.remember_window_enabled)
-        remember.setToolTip("Speichert Größe und Position beim Schließen und stellt sie beim nächsten Start wieder her.")
-        cache = QCheckBox("Heruntergeladene Paketdateien nach erfolgreicher Installation löschen")
+        cache = QCheckBox()
+        def update_settings_language():
+            english = self.language == "en"
+            dlg.setWindowTitle("LunaPaket – Settings" if english else "LunaPaket – Einstellungen")
+            remember.setText("Remember window size and position" if english else "Fenstergröße und Fensterposition merken")
+            remember.setToolTip("Saves the window size and position on exit and restores them next time." if english else "Speichert Größe und Position beim Schließen und stellt sie beim nächsten Start wieder her.")
+            cache.setText("Delete downloaded package files after successful installation" if english else "Heruntergeladene Paketdateien nach erfolgreicher Installation löschen")
+            buttons.button(QDialogButtonBox.Close).setText("Close" if english else "Schließen")
+        cache.setChecked(self.clean_cache_enabled)
         cache.setChecked(self.clean_cache_enabled)
         layout.addWidget(remember)
         layout.addWidget(cache)
@@ -304,7 +421,21 @@ class Window(QMainWindow):
         buttons.rejected.connect(dlg.reject)
         buttons.accepted.connect(dlg.accept)
         layout.addWidget(buttons)
+        update_settings_language()
         remember.toggled.connect(self.set_remember_window)
+        def language_changed(index):
+            self.language = language_combo.currentData()
+            self.settings.setValue("language", self.language)
+            self.translate_main_window()
+            update_settings_language()
+            self._sync_settings_permissions()
+        def theme_changed(index):
+            self.theme = theme_combo.currentData()
+            self.settings.setValue("theme", self.theme)
+            self.apply_theme()
+            self._sync_settings_permissions()
+        language_combo.currentIndexChanged.connect(language_changed)
+        theme_combo.currentIndexChanged.connect(theme_changed)
         def cache_changed(enabled):
             self.clean_cache_enabled = bool(enabled)
             self.settings.setValue("package/clean_cache_after_install", self.clean_cache_enabled)
@@ -331,7 +462,7 @@ class Window(QMainWindow):
         self._rows_offset = 0
         self._rows_chunk_size = 300
         self.table.setRowCount(len(data))
-        self.status.setText(f"0 von {len(data)} Paketen werden angezeigt …")
+        self.status.setText((f"0 of {len(data)} packages displayed …" if self.language == "en" else f"0 von {len(data)} Paketen werden angezeigt …"))
         self.table.setUpdatesEnabled(True)
         QTimer.singleShot(0, lambda g=generation: self._fill_rows_chunk(g))
 
@@ -361,20 +492,24 @@ class Window(QMainWindow):
             check.setData(Qt.UserRole + 1, installed)
             self.table.setItem(i, 0, check)
             for c, v in enumerate(r):
-                it = QTableWidgetItem(str(v))
+                display_value = str(v)
+                if self.language == "en":
+                    display_value = {"Installiert": "Installed", "Nicht installiert": "Not installed",
+                                     "Vorgemerkt": "Queued"}.get(display_value, display_value)
+                it = QTableWidgetItem(display_value)
                 it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 it.setData(Qt.UserRole, name)
                 self.table.setItem(i, c + 1, it)
         self._rows_offset = end
         self.table.setUpdatesEnabled(True)
         if end < len(data):
-            self.status.setText(f"{end} von {len(data)} Paketen werden angezeigt …")
+            self.status.setText((f"{end} of {len(data)} packages displayed …" if self.language == "en" else f"{end} von {len(data)} Paketen werden angezeigt …"))
             QTimer.singleShot(1, lambda g=generation: self._fill_rows_chunk(g))
         else:
             self.table.blockSignals(False)
             self._table_catalog_ready = True
             self.apply_table_filters()
-            self.status.setText(f"{len(data)} Pakete vollständig geladen · Kategorien werden ohne Neuladen gefiltert")
+            self.status.setText((f"{len(data)} packages loaded · Categories are filtered without reloading" if self.language == "en" else f"{len(data)} Pakete vollständig geladen · Kategorien werden ohne Neuladen gefiltert"))
 
     def checkbox_changed(self, item):
         if item.column() != 0 or self.table.signalsBlocked():
@@ -488,7 +623,7 @@ class Window(QMainWindow):
             self.table.setRowHidden(row, not show)
             if show: visible += 1
         self.table.setUpdatesEnabled(True)
-        self.status.setText(f"{visible} Pakete angezeigt · Gesamtliste bleibt im Speicher")
+        self.status.setText((f"{visible} packages shown · Full list remains in memory" if self.language == "en" else f"{visible} Pakete angezeigt · Gesamtliste bleibt im Speicher"))
 
     @staticmethod
     def collect_catalog():
