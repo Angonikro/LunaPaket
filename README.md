@@ -4,6 +4,10 @@ Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
 LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates über eine
 grafische Oberfläche auf Basis von Python 3 und PySide6.
 
+![LunaPaket](lunapaket.png)
+
+[Github Seite](https://github.com/Angonikro/LunaPaket/)
+
 ## 1. Voraussetzungen
 
 Empfohlen und getestet werden soll LunaPaket auf Debian 13 mit einer laufenden
