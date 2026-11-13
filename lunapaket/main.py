@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.34"
+VERSION="0.1.35"
 
 def privileged(args):
     """Führt Systembefehle direkt aus, wenn LunaPaket als root läuft."""
@@ -83,6 +83,9 @@ class ActionProgressDialog(QDialog):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         layout.addWidget(self.output, 1)
+        self.auto_close = QCheckBox("Fenster nach erfolgreicher Aktion schließen")
+        self.auto_close.setChecked(True)
+        layout.addWidget(self.auto_close)
         self.close_button = QPushButton("Vorgang läuft …")
         self.close_button.setEnabled(False)
         self.close_button.clicked.connect(self.accept)
@@ -107,10 +110,16 @@ class ActionProgressDialog(QDialog):
             self.current.setText(f"Aktion fehlgeschlagen (Fehlercode {code}).")
             self.close_button.setText("Schließen")
         self.close_button.setEnabled(True)
+        # Nur bei erfolgreichem Abschluss automatisch schließen. Bei Fehlern
+        # bleibt das Protokoll sichtbar, damit die Ursache gelesen werden kann.
+        if code == 0 and self.auto_close.isChecked():
+            QTimer.singleShot(1200, self.accept)
 class Window(QMainWindow):
     def __init__(self):
         super().__init__(); self.setWindowTitle("LunaPaket – Paketverwaltung · "+VERSION); self.resize(1100,720); self.queue={}
         self.catalog_cache = None
+        self._catalog_loading = False
+        self._table_catalog_ready = False
         self._theme_placeholder = True
         # Auch bei pkexec muss LunaPaket die Einstellungen des angemeldeten
         # Desktop-Benutzers verwenden und nicht /root/.config.
@@ -147,6 +156,11 @@ class Window(QMainWindow):
         bar=QHBoxLayout(); self.search=QLineEdit(); self.search.setPlaceholderText("Pakete suchen …"); self.search.returnPressed.connect(self.search_pkgs); bar.addWidget(self.search,1)
         self.filter=QComboBox(); self.filter.addItems(["Suchergebnisse","Installierte Pakete"]); self.filter.currentIndexChanged.connect(self.search_pkgs); bar.addWidget(self.filter)
         b=QPushButton("Suchen"); b.clicked.connect(self.search_pkgs); bar.addWidget(b); l.addLayout(bar)
+        self.cleanup_select_all = QCheckBox("Alle Pakete vormerken")
+        self.cleanup_select_all.setToolTip("Alle von APT als entbehrlich erkannten Pakete zur Entfernung vormerken")
+        self.cleanup_select_all.setVisible(False)
+        self.cleanup_select_all.toggled.connect(self.toggle_all_cleanup_packages)
+        l.addWidget(self.cleanup_select_all)
         self.table=QTableWidget(0,5); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QAbstractItemView.AllEditTriggers); self.table.setSortingEnabled(False); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.sortItems(1, Qt.AscendingOrder); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.itemSelectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); l.addWidget(self.table,4)
         row=QHBoxLayout()
         clear_queue_btn=QPushButton("Vormerkung löschen")
@@ -236,9 +250,9 @@ class Window(QMainWindow):
 
     def apply_theme(self):
         if self.theme == "light":
-            self.setStyleSheet("QMainWindow,QWidget{background:#f3f4f8;color:#252638;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#ffffff;color:#252638;border:1px solid #c9cbd8;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#e4e2ee;color:#37334b;padding:7px} QListWidget#packageSidebar{background:#e9e8f0;border:1px solid #c9c6d6;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px}")
+            self.setStyleSheet("QMainWindow,QWidget{background:#f3f4f8;color:#252638;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#ffffff;color:#252638;border:1px solid #c9cbd8;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#e4e2ee;color:#37334b;padding:7px} QListWidget#packageSidebar{background:#e9e8f0;border:1px solid #c9c6d6;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px}")
         else:
-            self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#171821;border:2px solid #aaa3bd;border-radius:3px}")
+            self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#171821;border:2px solid #aaa3bd;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #c9b5ff;border-radius:3px}")
     def translate_main_window(self):
         translations = {
             "LunaPaket – Paketverwaltung":"LunaPaket – Package Manager",
@@ -250,7 +264,7 @@ class Window(QMainWindow):
             "Suchergebnisse":"Search results","Installierte Pakete":"Installed packages","Suchen":"Search",
             "Paket":"Package","Version":"Version","Status":"Status","Beschreibung":"Description",
             "Vormerkung löschen":"Clear queue","Vorgemerkte Änderungen anwenden":"Apply queued changes",
-            "Keine vorgemerkten Änderungen":"No queued changes","Bereit":"Ready","Datei":"File",
+            "Keine vorgemerkten Änderungen":"No queued changes","Alle Pakete vormerken":"Mark all packages","Bereit":"Ready","Datei":"File",
             "DEB-Pakete öffnen …":"Open DEB packages …",
             "Eine oder mehrere lokale Debian-Paketdateien auswählen und installieren":"Select and install one or more local Debian package files",
             "Vorgemerkte Paketinstallationen und -entfernungen ausführen":"Execute queued package installations and removals",
@@ -540,12 +554,49 @@ class Window(QMainWindow):
     def load_installed(self):
         self.search_pkgs()
     def sidebar_changed(self, _row):
+        # Das Sammelkästchen ist ausschließlich im Bereich „Aufräumen“ sichtbar.
+        self.cleanup_select_all.blockSignals(True)
+        self.cleanup_select_all.setChecked(False)
+        self.cleanup_select_all.blockSignals(False)
+        self.cleanup_select_all.setVisible(_row == 3)
         # Kategorien werden direkt in der bereits geladenen Tabelle gefiltert.
         # Kein erneuter APT-/DPKG-Aufruf und kein erneuter Tabellenaufbau.
         if getattr(self, "_table_catalog_ready", False):
             self.apply_table_filters()
         else:
             self.search_pkgs()
+
+    def toggle_all_cleanup_packages(self, checked):
+        """Merkt alle APT-Autoremove-Kandidaten gesammelt zur Entfernung vor."""
+        if self.catalog_cache is None:
+            return
+        candidates = set(self.catalog_cache.get("autoremove", set()))
+        if not candidates:
+            self.status.setText("Keine entbehrlichen Pakete gefunden.")
+            return
+        self.table.blockSignals(True)
+        changed = 0
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            name = str(item.data(Qt.UserRole) or "")
+            if name.split(":", 1)[0] not in candidates:
+                continue
+            installed = bool(item.data(Qt.UserRole + 1))
+            if not installed:
+                continue
+            if checked:
+                item.setCheckState(Qt.Unchecked)
+                self.queue[name] = "remove"
+            else:
+                item.setCheckState(Qt.Checked)
+                if self.queue.get(name) == "remove":
+                    self.queue.pop(name, None)
+            changed += 1
+        self.table.blockSignals(False)
+        self.update_queue_label()
+        self.status.setText(f"{changed} Aufräum-Pakete {'zur Entfernung vorgemerkt' if checked else 'aus der Vormerkung entfernt'}.")
     def choose_font_size(self):
         size, ok = QInputDialog.getInt(self, "Schriftgröße", "Schriftgröße in Punkt:", self.font_size, 8, 24, 1)
         if ok:
@@ -554,19 +605,22 @@ class Window(QMainWindow):
             font = QApplication.font(); font.setPointSize(size); QApplication.setFont(font)
             self.status.setText(f"Schriftgröße auf {size} pt gesetzt")
     def search_pkgs(self):
-        # Sobald der vollständige Katalog in der Tabelle liegt, werden Suche
-        # und Kategorien ausschließlich über setRowHidden() angewendet.
-        if getattr(self, "_table_catalog_ready", False) and self.catalog_cache is not None:
-            self.apply_table_filters()
+        # Der Katalog wird genau einmal aufgebaut. Solange die erste
+        # Tabellenbefüllung läuft, dürfen Filter-/Sidebar-Klicks keinen
+        # weiteren APT-Lesejob starten.
+        if self.catalog_cache is not None:
+            if getattr(self, "_table_catalog_ready", False):
+                self.apply_table_filters()
+            # Während der initialen Tabellenbefüllung nur den aktuellen
+            # Filterzustand merken; _fill_rows_chunk wendet ihn am Ende an.
             return
-        if getattr(self, "search_job", None) is not None and self.search_job.isRunning():
-            self.search_again = True
+        if getattr(self, "_catalog_loading", False):
             return
-        self.search_again = False
+        self._catalog_loading = True
         self.status.setText("Paketkatalog wird einmalig im Hintergrund geladen …")
         self.search_job = FunctionJob(self.collect_catalog)
         self.search_job.result.connect(self.catalog_loaded)
-        self.search_job.failed.connect(lambda e: self.status.setText("Fehler beim Laden: " + e))
+        self.search_job.failed.connect(self.catalog_load_failed)
         self.search_job.start()
 
     def apply_row_filter(self, row):
@@ -717,9 +771,14 @@ class Window(QMainWindow):
         return result
 
     def catalog_loaded(self, catalog):
+        self._catalog_loading = False
         self.catalog_cache = catalog
         self._table_catalog_ready = False
         self.rows(catalog["rows"])
+
+    def catalog_load_failed(self, error):
+        self._catalog_loading = False
+        self.status.setText("Fehler beim Laden: " + str(error))
 
     def search_done(self, rows):
         self.rows(rows)
@@ -1011,6 +1070,9 @@ class Window(QMainWindow):
         details.setReadOnly(True)
         details.setPlainText(preview)
         layout.addWidget(details, 1)
+        auto_close = QCheckBox("Fenster nach erfolgreicher Aktion schließen")
+        auto_close.setChecked(True)
+        layout.addWidget(auto_close)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
         buttons.button(QDialogButtonBox.Ok).setText("Jetzt ausführen")
         buttons.button(QDialogButtonBox.Cancel).setText("Abbrechen")
@@ -1046,7 +1108,8 @@ class Window(QMainWindow):
         expected = sum(1 for action in actions.values()
                        if action in ("install", "reinstall", "remove", "purge") or action.startswith("version:"))
         self.run_action_job(privileged(["/bin/sh", "-c", shell]), "Paketaktionen",
-                            f"{len(actions)} ausgewählte Paketaktion(en) werden ausgeführt.", expected)
+                            f"{len(actions)} ausgewählte Paketaktion(en) werden ausgeführt.", expected,
+                            auto_close=auto_close.isChecked())
 
     def set_busy(self, busy):
         self._busy = bool(busy)
@@ -1080,10 +1143,11 @@ class Window(QMainWindow):
             return max(0, min(99, round(percent))), label
         return None, None
 
-    def run_action_job(self, args, title, description, expected=0):
+    def run_action_job(self, args, title, description, expected=0, auto_close=True):
         self.status.setText("Paketaktion läuft …")
         self.set_busy(True)
         dialog = ActionProgressDialog(self, title, description)
+        dialog.auto_close.setChecked(bool(auto_close))
         self.action_stream = StreamJob(args)
         completed = set()
         def output_line(line):
@@ -1214,6 +1278,9 @@ class Window(QMainWindow):
         log = QTextEdit(); log.setReadOnly(True); log.setMaximumHeight(110)
         log.setPlainText("Paketlisten erfolgreich aktualisiert.\n" + "\n".join(packages))
         lay.addWidget(log, 1)
+        auto_close = QCheckBox("Fenster nach erfolgreicher Aktion schließen")
+        auto_close.setChecked(True)
+        lay.addWidget(auto_close)
         buttons = QDialogButtonBox()
         cancel = buttons.addButton("Abbrechen", QDialogButtonBox.RejectRole)
         security_btn = None
@@ -1230,12 +1297,14 @@ class Window(QMainWindow):
             self.status.setText("Aktualisierung abgebrochen – nichts installiert")
             return
         selected = security_packages if choice["mode"] == "security" else packages
-        self.start_upgrade_install(selected, security_only=(choice["mode"] == "security"))
+        self.start_upgrade_install(selected, security_only=(choice["mode"] == "security"),
+                                   auto_close=auto_close.isChecked())
 
-    def start_upgrade_install(self, packages, security_only=False):
+    def start_upgrade_install(self, packages, security_only=False, auto_close=True):
         title = "Sicherheitsaktualisierungen installieren" if security_only else "System wird aktualisiert"
         description = f"{len(packages)} Paketaktualisierung(en) werden installiert."
         progress = ActionProgressDialog(self, title, description)
+        progress.auto_close.setChecked(bool(auto_close))
         self.set_busy(True)
         if security_only:
             names = [line.split()[0].split("/", 1)[0] for line in packages]

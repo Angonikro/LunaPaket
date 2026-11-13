@@ -1,4 +1,11 @@
-# Änderungsprotokoll
+# Änderungsprotokoll LunaPaket
+
+## 0.1.35
+- Im Bereich „Aufräumen“ ein sichtbares Sammelkästchen „Alle Pakete vormerken“ ergänzt. Es merkt alle von APT erkannten entbehrlichen, installierten Pakete gemeinsam zur Entfernung vor; erneutes Abwählen nimmt diese Sammelvormerkungen zurück.
+- Sammelvormerkung arbeitet direkt auf den bereits geladenen Tabellenzeilen und startet keine zusätzliche Paketabfrage.
+- Checkbox „Fenster nach erfolgreicher Aktion schließen“ zusätzlich in den Bestätigungsdialog für vorgemerkte Paketaktionen und in den Dialog „Verfügbare Aktualisierungen“ aufgenommen.
+- Die Auswahl wird an das jeweilige Fortschrittsfenster weitergegeben; standardmäßig aktiviert.
+- Bei Fehlern bleibt das Fortschrittsfenster einschließlich Protokoll geöffnet.
 
 ## 0.1.34
 - „Goldisoft 2026“ in den Dialog „Über LunaPaket“ integriert; separater Hilfe-Menüeintrag entfernt.

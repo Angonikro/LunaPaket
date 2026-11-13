@@ -3,7 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PKG="$ROOT/build/lunapaket-pkgroot"
 OUT="$ROOT/dist"
-VERSION="0.1.34"
+VERSION="0.1.35"
 rm -rf "$ROOT/build" "$OUT"
 mkdir -p "$PKG/DEBIAN" "$PKG/usr/share/lunapaket" "$PKG/usr/share/doc/lunapaket" "$PKG/usr/bin" "$PKG/usr/share/applications" "$PKG/usr/share/mime/packages" "$OUT"
 chmod 0755 "$PKG/DEBIAN"; chmod g-s "$PKG/DEBIAN"
