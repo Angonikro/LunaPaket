@@ -1,0 +1,3 @@
+#!/bin/sh
+# LunaPaket fordert beim Start selbst Administratorrechte an.
+exec /usr/bin/python3 /usr/share/lunapaket/main.py "$@"

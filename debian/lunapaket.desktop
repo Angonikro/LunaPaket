@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=LunaPaket
+GenericName=Debian-Paketverwaltung
+Comment=Debian-Pakete mit LunaPaket öffnen und verwalten
+TryExec=/usr/bin/lunapaket
+Exec=/usr/bin/lunapaket --open-deb %f
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;
+StartupNotify=true
+MimeType=application/vnd.debian.binary-package;application/x-deb;application/x-debian-package;

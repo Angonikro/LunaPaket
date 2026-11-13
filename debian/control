@@ -1,0 +1,9 @@
+Package: lunapaket
+Version: 0.1.32
+Section: admin
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.11), python3-apt, python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, libxcb-cursor0, libxkbcommon-x11-0, libxcb-xinerama0, apt, dpkg, pkexec, polkitd, desktop-file-utils, shared-mime-info
+Maintainer: LunaPaket
+Description: Grafische Paketverwaltung für Debian
+ Graphische Paketverwaltung mit Paketlisten, Suche, Vormerkungen und APT-Integration.
