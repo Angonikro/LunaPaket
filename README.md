@@ -1,4 +1,4 @@
-# LunaPaket 0.1.35
+# LunaPaket 0.1.36
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
 LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates über eine
@@ -18,6 +18,7 @@ grafische Oberfläche auf Basis von Python 3 und PySide6.
 - Sicherheitsupdates anzeigen und einzeln bearbeiten
 - Lokale DEB-Dateien auswählen und installieren
 - Gemeinsames Anwenden vorgemerkter Installationen und Entfernungen
+- Paketverlauf für Installationen, Entfernungen und Aktualisierungen (aufrufbar über Datei-Menü, maximal 1 MB)
 - Einstellbare Schriftgröße
 - Oberflächensprache Deutsch/Englisch
 - Hell-/Dunkel-Theme
@@ -59,7 +60,7 @@ ZIP-Datei entpacken und in den Projektordner wechseln:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.35_GITHUB.zip -d ~/Programme
+unzip LunaPaket_0.1.36_GITHUB.zip -d ~/Programme
 cd ~/Programme/LunaPaket
 ```
 
@@ -80,6 +81,11 @@ Für den ZIP-Start bitte `run.sh` oder `python3 lunapaket/main.py` verwenden.
 Der Launcher `lunapaket/lunapaket` ist für die installierte DEB-Version
 vorgesehen und verweist auf `/usr/share/lunapaket/main.py`.
 
+Fehlgeschlagene APT-Befehle werden automatisch protokolliert. Das Fehlerprotokoll
+liegt unter `~/.local/share/LunaPaket/logs/apt-errors.log`; bei Überschreiten
+von 512 KB wird eine Sicherung (`apt-errors.log.1`) angelegt. Es werden nur
+Fehler protokolliert, erfolgreiche Aktionen erzeugen keinen Logeintrag.
+
 LunaPaket fordert Administratorrechte bei Bedarf über PolicyKit (`pkexec`) an.
 Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
@@ -87,7 +93,7 @@ Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./lunapaket_0.1.35_all.deb
+sudo apt install ./lunapaket_0.1.36_all.deb
 ```
 
 Anschließend über das Anwendungsmenü oder mit `lunapaket` starten.
@@ -104,7 +110,7 @@ chmod +x build_deb.sh
 ./build_deb.sh
 ```
 
-Das Skript erstellt `dist/lunapaket_0.1.35_all.deb`.
+Das Skript erstellt `dist/lunapaket_0.1.36_all.deb`.
 Zum Bauen wird `dpkg-deb` benötigt.
 
 

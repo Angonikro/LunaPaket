@@ -1,14 +1,74 @@
 #!/usr/bin/python3
-import os, sys, subprocess, re, pwd, json
+import os, sys, subprocess, re, pwd, json, shlex
 from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.35"
+VERSION="0.1.36"
 
 def privileged(args):
     """Führt Systembefehle direkt aus, wenn LunaPaket als root läuft."""
     return list(args) if os.geteuid() == 0 else ["pkexec", *args]
+
+
+def is_apt_command(args):
+    """Erkennt direkte APT-Aufrufe sowie APT-Befehle innerhalb einer Shell-Kette."""
+    values = [str(value) for value in args]
+    for value in values:
+        if os.path.basename(value) == "apt":
+            return True
+    # Vorgemerkte Änderungen werden als "sh -c 'apt ... && apt ...'" gestartet.
+    # In diesem Fall steht apt nicht als eigenes argv-Element zur Verfügung.
+    joined = " ".join(values)
+    return bool(re.search(r"""(?<![A-Za-z0-9_./+-])(?:'apt'|"apt"|apt)(?=[\s'"])""", joined))
+
+def log_apt_problem(args, returncode, output):
+    """Schreibt ausschließlich fehlgeschlagene APT-Aufrufe in ein begrenztes Benutzer-Log."""
+    try:
+        from datetime import datetime
+        uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+        account = pwd.getpwuid(uid)
+        home = Path(account.pw_dir)
+        log_dir = home / ".local" / "share" / "LunaPaket" / "logs"
+        # LunaPaket kann für die Installation als root laufen. Das Protokoll
+        # bleibt trotzdem im Besitz des angemeldeten Desktop-Benutzers.
+        for directory in (home / ".local", home / ".local" / "share",
+                          home / ".local" / "share" / "LunaPaket", log_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+            if os.geteuid() == 0:
+                os.chown(directory, account.pw_uid, account.pw_gid)
+        os.chmod(log_dir, 0o700)
+        log_file = log_dir / "apt-errors.log"
+        backup_file = log_dir / "apt-errors.log.1"
+        max_bytes = 512 * 1024
+        command = shlex.join([str(x) for x in args])
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        details = str(output or "(Keine Programmausgabe vorhanden.)")
+        # Ein einzelner Fehler darf die Größenbegrenzung nicht umgehen.
+        details = details[-(max_bytes - 4096):]
+        entry = (
+            f"\\n{'=' * 72}\\n"
+            f"Zeit: {timestamp}\\n"
+            f"Befehl: {command}\\n"
+            f"Exit-Code: {returncode}\\n"
+            f"Ausgabe:\\n{details.rstrip()}\\n"
+        ).encode("utf-8", errors="replace")
+        if log_file.exists() and log_file.stat().st_size + len(entry) > max_bytes:
+            if backup_file.exists():
+                backup_file.unlink()
+            os.replace(log_file, backup_file)
+        with log_file.open("ab") as stream:
+            stream.write(entry)
+        if os.geteuid() == 0:
+            os.chown(log_file, account.pw_uid, account.pw_gid)
+            if backup_file.exists():
+                os.chown(backup_file, account.pw_uid, account.pw_gid)
+        os.chmod(log_file, 0o600)
+        if backup_file.exists():
+            os.chmod(backup_file, 0o600)
+    except Exception:
+        # Das Logging darf den eigentlichen APT-Fehler nicht verdecken.
+        pass
 
 def relaunch_as_root():
     """Startet die GUI mit Root-Rechten und erhält den Zugriff auf die Desktop-Sitzung."""
@@ -27,7 +87,14 @@ def relaunch_as_root():
     command += ["/usr/bin/python3", os.path.abspath(__file__), *sys.argv[1:]]
     os.execvp(command[0], command)
 def cmd(args):
-    p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=1800)
+    try:
+        p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=1800)
+    except Exception as exc:
+        if is_apt_command(args):
+            log_apt_problem(args, 1, str(exc))
+        raise
+    if p.returncode != 0 and is_apt_command(args):
+        log_apt_problem(args, p.returncode, p.stdout)
     return p.returncode,p.stdout
 class Job(QThread):
     finished_text=Signal(int,str)
@@ -37,6 +104,166 @@ class Job(QThread):
         except Exception as e: r,o=1,str(e)
         self.finished_text.emit(r,o)
 
+
+
+def dpkg_log_snapshot():
+    """Merkt die aktuelle Position im DPKG-Protokoll vor einer Paketaktion."""
+    try:
+        path = Path("/var/log/dpkg.log")
+        return path.stat().st_size if path.exists() else 0
+    except OSError:
+        return 0
+
+
+def dpkg_changes_since(offset):
+    """Liest tatsächliche install/upgrade/remove/purge-Ereignisse aus dpkg.log."""
+    changes = []
+    try:
+        path = Path("/var/log/dpkg.log")
+        if not path.exists():
+            return changes
+        size = path.stat().st_size
+        if size < offset:  # dpkg.log wurde während der Aktion rotiert/neu angelegt
+            offset = 0
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            stream.seek(offset)
+            for line in stream:
+                match = re.match(
+                    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) "
+                    r"(install|upgrade|remove|purge) (\S+) (\S+) (\S+)",
+                    line.strip()
+                )
+                if not match:
+                    continue
+                timestamp, operation, package, old_version, new_version = match.groups()
+                if operation == "install":
+                    label = "Erneut installiert" if old_version != "<none>" else "Installiert"
+                    version = new_version
+                elif operation == "upgrade":
+                    label, version = "Aktualisiert", f"{old_version} -> {new_version}"
+                elif operation == "remove":
+                    label, version = "Entfernt", old_version
+                else:
+                    label, version = "Vollständig entfernt", old_version
+                changes.append((label, package, version, timestamp))
+    except OSError:
+        pass
+    return changes
+
+def package_snapshot():
+    """Ermittelt die aktuell installierten Pakete samt Version."""
+    try:
+        result = subprocess.run(
+            ["dpkg-query", "-W", "-f=${binary:Package}\\t${Version}\\t${db:Status-Status}\\n"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120
+        )
+        if result.returncode != 0:
+            return None
+        packages = {}
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 3 and fields[2] == "installed":
+                packages[fields[0]] = fields[1]
+        return packages
+    except Exception:
+        return None
+
+
+def write_package_history(args, before, after, returncode, dpkg_changes=None):
+    """Schreibt Paketänderungen in einen auf 1 MiB begrenzten Verlauf."""
+    changes = []
+    if dpkg_changes:
+        changes.extend((action, name, version) for action, name, version, _timestamp in dpkg_changes)
+    logged_names = {name for _action, name, _version in changes}
+    if before is not None and after is not None:
+        for name in sorted(set(before) | set(after)):
+            old_version, new_version = before.get(name), after.get(name)
+            if name not in logged_names:
+                if old_version is None and new_version is not None:
+                    changes.append(("Installiert", name, new_version))
+                elif old_version is not None and new_version is None:
+                    changes.append(("Entfernt", name, old_version))
+                elif old_version != new_version:
+                    changes.append(("Aktualisiert", name, f"{old_version} -> {new_version}"))
+    # Bei einer echten Neuinstallation derselben Version bleibt der dpkg-
+    # Versionsbestand unverändert. Diese Aktion muss trotzdem im Verlauf stehen.
+    args_list = [str(value) for value in args]
+    if "--reinstall" in args_list:
+        already_listed = {name for _action, name, _version in changes}
+        for value in args_list:
+            if value.lower().endswith(".deb") and Path(value).is_file():
+                try:
+                    result = subprocess.run(
+                        ["dpkg-deb", "-f", value, "Package", "Version"],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30
+                    )
+                    fields = {}
+                    for line in result.stdout.splitlines():
+                        if ":" in line:
+                            key, val = line.split(":", 1)
+                            fields[key.strip()] = val.strip()
+                    name = fields.get("Package", "")
+                    version = fields.get("Version", "")
+                    if name and name not in already_listed:
+                        changes.append(("Erneut installiert", name, version or after.get(name, "unbekannt")))
+                        already_listed.add(name)
+                except Exception:
+                    pass
+            elif value and not value.startswith("-") and value not in ("apt", "install"):
+                # Paketname bei apt install --reinstall paketname.
+                name = value.split("=", 1)[0].split(":", 1)[0]
+                if name in before and name in after and name not in already_listed:
+                    changes.append(("Erneut installiert", name, after[name]))
+                    already_listed.add(name)
+    if not changes:
+        return
+    try:
+        from datetime import datetime
+        uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+        account = pwd.getpwuid(uid)
+        home = Path(account.pw_dir)
+        log_dir = home / ".local" / "share" / "LunaPaket" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if os.geteuid() == 0:
+            os.chown(log_dir, account.pw_uid, account.pw_gid)
+        os.chmod(log_dir, 0o700)
+        history_file = log_dir / "package-history.log"
+        max_bytes = 1024 * 1024
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        command = shlex.join([str(x) for x in args])
+        result_text = "Erfolgreich" if returncode == 0 else f"Fehler (Exit-Code {returncode})"
+        lines = ["", "=" * 72, f"Zeit: {timestamp}", f"Befehl: {command}",
+                 f"Ergebnis: {result_text}", "Paketänderungen:"]
+        lines.extend(f"  {action}: {name} ({version})" for action, name, version in changes)
+        entry = ("\n".join(lines) + "\n").encode("utf-8", errors="replace")
+        if len(entry) > max_bytes:
+            entry = entry[-max_bytes:]
+        existing = history_file.read_bytes() if history_file.exists() else b""
+        combined = existing + entry
+        if len(combined) > max_bytes:
+            combined = combined[-max_bytes:]
+            first_newline = combined.find(b"\n")
+            if first_newline >= 0:
+                combined = combined[first_newline + 1:]
+        history_file.write_bytes(combined)
+        if os.geteuid() == 0:
+            os.chown(history_file, account.pw_uid, account.pw_gid)
+        os.chmod(history_file, 0o600)
+    except Exception:
+        # Der Verlauf darf die Paketverwaltung niemals blockieren.
+        pass
+
+
+def read_package_history():
+    """Liest den Paketverlauf des angemeldeten Desktop-Benutzers."""
+    try:
+        uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+        home = Path(pwd.getpwuid(uid).pw_dir)
+        path = home / ".local" / "share" / "LunaPaket" / "logs" / "package-history.log"
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
 class StreamJob(QThread):
     output = Signal(str)
     finished_text = Signal(int, str)
@@ -44,6 +271,9 @@ class StreamJob(QThread):
         super().__init__(); self.args = args
     def run(self):
         chunks = []
+        tracks_packages = is_apt_command(self.args)
+        before = package_snapshot() if tracks_packages else None
+        dpkg_offset = dpkg_log_snapshot() if tracks_packages else 0
         try:
             proc = subprocess.Popen(self.args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1, universal_newlines=True,
@@ -51,8 +281,18 @@ class StreamJob(QThread):
             for line in iter(proc.stdout.readline, ''):
                 chunks.append(line); self.output.emit(line.rstrip())
             proc.stdout.close(); rc = proc.wait()
-            self.finished_text.emit(rc, ''.join(chunks))
+            output = ''.join(chunks)
+            if tracks_packages:
+                dpkg_changes = dpkg_changes_since(dpkg_offset)
+                write_package_history(self.args, before, package_snapshot(), rc, dpkg_changes)
+            if rc != 0 and tracks_packages:
+                log_apt_problem(self.args, rc, output)
+            self.finished_text.emit(rc, output)
         except Exception as exc:
+            if tracks_packages:
+                dpkg_changes = dpkg_changes_since(dpkg_offset)
+                write_package_history(self.args, before, package_snapshot(), 1, dpkg_changes)
+                log_apt_problem(self.args, 1, str(exc))
             self.finished_text.emit(1, str(exc))
 
 class FunctionJob(QThread):
@@ -190,6 +430,11 @@ class Window(QMainWindow):
         refresh_action.setShortcut("Ctrl+R")
         refresh_action.triggered.connect(self.update_lists)
         file_menu.addAction(refresh_action)
+
+        history_action = QAction("Paketverlauf anzeigen …", self)
+        history_action.setToolTip("Zuletzt installierte, entfernte und aktualisierte Pakete anzeigen")
+        history_action.triggered.connect(self.show_package_history)
+        file_menu.addAction(history_action)
 
         file_menu.addSeparator()
         exit_action = QAction("Beenden", self)
@@ -976,7 +1221,7 @@ class Window(QMainWindow):
             self.status.setText("Aufräumen abgebrochen – keine Pakete entfernt")
             return
         # Beibehalten: die tatsächlich funktionierende APT-Autoremove-Ausführung.
-        self.run_action_job(privileged(["apt-get", "-o", "APT::Status-Fd=2", "-y", "autoremove"]),
+        self.run_action_job(privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "autoremove"]),
                             "Aufräumen", f"APT entfernt nicht mehr benötigte Pakete ({len(candidates)} gefunden).",
                             len(candidates))
 
@@ -1025,10 +1270,10 @@ class Window(QMainWindow):
         for action, apt_args in groups:
             names = [n for n, a in actions.items() if a == action]
             if names:
-                apt_commands.append(["apt-get", "-s"] + apt_args + names)
+                apt_commands.append(["apt", "-s"] + apt_args + names)
         versions = [(n, a.split(":", 1)[1]) for n, a in actions.items() if a.startswith("version:")]
         for n, version in versions:
-            apt_commands.append(["apt-get", "-s", "install", f"{n}={version}"])
+            apt_commands.append(["apt", "-s", "install", f"{n}={version}"])
         previews = []
         for command in apt_commands:
             rc, output = cmd(command)
@@ -1094,14 +1339,14 @@ class Window(QMainWindow):
         for action, apt_args in groups:
             names = [n for n, a in actions.items() if a == action]
             if names:
-                commands.append(["apt-get", "-o", "APT::Status-Fd=2", "-y"] + apt_args + names)
-        commands.extend([["apt-get", "-o", "APT::Status-Fd=2", "-y", "install", f"{n}={version}"] for n, version in versions])
+                commands.append(["apt", "-o", "APT::Status-Fd=2", "-y"] + apt_args + names)
+        commands.extend([["apt", "-o", "APT::Status-Fd=2", "-y", "install", f"{n}={version}"] for n, version in versions])
         commands.extend([["apt-mark", a, n] for n, a in actions.items() if a in ("hold", "unhold")])
         if not commands:
             return
         has_installation = any(a in ("install", "reinstall") or a.startswith("version:") for a in actions.values())
         if has_installation and self.clean_cache_enabled:
-            commands.append(["apt-get", "clean"])
+            commands.append(["apt", "clean"])
         self.queue.clear()
         self.update_queue_label()
         shell = "set -e; " + " && ".join(" ".join("'" + x.replace("'", "'\\''") + "'" for x in c) for c in commands)
@@ -1111,6 +1356,25 @@ class Window(QMainWindow):
                             f"{len(actions)} ausgewählte Paketaktion(en) werden ausgeführt.", expected,
                             auto_close=auto_close.isChecked())
 
+    def show_package_history(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Paketverlauf")
+        dialog.resize(850, 600)
+        layout = QVBoxLayout(dialog)
+        info = QLabel("Installierte, entfernte und aktualisierte Pakete. Der Verlauf ist auf maximal 1 MB begrenzt.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        history = read_package_history()
+        view.setPlainText(history if history else "Noch keine Paketänderungen durch LunaPaket protokolliert.")
+        layout.addWidget(view, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
     def set_busy(self, busy):
         self._busy = bool(busy)
         self.update_btn.setEnabled(not busy)
@@ -1118,7 +1382,7 @@ class Window(QMainWindow):
     @staticmethod
     def apt_status_progress(line):
         """Liest APTs maschinenlesbares dlstatus-/pmstatus-Protokoll."""
-        clean = line.strip().lstrip("\\x1b")
+        clean = line.strip().lstrip("\x1b")
         fields = clean.split(":", 3)
         if len(fields) < 4:
             return None, None
@@ -1157,7 +1421,7 @@ class Window(QMainWindow):
                 dialog.set_progress(apt_percent, apt_message)
                 return
             # Fallback for APT versions without status-fd progress.
-            match = re.match(r"^(?:Setting up|Removing|Purging|Unpacking)\\s+([^ :]+)", line)
+            match = re.match(r"^(?:Setting up|Removing|Purging|Unpacking)\s+([^ :]+)", line)
             if match:
                 package = match.group(1)
                 completed.add(package)
@@ -1193,7 +1457,7 @@ class Window(QMainWindow):
     def update_lists(self):
         self.catalog_cache = None
         self._table_catalog_ready = False
-        self.run_job(privileged(["apt-get","update"]))
+        self.run_job(privileged(["apt","update"]))
     def upgrade(self):
         self.catalog_cache = None
         self._table_catalog_ready = False
@@ -1207,7 +1471,7 @@ class Window(QMainWindow):
 
     @staticmethod
     def check_upgrades():
-        rc, update_output = cmd(privileged(["apt-get", "update"]))
+        rc, update_output = cmd(privileged(["apt", "update"]))
         if rc != 0:
             raise RuntimeError("Paketlisten konnten nicht aktualisiert werden.\n\n" + update_output)
         rc, listing = cmd(["apt", "list", "--upgradable"])
@@ -1217,7 +1481,7 @@ class Window(QMainWindow):
         # APT nennt bei der Upgrade-Simulation die Herkunft der Zielversion.
         # Debian-Sicherheitsquellen sind an security.debian.org bzw.
         # trixie-security/bookworm-security und Debian-Security erkennbar.
-        rc, simulation = cmd(["apt-get", "-s", "upgrade"])
+        rc, simulation = cmd(["apt", "-s", "upgrade"])
         if rc != 0:
             raise RuntimeError(simulation or "Sicherheitsaktualisierungen konnten nicht erkannt werden.")
         security_names = set()
@@ -1308,9 +1572,9 @@ class Window(QMainWindow):
         self.set_busy(True)
         if security_only:
             names = [line.split()[0].split("/", 1)[0] for line in packages]
-            args = privileged(["apt-get", "-o", "APT::Status-Fd=2", "-y", "--only-upgrade", "install", *names])
+            args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "--only-upgrade", "install", *names])
         else:
-            args = privileged(["apt-get", "-o", "APT::Status-Fd=2", "-y", "upgrade"])
+            args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "upgrade"])
         self.upgrade_stream = StreamJob(args)
         unpacked = set()
         configured = set()
@@ -1406,7 +1670,7 @@ class Window(QMainWindow):
 
     @staticmethod
     def find_security_updates():
-        rc, update_out = cmd(privileged(["apt-get", "update"]))
+        rc, update_out = cmd(privileged(["apt", "update"]))
         if rc:
             raise RuntimeError("Paketlisten konnten nicht aktualisiert werden:\n" + update_out)
         rc, listing = cmd(["apt", "list", "--upgradable"])
@@ -1531,7 +1795,7 @@ class Window(QMainWindow):
             if not chosen:
                 QMessageBox.information(dlg, "Sicherheitsupdates", "Bitte mindestens ein Update auswählen."); return
             names = [x["package"] for x in chosen]
-            preview_rc, preview = cmd(["apt-get", "-s", "--only-upgrade", "install", *names])
+            preview_rc, preview = cmd(["apt", "-s", "--only-upgrade", "install", *names])
             if preview_rc:
                 QMessageBox.critical(dlg, "APT-Vorschau fehlgeschlagen", preview); return
             question = "Folgende Sicherheitsupdates werden installiert:\n\n" + "\n".join(names) + "\n\n" + preview[-7000:] + "\n\nFortfahren?"
@@ -1560,7 +1824,7 @@ class Window(QMainWindow):
         progress = ActionProgressDialog(self, "Sicherheitsupdates installieren",
                                         f"{len(names)} ausgewählte Sicherheitsupdates werden installiert.")
         self.set_busy(True)
-        args = privileged(["apt-get", "-o", "APT::Status-Fd=2", "-y", "--only-upgrade", "install", *names])
+        args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "--only-upgrade", "install", *names])
         self.security_install_stream = StreamJob(args)
         self.security_install_stream.output.connect(lambda line: (
             progress.append_output(line),
@@ -1717,7 +1981,7 @@ class Window(QMainWindow):
 
     def check_sources(self):
         progress=ActionProgressDialog(self,"Paketquellen prüfen","APT prüft alle konfigurierten Paketquellen und meldet fehlerhafte oder nicht erreichbare Repositories.")
-        job=StreamJob(privileged(["apt-get","update"]))
+        job=StreamJob(privileged(["apt","update"]))
         job.output.connect(progress.append_output)
         result={"code":1}
         def done(rc,out):
@@ -1832,7 +2096,7 @@ class Window(QMainWindow):
             QMessageBox.information(self,"Keine Installation","Es gibt keine neuen oder aktualisierbaren Pakete. Für eine Neuinstallation bitte „Erneut installieren“ wählen.")
             return
 
-        apt_args=["apt-get","install","-y"]
+        apt_args=["apt","install","-y"]
         if reinstall:
             apt_args.append("--reinstall")
         args=privileged([*apt_args,*normal_paths])

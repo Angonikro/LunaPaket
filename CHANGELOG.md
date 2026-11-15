@@ -1,3 +1,20 @@
+## 0.1.36
+- Fehlerhafte doppelte Maskierung in den DPKG-Auswertungsmustern behoben; Erstinstallationen, erneute Installationen, Entfernungen, vollständige Entfernungen und Upgrades werden dadurch zuverlässig erkannt.
+- Paketverlauf schreibt wieder echte Zeilenumbrüche statt sichtbarer `\n`-Sequenzen.
+- Der Bereich „Aufräumen“ wird über dieselbe DPKG-Ereigniserfassung protokolliert; tatsächlich entfernte Pakete erscheinen als Verlaufseinträge.
+- Paketverlauf auf tatsächliche DPKG-Ereignisse umgestellt: Installationen, Neuinstallationen (auch gleiche Version), Upgrades, Entfernungen und vollständige Entfernungen werden direkt aus `/var/log/dpkg.log` erfasst.
+- Erkennung shell-quotierter APT-Aufrufe korrigiert; damit werden auch gebündelte vorgemerkte Aktionen protokolliert.
+- Neuinstallationen derselben Paketversion werden jetzt ebenfalls als „Erneut installiert“ erfasst, auch wenn sich die Versionsnummer vor und nach der Aktion nicht ändert.
+- Paketverlauf korrigiert: Auch APT-Aktionen, die LunaPaket als Shell-Kette für vorgemerkte Änderungen ausführt, werden jetzt erkannt und protokolliert.
+- Paketverlauf in der Oberfläche ergänzt: über „Datei → Paketverlauf anzeigen …“ lassen sich zuletzt installierte, entfernte und aktualisierte Pakete einsehen.
+- Der Verlauf erfasst Paketnamen, Versionen, Zeitstempel, ausgeführten APT-Befehl und Ergebnis; auch teilweise Paketänderungen bei fehlgeschlagenen APT-Aktionen werden festgehalten.
+- Paketverlauf unter `~/.local/share/LunaPaket/logs/package-history.log`, auf maximal 1 MiB begrenzt; bei Platzbedarf werden die ältesten Einträge verworfen.
+- APT-Aufrufe in LunaPaket konsequent von `apt-get` auf `apt` umgestellt, einschließlich Systemaktualisierung, Sicherheitsupdates, Paketquellenprüfung, Installation und Aufräumen.
+- Systemaktualisierung verwendet `apt upgrade`, damit erforderliche zusätzliche Pakete (z. B. neue Kernelpakete) mitinstalliert werden können.
+- Fehlgeschlagene APT-Aufrufe werden mit Zeitstempel, Befehl, Exit-Code und Ausgabe protokolliert.
+- Fehlerprotokoll unter `~/.local/share/LunaPaket/logs/apt-errors.log`; Begrenzung auf 512 KB plus eine rotierte Sicherung.
+- Erfolgreiche APT-Aktionen erzeugen keine eigenen Fehlerprotokolleinträge.
+
 # Änderungsprotokoll LunaPaket
 
 ## 0.1.35
