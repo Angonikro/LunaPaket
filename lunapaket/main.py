@@ -1,10 +1,29 @@
 #!/usr/bin/python3
 import os, sys, subprocess, re, pwd, json, shlex
 from pathlib import Path
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.37"
+VERSION="0.1.38"
+
+# Thematische Filter auf dem bereits geladenen Paketbestand.
+# Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
+# dadurch in mehreren Bereichen erscheinen.
+TOPIC_CATEGORIES = [
+    ("amateurfunk", "Amateurfunk", "Amateur Radio", r"\b(hamradio|amateur.?radio|gnuradio|gqrx|rtl.?sdr|soapysdr|direwolf|fldigi|chirp|qsstv|wsjtx|js8call|hamlib|ax25|aprs|cqrlog|xastir|qtel|sdrangel)\b"),
+    ("network", "Internet & Netzwerk", "Internet & Network", r"\b(network|netzwerk|browser|firefox|chromium|curl|wget|ssh|openssh|ftp|sftp|wifi|wireless|wireshark|tcpdump|nmap| traceroute|dns|vpn)\b"),
+    ("audio", "Audio & Musik", "Audio & Music", r"\b(audio|musik|music|sound|alsa|pulseaudio|pipewire|vlc|audacity|ardour|lmms|mpd|mplayer|rhythmbox|strawberry|lame|flac|vorbis)\b"),
+    ("video", "Video & Multimedia", "Video & Multimedia", r"\b(video|multimedia|ffmpeg|ffplay|handbrake|makemkv|mkvtoolnix|kdenlive|shotcut|obs-studio|mpv|totem|dvd|bluray|gstreamer)\b"),
+    ("graphics", "Grafik & Design", "Graphics & Design", r"\b(graphics|grafik|image|bildbearbeitung|gimp|inkscape|krita|blender|darktable|scribus|imagemagick|inkscape|freecad|openscad|cad)\b"),
+    ("programming", "Programmierung", "Programming", r"\b(programming|programmierung|compiler|debugger|python|python3|gcc|g\+\+|clang|cmake|git|geany|kate|vim|emacs|code editor|ide|qtcreator| Lazarus|rustc|nodejs|golang)\b"),
+    ("system", "System & Verwaltung", "System & Administration", r"\b(system|administration|verwaltung|systemd|gnome-system|partition|disk|laufwerk|backup|monitor|htop|lshw|hardinfo|gparted|timeshift|grub|udev|aptitude)\b"),
+    ("security", "Sicherheit", "Security", r"\b(security|sicherheit|firewall|ufw|gufw|clamav|antivirus|crypt|verschlüssel|gnupg|gpg|keepass|fail2ban|apparmor|selinux|rkhunter|chkrootkit)\b"),
+    ("electronics", "Elektronik & Hardware", "Electronics & Hardware", r"\b(electronics|elektronik|hardware|arduino|raspberry|raspi|esp32|esp-idf|platformio|avrdude|openocd|esptool|kicad|electronics|microcontroller|mikrocontroller|i2c|spi|serial)\b"),
+    ("office", "Büro & Bildung", "Office & Education", r"\b(office|büro|bildung|education|libreoffice|openoffice|pdf|okular|evince|texlive|latex|dictionary|wörterbuch|learning|lernprogramm|stellarium|kalzium)\b"),
+    ("games", "Spiele", "Games", r"\b(game|games|spiel|spiele|steam|lutris|dosbox|retroarch|scummvm|minecraft|supertux|xonotic|emulator)\b"),
+    ("science", "Wissenschaft & Navigation", "Science & Navigation", r"\b(science|wissenschaft|navigation|gps|gpsd|qgis|map|karte|kartographie|stellarium|celestia|gnuplot|octave|scipy|r-?base|geography|astronomy|astronomie)\b"),
+]
+TOPIC_REGEX = {key: re.compile(pattern, re.IGNORECASE) for key, _de, _en, pattern in TOPIC_CATEGORIES}
 
 
 class PackageTableModel(QAbstractTableModel):
@@ -85,6 +104,20 @@ class PackageTableModel(QAbstractTableModel):
             if category==2 and installed: continue
             if category==3 and name.split(":",1)[0] not in auto: continue
             if category==4 and not queue.get(name): continue
+            if category >= 6:
+                topic_index = category - 6
+                if topic_index >= len(TOPIC_CATEGORIES): continue
+                topic_key = TOPIC_CATEGORIES[topic_index][0]
+                searchable = self.search_texts[source_row]
+                # Debian verwendet "games" bzw. "games/..." als Section.
+                # Die Regel gilt automatisch für alle Pakete dieser Sektion.
+                section = str(row[4] if len(row) > 4 else "").casefold()
+                is_game_section = section == "games" or section.startswith("games/")
+                if topic_key == "games":
+                    if not is_game_section and not TOPIC_REGEX[topic_key].search(searchable):
+                        continue
+                elif not TOPIC_REGEX[topic_key].search(searchable):
+                    continue
             if term and term not in self.search_texts[source_row]: continue
             selected.append(source_row)
         if selected == self.visible_rows: return len(selected)
@@ -530,10 +563,37 @@ class Window(QMainWindow):
         self.font_size = int(self.settings.value("font_size", 11))
         app_font = QApplication.font(); app_font.setPointSize(self.font_size); QApplication.setFont(app_font)
         w=QWidget(); self.setCentralWidget(w); outer=QHBoxLayout(w)
-        self.sidebar=QListWidget(); self.sidebar.setObjectName("packageSidebar"); self.sidebar.setFixedWidth(205)
+        # Zwei getrennte Listen: Grundansichten bleiben oben, Themenbereiche
+        # werden mit einem Stretch-Element am unteren Rand der Seitenleiste verankert.
+        self.sidebar_panel = QWidget()
+        self.sidebar_panel.setFixedWidth(205)
+        sidebar_layout = QVBoxLayout(self.sidebar_panel)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
+        self.sidebar = QListWidget()
+        self.sidebar.setObjectName("packageSidebar")
         self.sidebar.addItems(["Alle Pakete", "Installiert", "Nicht installiert", "Aufräumen", "Vorgemerkt"])
-        self.sidebar.setCurrentRow(0); self.sidebar.currentRowChanged.connect(self.sidebar_changed)
-        outer.addWidget(self.sidebar)
+        self.sidebar.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sidebar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        sidebar_layout.addWidget(self.sidebar)
+        sidebar_layout.addStretch(1)
+        self.topic_sidebar = QListWidget()
+        self.topic_sidebar.setObjectName("packageSidebar")
+        for _key, label_de, _label_en, _pattern in TOPIC_CATEGORIES:
+            self.topic_sidebar.addItem(label_de)
+        # Die Themenliste bleibt unten verankert; Scrollleisten werden ausgeblendet.
+        # Scrollen per Mausrad bleibt bei Bedarf weiterhin möglich.
+        self.topic_sidebar.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.topic_sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.topic_sidebar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        sidebar_layout.addWidget(self.topic_sidebar)
+        self._sidebar_sync = False
+        self.sidebar.setCurrentRow(0)
+        self.sidebar.currentRowChanged.connect(self._base_sidebar_changed)
+        self.topic_sidebar.currentRowChanged.connect(self._topic_sidebar_changed)
+        outer.addWidget(self.sidebar_panel)
+        self.sidebar.setFixedHeight(5 * 40 + 12)
+        self.topic_sidebar.setFixedHeight(len(TOPIC_CATEGORIES) * 40 + 12)
         content=QWidget(); outer.addWidget(content,1); l=QVBoxLayout(content)
         h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>" + ("Debian package manager" if self.language == "en" else "Debian-Paketverwaltung")); self._main_subtitle_label = title; h.addWidget(title); h.addStretch()
         self.repo_btn=QPushButton("Paketquellen verwalten")
@@ -716,7 +776,14 @@ class Window(QMainWindow):
         translations = {
             "LunaPaket – Paketverwaltung":"LunaPaket – Package Manager",
             "Alle Pakete":"All packages","Installiert":"Installed","Nicht installiert":"Not installed",
-            "Aufräumen":"Cleanup","Vorgemerkt":"Queued","Paketquellen verwalten":"Manage repositories",
+            "Aufräumen":"Cleanup","Vorgemerkt":"Queued","Amateurfunk":"Amateur Radio",
+            "Internet & Netzwerk":"Internet & Network","Audio & Musik":"Audio & Music",
+            "Video & Multimedia":"Video & Multimedia","Grafik & Design":"Graphics & Design",
+            "Programmierung":"Programming","System & Verwaltung":"System & Administration",
+            "Sicherheit":"Security","Elektronik & Hardware":"Electronics & Hardware",
+            "Büro & Bildung":"Office & Education","Spiele":"Games",
+            "Wissenschaft & Navigation":"Science & Navigation",
+            "Paketquellen verwalten":"Manage repositories",
             "APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren":"Add, edit, enable or disable APT repositories",
             "Paketlisten aktualisieren":"Refresh package lists","System aktualisieren":"Upgrade system",
             "Sicherheitsupdates verwalten":"Manage security updates","Pakete suchen …":"Search packages …",
@@ -1009,6 +1076,22 @@ class Window(QMainWindow):
         return out
     def load_installed(self):
         self.search_pkgs()
+    def _base_sidebar_changed(self, row):
+        if self._sidebar_sync or row < 0:
+            return
+        self._sidebar_sync = True
+        self.topic_sidebar.setCurrentRow(-1)
+        self._sidebar_sync = False
+        self.sidebar_changed(row)
+
+    def _topic_sidebar_changed(self, row):
+        if self._sidebar_sync or row < 0:
+            return
+        self._sidebar_sync = True
+        self.sidebar.setCurrentRow(-1)
+        self._sidebar_sync = False
+        self.sidebar_changed(6 + row)
+
     def sidebar_changed(self, _row):
         # Das Sammelkästchen ist ausschließlich im Bereich „Aufräumen“ sichtbar.
         self.cleanup_select_all.blockSignals(True)
@@ -1092,10 +1175,14 @@ class Window(QMainWindow):
         """Aktualisiert den gefilterten Modellindex ohne tausende setRowHidden-Aufrufe."""
         self.apply_table_filters()
 
+    def _current_sidebar_category(self):
+        topic_row = self.topic_sidebar.currentRow()
+        return 6 + topic_row if topic_row >= 0 else max(0, self.sidebar.currentRow())
+
     def apply_table_filters(self):
         if self.catalog_cache is None or not getattr(self, "_table_catalog_ready", False):
             return
-        category = self.sidebar.currentRow()
+        category = self._current_sidebar_category()
         autoremove = self.catalog_cache.get("autoremove", set())
         visible = self.table.package_model.apply_filter(
             category, self.search.text().strip(), autoremove, self.queue)
@@ -1157,9 +1244,12 @@ class Window(QMainWindow):
             selected = installed if is_installed else candidate
             version = selected.version if selected is not None else ""
             summary = (selected.summary or "") if selected is not None else ""
+            # Debian-Sektion als zusätzliche, nicht sichtbare Filter-Metainformation.
+            # Spiele werden anhand der Paketmetadaten erkannt, nicht über Paketnamen.
+            section = (getattr(selected, "section", "") or "") if selected is not None else ""
             rows.append((name, version,
                          "Installiert" if is_installed else "Nicht installiert",
-                         summary))
+                         summary, section))
             if package.is_upgradable:
                 upgradable.add(name.split(":", 1)[0])
             if package.is_auto_removable:
@@ -1370,7 +1460,7 @@ class Window(QMainWindow):
 
     def remove_action(self):
         # In der Kategorie „Aufräumen“ bleibt APTs bestehende Autoremove-Erkennung erhalten.
-        if self.sidebar.currentRow() == 3:
+        if self._current_sidebar_category() == 3:
             self.show_autoremove_dialog()
             return
         name = self.selected()

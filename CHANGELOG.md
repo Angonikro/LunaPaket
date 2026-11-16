@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.38 Thematische Softwarebereiche - Performance Update
+- Neue Seitenleisten-Kategorien: Amateurfunk, Internet & Netzwerk, Audio & Musik, Video & Multimedia, Grafik & Design, Programmierung, System & Verwaltung, Sicherheit, Elektronik & Hardware, Büro & Bildung, Spiele sowie Wissenschaft & Navigation.
+- Kategorienamen vollständig auf Deutsch und Englisch übersetzt.
+- Kategorien filtern den bereits geladenen Paketbestand anhand von Paketnamen und Kurzbeschreibungen; der APT-Katalog wird dafür nicht erneut geladen.
+- Mehrfachzuordnungen sind möglich, weil die Bereiche unabhängig voneinander filtern.
+- Bestehende Bereiche, Installationsstatus, Vormerkungen und APT-Abläufe bleiben erhalten.
+- Vertikale und horizontale Scrollleisten der Themenbereiche in der linken Seitenleiste ausgeblendet; Mausradbedienung bleibt erhalten.
+- Thematische Paketbereiche in der linken Seitenleiste ergänzt (Deutsch/Englisch).
+- Bereiche filtern den vorhandenen Paketbestand; Pakete können mehreren Bereichen zugeordnet sein.
+
 ## 0.1.37
 - Paketübersicht für 70.549 Pakete optimiert; der vollständige Paketbestand bleibt im Speicher.
 - Kategorie- und Statusfilter für „Alle Pakete“, „Installiert“, „Nicht installiert“, „Aufräumen“ und „Vorgemerkt“ beschleunigt.
