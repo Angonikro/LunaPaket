@@ -23,7 +23,6 @@ grafische Oberfläche auf Basis von Python 3 und PySide6.
 - Einstellbare Schriftgröße
 - Oberflächensprache Deutsch/Englisch
 - Hell-/Dunkel-Theme
-- Deutsch/Englisch
 
 ## Einstellungen
 
