@@ -1,4 +1,15 @@
-# Changelog
+# Änderungsprotokoll LunaPaket
+
+## 0.1.39 Schriftgröße und anpassbare Fensteraufteilung
+- Linke Seitenleiste standardmäßig um etwa 2 cm verbreitert.
+- Seitenleiste und Paketbereich lassen sich über einen horizontalen Teiler nach links/rechts in der Breite verändern.
+- Paketliste und unterer Detailbereich lassen sich über einen vertikalen Teiler in der Höhe verändern.
+- Beide Teilerpositionen werden gespeichert und beim nächsten Start wiederhergestellt.
+- Fehler behoben: Die fest in den Themes hinterlegte Schriftgröße von 11 pt hat die gespeicherte bzw. ausgewählte Schriftgröße überschrieben.
+- Die Theme-Stylesheets verwenden jetzt die eingestellte Schriftgröße.
+- Nach einer Änderung über „Einstellungen → Schriftgröße …“ wird das aktive Theme mit der neuen Größe erneut angewendet.
+- Die gewählte Schriftgröße bleibt wie bisher in `~/.config/LunaPaket/LunaPaket.conf` gespeichert.
+- Keine Änderungen an Paketkatalog, Filtern oder APT-Abläufen.
 
 ## 0.1.38 Thematische Softwarebereiche - Performance Update
 - Neue Seitenleisten-Kategorien: Amateurfunk, Internet & Netzwerk, Audio & Musik, Video & Multimedia, Grafik & Design, Programmierung, System & Verwaltung, Sicherheit, Elektronik & Hardware, Büro & Bildung, Spiele sowie Wissenschaft & Navigation.

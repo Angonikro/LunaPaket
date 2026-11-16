@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.38"
+VERSION="0.1.39"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
@@ -559,14 +559,19 @@ class Window(QMainWindow):
         self.settings = QSettings(os.path.join(settings_dir, "LunaPaket.conf"), QSettings.IniFormat)
         self.language = str(self.settings.value("language", "de"))
         self.theme = str(self.settings.value("theme", "dark"))
-        self.apply_theme()
         self.font_size = int(self.settings.value("font_size", 11))
         app_font = QApplication.font(); app_font.setPointSize(self.font_size); QApplication.setFont(app_font)
+        self.apply_theme()
         w=QWidget(); self.setCentralWidget(w); outer=QHBoxLayout(w)
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.setHandleWidth(7)
+        outer.addWidget(main_splitter)
         # Zwei getrennte Listen: Grundansichten bleiben oben, Themenbereiche
         # werden mit einem Stretch-Element am unteren Rand der Seitenleiste verankert.
         self.sidebar_panel = QWidget()
-        self.sidebar_panel.setFixedWidth(205)
+        self.sidebar_panel.setMinimumWidth(205)
+        self.sidebar_panel.setMaximumWidth(600)
         sidebar_layout = QVBoxLayout(self.sidebar_panel)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(0)
@@ -591,10 +596,10 @@ class Window(QMainWindow):
         self.sidebar.setCurrentRow(0)
         self.sidebar.currentRowChanged.connect(self._base_sidebar_changed)
         self.topic_sidebar.currentRowChanged.connect(self._topic_sidebar_changed)
-        outer.addWidget(self.sidebar_panel)
+        main_splitter.addWidget(self.sidebar_panel)
         self.sidebar.setFixedHeight(5 * 40 + 12)
         self.topic_sidebar.setFixedHeight(len(TOPIC_CATEGORIES) * 40 + 12)
-        content=QWidget(); outer.addWidget(content,1); l=QVBoxLayout(content)
+        content=QWidget(); main_splitter.addWidget(content); main_splitter.setStretchFactor(0, 0); main_splitter.setStretchFactor(1, 1); main_splitter.setSizes([280, 1320]); l=QVBoxLayout(content)
         h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>" + ("Debian package manager" if self.language == "en" else "Debian-Paketverwaltung")); self._main_subtitle_label = title; h.addWidget(title); h.addStretch()
         self.repo_btn=QPushButton("Paketquellen verwalten")
         self.repo_btn.setToolTip("APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren")
@@ -614,7 +619,13 @@ class Window(QMainWindow):
         self.cleanup_select_all.setVisible(False)
         self.cleanup_select_all.toggled.connect(self.toggle_all_cleanup_packages)
         l.addWidget(self.cleanup_select_all)
-        self.table=PackageTableView(self); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.selectionModel().selectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); l.addWidget(self.table,4)
+        # Vertikaler Teiler: Tabellenbereich oben, Paketdetails/Status unten.
+        self.work_splitter = QSplitter(Qt.Vertical)
+        self.work_splitter.setChildrenCollapsible(False)
+        self.work_splitter.setHandleWidth(7)
+        upper_panel = QWidget(); upper_layout = QVBoxLayout(upper_panel)
+        upper_layout.setContentsMargins(0, 0, 0, 0)
+        self.table=PackageTableView(self); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.selectionModel().selectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); upper_layout.addWidget(self.table, 1)
         row=QHBoxLayout()
         clear_queue_btn=QPushButton("Vormerkung löschen")
         clear_queue_btn.clicked.connect(self.clear_queue)
@@ -622,8 +633,21 @@ class Window(QMainWindow):
         apply_queue_btn=QPushButton("Vorgemerkte Änderungen anwenden")
         apply_queue_btn.clicked.connect(self.apply_queued_changes)
         row.addWidget(apply_queue_btn)
-        l.addLayout(row); self.details=QTextEdit(); self.details.setReadOnly(True); self.details.setMaximumHeight(170); l.addWidget(self.details,1)
-        self.queue_label=QLabel("Keine vorgemerkten Änderungen"); l.addWidget(self.queue_label); self.status=QLabel("Bereit"); l.addWidget(self.status)
+        upper_layout.addLayout(row)
+        lower_panel = QWidget(); lower_layout = QVBoxLayout(lower_panel)
+        lower_layout.setContentsMargins(0, 0, 0, 0)
+        self.details=QTextEdit(); self.details.setReadOnly(True); lower_layout.addWidget(self.details, 1)
+        self.queue_label=QLabel("Keine vorgemerkten Änderungen"); lower_layout.addWidget(self.queue_label); self.status=QLabel("Bereit"); lower_layout.addWidget(self.status)
+        self.work_splitter.addWidget(upper_panel); self.work_splitter.addWidget(lower_panel)
+        self.work_splitter.setStretchFactor(0, 4); self.work_splitter.setStretchFactor(1, 1)
+        self.work_splitter.setSizes([560, 180])
+        saved_h = self.settings.value("layout/horizontal_splitter")
+        saved_v = self.settings.value("layout/vertical_splitter")
+        if saved_h: main_splitter.restoreState(saved_h)
+        if saved_v: self.work_splitter.restoreState(saved_v)
+        main_splitter.splitterMoved.connect(lambda *_: self.settings.setValue("layout/horizontal_splitter", main_splitter.saveState()))
+        self.work_splitter.splitterMoved.connect(lambda *_: self.settings.setValue("layout/vertical_splitter", self.work_splitter.saveState()))
+        l.addWidget(self.work_splitter, 1)
         # Hauptmenü „Datei“ mit den wichtigsten Datei- und Programmaktionen.
         file_menu = self.menuBar().addMenu("Datei")
 
@@ -708,9 +732,9 @@ class Window(QMainWindow):
 
     def apply_theme(self):
         if self.theme == "light":
-            self.setStyleSheet("QMainWindow,QWidget{background:#f3f4f8;color:#252638;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget,QTableView{background:#ffffff;color:#252638;border:1px solid #c9cbd8;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#e4e2ee;color:#37334b;padding:7px} QListWidget#packageSidebar{background:#e9e8f0;border:1px solid #c9c6d6;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator,QTableView::indicator{width:18px;height:18px} QTableWidget::indicator:checked,QTableView::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked,QTableView::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px}")
+            self.setStyleSheet("QMainWindow,QWidget{background:#f3f4f8;color:#252638;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget,QTableView{background:#ffffff;color:#252638;border:1px solid #c9cbd8;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#e4e2ee;color:#37334b;padding:7px} QListWidget#packageSidebar{background:#e9e8f0;border:1px solid #c9c6d6;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator,QTableView::indicator{width:18px;height:18px} QTableWidget::indicator:checked,QTableView::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked,QTableView::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px}".replace("font-size:11pt", f"font-size:{self.font_size}pt"))
         else:
-            self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget,QTableView{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator,QTableView::indicator{width:18px;height:18px} QTableWidget::indicator:checked,QTableView::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked,QTableView::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #c9b5ff;border-radius:3px}")
+            self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget,QTableView{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator,QTableView::indicator{width:18px;height:18px} QTableWidget::indicator:checked,QTableView::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked,QTableView::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #c9b5ff;border-radius:3px}".replace("font-size:11pt", f"font-size:{self.font_size}pt"))
     def translate_dialog(self, dialog):
         if self.language != "en":
             return
@@ -913,6 +937,8 @@ class Window(QMainWindow):
         self.settings.setValue("window/remember", self.remember_window_enabled)
         if self.remember_window_enabled:
             self.settings.setValue("window/geometry", self.saveGeometry())
+        if hasattr(self, "work_splitter"):
+            self.settings.setValue("layout/vertical_splitter", self.work_splitter.saveState())
         else:
             self.settings.remove("window/geometry")
         self._sync_settings_permissions()
@@ -1034,6 +1060,8 @@ class Window(QMainWindow):
     def closeEvent(self, event):
         if self.remember_window_enabled:
             self.settings.setValue("window/geometry", self.saveGeometry())
+        if hasattr(self, "work_splitter"):
+            self.settings.setValue("layout/vertical_splitter", self.work_splitter.saveState())
         self._sync_settings_permissions()
         super().closeEvent(event)
     def rows(self, data):
@@ -1142,6 +1170,9 @@ class Window(QMainWindow):
             self.font_size = size
             self.settings.setValue("font_size", size)
             font = QApplication.font(); font.setPointSize(size); QApplication.setFont(font)
+            # QSS-Schriftgrößen überschreiben die Qt-Anwendungsfont; Theme daher
+            # mit der neuen Größe erneut anwenden.
+            self.apply_theme()
             self.status.setText((f"Font size set to {size} pt" if self.language == "en" else f"Schriftgröße auf {size} pt gesetzt"))
     def search_pkgs(self):
         # Der Katalog wird genau einmal aufgebaut. Solange die erste

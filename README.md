@@ -1,4 +1,4 @@
-# LunaPaket 0.1.38
+# LunaPaket 0.1.39
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
 LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates über eine
@@ -23,6 +23,7 @@ grafische Oberfläche auf Basis von Python 3 und PySide6.
 - Einstellbare Schriftgröße
 - Oberflächensprache Deutsch/Englisch
 - Hell-/Dunkel-Theme
+- Deutsch/Englisch
 
 ## Einstellungen
 
@@ -60,7 +61,7 @@ ZIP-Datei entpacken und in den Projektordner wechseln:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.38_GITHUB.zip -d ~/Programme
+unzip LunaPaket_0.1.39_GITHUB.zip -d ~/Programme
 cd ~/Programme/LunaPaket
 ```
 
@@ -93,7 +94,7 @@ Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./lunapaket_0.1.38_all.deb
+sudo apt install ./lunapaket_0.1.39_all.deb
 ```
 
 Anschließend über das Anwendungsmenü oder mit `lunapaket` starten.
@@ -110,7 +111,7 @@ chmod +x build_deb.sh
 ./build_deb.sh
 ```
 
-Das Skript erstellt `dist/lunapaket_0.1.38_all.deb`.
+Das Skript erstellt `dist/lunapaket_0.1.39_all.deb`.
 Zum Bauen wird `dpkg-deb` benötigt.
 
 
