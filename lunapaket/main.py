@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.39"
+VERSION="0.1.40"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
@@ -1077,6 +1077,11 @@ class Window(QMainWindow):
         self.status.setText((f"{count} packages loaded · Categories are filtered without reloading" if self.language == "en" else f"{count} Pakete vollständig geladen · Kategorien werden ohne Neuladen gefiltert"))
 
     def checkbox_changed(self, item):
+        # Checkbox-Änderungen, die durch mark()/refresh_checkbox() ausgelöst
+        # werden, dürfen die ausdrücklich gewählte Aktion (insbesondere purge)
+        # nicht als normales remove zurück in die Vormerkliste schreiben.
+        if getattr(self, "_syncing_queue_checkbox", False):
+            return
         if item.column() != 0 or self.table.signalsBlocked():
             return
         name=item.data(Qt.UserRole)
@@ -1362,6 +1367,22 @@ class Window(QMainWindow):
         if not name:
             return
         menu = QMenu(self)
+        # Größere, gut treffbare Menüzeilen – die gewohnte native QMenu-
+        # Darstellung bleibt erhalten, nur die Abstände werden verbessert.
+        menu.setStyleSheet("""
+            QMenu {
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 8px 30px 8px 12px;
+                min-height: 22px;
+                margin: 1px 0px;
+            }
+            QMenu::separator {
+                height: 1px;
+                margin: 5px 8px;
+            }
+        """)
         menu.addAction("Queue for installation" if self.language == "en" else "Installieren vormerken", lambda: self.mark("install"))
         menu.addAction("Queue for reinstallation" if self.language == "en" else "Neu installieren vormerken", lambda: self.mark("reinstall"))
         menu.addAction("Queue for removal" if self.language == "en" else "Entfernen vormerken", lambda: self.mark("remove"))
@@ -1547,7 +1568,13 @@ class Window(QMainWindow):
         action=self.queue.get(name, ""); checked=installed
         if action in ("install","reinstall") or action.startswith("version:"): checked=True
         elif action in ("remove","purge"): checked=False
-        model.set_checked_for_name(name,checked)
+        # Das Modell-Signal darf checkbox_changed nicht als Benutzereingabe
+        # interpretieren: sonst wird "purge" unmittelbar zu "remove".
+        self._syncing_queue_checkbox = True
+        try:
+            model.set_checked_for_name(name,checked)
+        finally:
+            self._syncing_queue_checkbox = False
 
     def clear_queue(self):
         self.queue.clear(); self.update_queue_label()

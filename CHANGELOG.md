@@ -1,5 +1,11 @@
 # Änderungsprotokoll LunaPaket
 
+## 0.1.40 Purge-Vormerkung und Kontextmenü
+- Fehler behoben: Beim programmatischen Aktualisieren der Paket-Checkbox wurde eine ausdrücklich vorgemerkte Purge-Aktion als normales Entfernen überschrieben.
+- Programmatische Checkbox-Synchronisierung wird jetzt von echten Benutzereingaben getrennt.
+- Das native Kontextmenü aus 0.1.39 bleibt erhalten; die Menüzeilen und Abstände sind für zuverlässiges Anklicken vergrößert.
+- APT-Aktionen und übrige Bedienabläufe bleiben unverändert.
+
 ## 0.1.39 Schriftgröße und anpassbare Fensteraufteilung
 - Linke Seitenleiste standardmäßig um etwa 2 cm verbreitert.
 - Seitenleiste und Paketbereich lassen sich über einen horizontalen Teiler nach links/rechts in der Breite verändern.
