@@ -1,10 +1,135 @@
 #!/usr/bin/python3
 import os, sys, subprocess, re, pwd, json, shlex
 from pathlib import Path
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import *
-VERSION="0.1.36"
+VERSION="0.1.37"
+
+
+class PackageTableModel(QAbstractTableModel):
+    """Modellbasierte Paketliste ohne tausende QTableWidgetItems."""
+    HEADERS = ("", "Paket", "Version", "Status", "Beschreibung")
+    def __init__(self, parent=None):
+        super().__init__(parent); self.rows=[]; self.checked=[]; self.installed=[]; self.visible_rows=[]; self.search_texts=[]
+    def rowCount(self, parent=QModelIndex()): return 0 if parent.isValid() else len(self.visible_rows)
+    def columnCount(self, parent=QModelIndex()): return 0 if parent.isValid() else 5
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal and 0 <= section < 5:
+            headers = self.HEADERS
+            if getattr(self, "language", "de") == "en":
+                headers = ("", "Package", "Version", "Status", "Description")
+            return headers[section]
+        return None
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.rows): return None
+        r,c=index.row(),index.column()
+        if r >= len(self.visible_rows): return None
+        source_row = self.visible_rows[r]
+        if c == 0:
+            if role == Qt.CheckStateRole: return Qt.Checked if self.checked[source_row] else Qt.Unchecked
+            if role == Qt.UserRole: return self.rows[source_row][0]
+            if role == Qt.UserRole+1: return self.installed[source_row]
+            return None
+        if role == Qt.DisplayRole:
+            value = str(self.rows[source_row][c-1] if c-1 < len(self.rows[source_row]) else "")
+            if getattr(self, "language", "de") == "en" and c == 3:
+                value = {"Nicht installiert": "Not installed", "Installiert": "Installed"}.get(value, value)
+            return value
+        if role == Qt.UserRole: return self.rows[source_row][0]
+        return None
+    def flags(self,index):
+        if not index.isValid(): return Qt.NoItemFlags
+        f=Qt.ItemIsEnabled|Qt.ItemIsSelectable
+        return f|Qt.ItemIsUserCheckable if index.column()==0 else f
+    def setData(self,index,value,role=Qt.EditRole):
+        if not index.isValid() or index.column()!=0 or role!=Qt.CheckStateRole: return False
+        r=index.row()
+        if r >= len(self.visible_rows): return False
+        source_row = self.visible_rows[r]
+        v=(value==Qt.Checked or value is True)
+        if self.checked[source_row] != v:
+            self.checked[source_row]=v; self.dataChanged.emit(index,index,[Qt.CheckStateRole])
+        return True
+    def replace_rows(self, rows, queue):
+        self.beginResetModel(); self.rows=list(rows)
+        self.visible_rows=list(range(len(self.rows)))
+        self.search_texts=[" ".join(str(v) for v in x).casefold() for x in self.rows]
+        self.installed=[len(x)>2 and str(x[2])=="Installiert" for x in self.rows]
+        self.checked=[]
+        for x,inst in zip(self.rows,self.installed):
+            a=queue.get(x[0],""); v=inst
+            if a in ("install","reinstall") or a.startswith("version:"): v=True
+            elif a in ("remove","purge"): v=False
+            self.checked.append(v)
+        self.endResetModel()
+    def set_checked_for_name(self,name,checked):
+        for source_row,x in enumerate(self.rows):
+            if x and x[0]==name:
+                value=bool(checked)
+                if self.checked[source_row] != value:
+                    self.checked[source_row]=value
+                    try: visible_row=self.visible_rows.index(source_row)
+                    except ValueError: return source_row
+                    idx=self.index(visible_row,0); self.dataChanged.emit(idx,idx,[Qt.CheckStateRole])
+                return source_row
+        return -1
+    def apply_filter(self, category, term, autoremove, queue):
+        term=(term or "").casefold()
+        auto=autoremove or set()
+        selected=[]
+        for source_row,row in enumerate(self.rows):
+            name=row[0] if row else ""
+            installed=self.installed[source_row]
+            if category==1 and not installed: continue
+            if category==2 and installed: continue
+            if category==3 and name.split(":",1)[0] not in auto: continue
+            if category==4 and not queue.get(name): continue
+            if term and term not in self.search_texts[source_row]: continue
+            selected.append(source_row)
+        if selected == self.visible_rows: return len(selected)
+        self.beginResetModel(); self.visible_rows=selected; self.endResetModel()
+        return len(selected)
+
+class _PackageItemProxy:
+    def __init__(self,view,row,col): self.view,self._row,self._column=view,row,col
+    def row(self): return self._row
+    def column(self): return self._column
+    def data(self,role): return self.view.package_model.data(self.view.package_model.index(self._row,self._column),role)
+    def text(self): return str(self.view.package_model.data(self.view.package_model.index(self._row,self._column),Qt.DisplayRole) or "")
+    def checkState(self): return self.view.package_model.data(self.view.package_model.index(self._row,self._column),Qt.CheckStateRole)
+    def setCheckState(self,state): self.view.package_model.setData(self.view.package_model.index(self._row,self._column),state,Qt.CheckStateRole)
+
+class PackageTableView(QTableView):
+    itemChanged=Signal(object)
+    def __init__(self,parent=None):
+        super().__init__(parent); self.package_model=PackageTableModel(self); self.setModel(self.package_model)
+        self.package_model.dataChanged.connect(self._changed); self.setSelectionBehavior(QAbstractItemView.SelectRows); self.setEditTriggers(QAbstractItemView.AllEditTriggers)
+    def mousePressEvent(self, event):
+        # Die Check-Spalte wird explizit per einfachem Linksklick umgeschaltet.
+        # Damit hängt die Bedienung nicht vom Edit-Trigger des QTableView-Delegates ab.
+        if event.button() == Qt.LeftButton:
+            index = self.indexAt(event.position().toPoint())
+            if index.isValid() and index.column() == 0:
+                self.setCurrentIndex(index)
+                self.selectRow(index.row())
+                current = self.package_model.data(index, Qt.CheckStateRole)
+                target = Qt.Unchecked if current == Qt.Checked else Qt.Checked
+                self.package_model.setData(index, target, Qt.CheckStateRole)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+    def _changed(self,a,b,roles):
+        if a.column()==0 and (not roles or Qt.CheckStateRole in roles): self.itemChanged.emit(_PackageItemProxy(self,a.row(),0))
+    def setHorizontalHeaderLabels(self,labels): self.package_model.HEADERS=tuple(labels)
+    def rowCount(self): return self.package_model.rowCount()
+    def columnCount(self): return self.package_model.columnCount()
+    def item(self,r,c): return _PackageItemProxy(self,r,c) if 0<=r<self.rowCount() and 0<=c<5 else None
+    def selectedItems(self):
+        i=self.currentIndex(); return [_PackageItemProxy(self,i.row(),i.column())] if i.isValid() else []
+    def currentColumn(self): return self.currentIndex().column()
+    def sortItems(self,*args): pass
+    def setSortingEnabled(self,*args): pass
 
 def privileged(args):
     """Führt Systembefehle direkt aus, wenn LunaPaket als root läuft."""
@@ -298,22 +423,30 @@ class StreamJob(QThread):
 class FunctionJob(QThread):
     result=Signal(object)
     failed=Signal(str)
-    def __init__(self, fn):
-        super().__init__(); self.fn=fn
+    progress=Signal(int, int)
+    def __init__(self, fn, with_progress=False):
+        super().__init__(); self.fn=fn; self.with_progress=with_progress
     def run(self):
-        try: self.result.emit(self.fn())
-        except Exception as e: self.failed.emit(str(e))
+        try:
+            result = self.fn(self.progress.emit) if self.with_progress else self.fn()
+            self.result.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 class ActionProgressDialog(QDialog):
     """Separates live action output from the normal protocol/details pane."""
-    def __init__(self, parent, title, description):
+    def __init__(self, parent, title, description, english=False):
         super().__init__(parent)
+        self.english = english
+        if english:
+            title = {"Paketaktionen": "Package actions", "Paketaktionen bestätigen": "Confirm package actions"}.get(title, title)
+            description = {"1 ausgewählte Paketaktion(en) werden ausgeführt.": "1 selected package action(s) are being executed."}.get(description, description)
         self.setWindowTitle(title)
         self.resize(800, 520)
         self.setWindowModality(Qt.WindowModal)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(description))
-        self.current = QLabel("Vorgang wird gestartet …")
+        self.current = QLabel("Starting operation …" if english else "Vorgang wird gestartet …")
         layout.addWidget(self.current)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -323,32 +456,52 @@ class ActionProgressDialog(QDialog):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         layout.addWidget(self.output, 1)
-        self.auto_close = QCheckBox("Fenster nach erfolgreicher Aktion schließen")
+        self.auto_close = QCheckBox("Close window after successful action" if english else "Fenster nach erfolgreicher Aktion schließen")
         self.auto_close.setChecked(True)
         layout.addWidget(self.auto_close)
-        self.close_button = QPushButton("Vorgang läuft …")
+        self.close_button = QPushButton("Operation in progress …" if english else "Vorgang läuft …")
         self.close_button.setEnabled(False)
         self.close_button.clicked.connect(self.accept)
         layout.addWidget(self.close_button)
 
     def append_output(self, line):
         if line:
+            # APT may inherit the desktop locale through pkexec despite the
+            # worker locale. Keep the original command output, but present the
+            # standard APT progress prefixes in English in the English UI.
+            if self.english:
+                replacements = (
+                    ("Holen:", "Get:"), ("Ign:", "Ign:"), ("Treffer:", "Hit:"), ("Fehl:", "Err:"),
+                    ("Paketlisten werden gelesen", "Reading package lists"),
+                    ("Abhängigkeitsbaum wird aufgebaut", "Building dependency tree"),
+                    ("Statusinformationen werden eingelesen", "Reading state information"),
+                    ("Entpacken von ", "Unpacking "), ("Entpacke ", "Unpacking "),
+                    ("Vorbereitung zum Entpacken von ", "Preparing to unpack "),
+                    ("Einrichten von ", "Setting up "), ("Richte ein ", "Setting up "),
+                    ("Verarbeite Trigger für ", "Processing triggers for "),
+                    ("Trigger werden verarbeitet für ", "Processing triggers for "),
+                    ("Wird verarbeitet: ", "Processing: "),
+                    ("Paket wird verarbeitet", "Processing package"),
+                    ("Pakete werden heruntergeladen", "Downloading packages"),
+                )
+                for old, new in replacements:
+                    line = line.replace(old, new)
             self.output.append(line)
 
     def set_progress(self, percent, message):
         if percent is not None:
             self.progress.setValue(max(0, min(100, int(percent))))
         if message:
-            self.current.setText("Aktuell: " + message)
+            self.current.setText(("Current: " if self.english else "Aktuell: ") + message)
 
     def finish(self, code):
         if code == 0:
             self.progress.setValue(100)
-            self.current.setText("Aktion erfolgreich abgeschlossen.")
-            self.close_button.setText("Schließen")
+            self.current.setText("Action completed successfully." if self.english else "Aktion erfolgreich abgeschlossen.")
+            self.close_button.setText("Close" if self.english else "Schließen")
         else:
-            self.current.setText(f"Aktion fehlgeschlagen (Fehlercode {code}).")
-            self.close_button.setText("Schließen")
+            self.current.setText((f"Action failed (error code {code})." if self.english else f"Aktion fehlgeschlagen (Fehlercode {code})."))
+            self.close_button.setText("Close" if self.english else "Schließen")
         self.close_button.setEnabled(True)
         # Nur bei erfolgreichem Abschluss automatisch schließen. Bei Fehlern
         # bleibt das Protokoll sichtbar, damit die Ursache gelesen werden kann.
@@ -401,7 +554,7 @@ class Window(QMainWindow):
         self.cleanup_select_all.setVisible(False)
         self.cleanup_select_all.toggled.connect(self.toggle_all_cleanup_packages)
         l.addWidget(self.cleanup_select_all)
-        self.table=QTableWidget(0,5); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setEditTriggers(QAbstractItemView.AllEditTriggers); self.table.setSortingEnabled(False); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.sortItems(1, Qt.AscendingOrder); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.itemSelectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); l.addWidget(self.table,4)
+        self.table=PackageTableView(self); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.selectionModel().selectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); l.addWidget(self.table,4)
         row=QHBoxLayout()
         clear_queue_btn=QPushButton("Vormerkung löschen")
         clear_queue_btn.clicked.connect(self.clear_queue)
@@ -495,9 +648,70 @@ class Window(QMainWindow):
 
     def apply_theme(self):
         if self.theme == "light":
-            self.setStyleSheet("QMainWindow,QWidget{background:#f3f4f8;color:#252638;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#ffffff;color:#252638;border:1px solid #c9cbd8;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#e4e2ee;color:#37334b;padding:7px} QListWidget#packageSidebar{background:#e9e8f0;border:1px solid #c9c6d6;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px}")
+            self.setStyleSheet("QMainWindow,QWidget{background:#f3f4f8;color:#252638;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget,QTableView{background:#ffffff;color:#252638;border:1px solid #c9cbd8;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#e4e2ee;color:#37334b;padding:7px} QListWidget#packageSidebar{background:#e9e8f0;border:1px solid #c9c6d6;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator,QTableView::indicator{width:18px;height:18px} QTableWidget::indicator:checked,QTableView::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked,QTableView::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px}")
         else:
-            self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator{width:18px;height:18px} QTableWidget::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked{background:#171821;border:2px solid #aaa3bd;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #c9b5ff;border-radius:3px}")
+            self.setStyleSheet("QMainWindow,QWidget{background:#20212a;color:#eeeef5;font-size:11pt} QLineEdit,QComboBox,QTextEdit,QTableWidget,QTableView{background:#292b37;color:#f2f1fa;border:1px solid #48495d;padding:6px} QPushButton{background:#6746b8;color:white;border:0;border-radius:6px;padding:8px 13px} QPushButton:hover{background:#7959cb} QHeaderView::section{background:#343545;color:#ddd9f4;padding:7px} QListWidget#packageSidebar{background:#252633;border:1px solid #414253;padding:5px} QListWidget#packageSidebar::item{padding:11px 8px;border-radius:5px} QListWidget#packageSidebar::item:selected{background:#6746b8;color:white} QTableWidget::indicator,QTableView::indicator{width:18px;height:18px} QTableWidget::indicator:checked,QTableView::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QTableWidget::indicator:unchecked,QTableView::indicator:unchecked{background:#ffffff;border:2px solid #8d899e;border-radius:3px} QCheckBox::indicator{width:18px;height:18px} QCheckBox::indicator:checked{background:#7652c8;border:2px solid #c9b5ff;border-radius:3px} QCheckBox::indicator:unchecked{background:#ffffff;border:2px solid #c9b5ff;border-radius:3px}")
+    def translate_dialog(self, dialog):
+        if self.language != "en":
+            return
+        translations = {
+            "Paketverlauf":"Package history", "Installierte, entfernte und aktualisierte Pakete. Der Verlauf ist auf maximal 1 MB begrenzt.":"Installed, removed and upgraded packages. History is limited to 1 MB.",
+            "Noch keine Paketänderungen durch LunaPaket protokolliert.":"No package changes have been logged by LunaPaket yet.",
+            "Sicherheitsupdates verwalten":"Manage security updates", "Auswahl":"Selection", "Paket":"Package", "Installiert":"Installed", "Verfügbar":"Available", "Status":"Status", "Sicherheitsquelle":"Security origin",
+            "Ausgewählte zurückstellen":"Defer selected", "Ausgewählte wieder aktivieren":"Reactivate selected", "Jetzt nach Updates suchen":"Check for updates now", "Ausgewählte installieren":"Install selected", "Verlauf anzeigen":"Show history", "Automatisch nach Sicherheitsupdates suchen":"Automatically check for security updates", "Prüfintervall:":"Check interval:", "Schließen":"Close", "Alle 15 Minuten":"Every 15 minutes", "Alle 30 Minuten":"Every 30 minutes", "Stündlich":"Hourly", "Alle 6 Stunden":"Every 6 hours", "Täglich":"Daily", "Bereit":"Ready", "Zurückgestellt":"Deferred",
+            "Paketquellen (Repository-Verwaltung)":"Repositories (repository management)", "APT-Paketquellen aktivieren, bearbeiten und verwalten.":"Enable, edit and manage APT repositories.", "Aktiviert":"Enabled", "Typ:":"Type:", "Adresse:":"Address:", "Distribution:":"Distribution:", "Bereiche:":"Components:", "Ausgewählte Paketquelle bearbeiten":"Edit selected repository", "Hoch":"Up", "Runter":"Down", "Neu":"New", "Löschen":"Delete", "Übernehmen":"Apply", "Abbrechen":"Cancel", "OK":"OK",
+            "Einstellungen – Distribution":"Distribution settings", "⚠  Diese Einstellungen betreffen die elementaren Bestandteile Ihres Systems. Überdenken Sie solche Änderungen daher eingehend.":"⚠  These settings affect essential components of your system. Consider such changes carefully.", "Paketaktualisierungsverhalten (vorgegebene Distribution)":"Package upgrade policy (default distribution)", "Anwenden":"Apply", "Immer die höchste Version bevorzugen":"Always prefer the highest version", "Immer die installierte Version bevorzugen":"Always prefer the installed version", "Version bevorzugen von:":"Prefer version from:",
+        }
+        translations.update({
+            "Paketaktionen bestätigen":"Confirm package actions",
+            "Prüfe die geplanten Aktionen. Entferne Häkchen, um einzelne Aktionen abzuwählen.":"Review the planned actions. Uncheck items to omit individual actions.",
+            "Installieren":"Install", "Neu installieren":"Reinstall", "Entfernen":"Remove",
+            "Vollständig entfernen":"Purge", "Version sperren":"Hold version",
+            "Versionssperre aufheben":"Unhold version", "APT-Prüfung (Simulation, noch keine Änderungen ausgeführt):":"APT check (simulation; no changes have been made):",
+            "Fenster nach erfolgreicher Aktion schließen":"Close window after successful action",
+            "Jetzt ausführen":"Run now", "Aufräumen bestätigen":"Confirm cleanup",
+            "Diese Pakete hat APT als nicht mehr benötigt erkannt. Sollen sie entfernt werden?":"APT identified these packages as no longer required. Remove them?",
+            "Jetzt aufräumen":"Clean up now", "Abbrechen":"Cancel",
+            "Aufräumen":"Cleanup", "Der Paketkatalog wird noch geladen.":"The package catalog is still loading.",
+            "Es werden keine nicht mehr benötigten Pakete gefunden.":"No packages eligible for autoremove were found.",
+            "Aufräumen abgebrochen – keine Pakete entfernt":"Cleanup cancelled – no packages were removed",
+            "Paketaktionen":"Package actions", "Vorgemerkte Änderungen":"Queued changes",
+            "Es sind keine Änderungen vorgemerkt. Bitte Pakete zuerst über die Kontrollkästchen auswählen.":"No changes are queued. Select packages using the checkboxes first.",
+            "Bitte zuerst Pakete auswählen oder vormerken.":"Please select or queue packages first.",
+            "Bitte zuerst ein Paket auswählen.":"Please select a package first.",
+            "Keine Paketaktionen ausgewählt":"No package actions selected", "Keine APT-Änderungen.":"No APT changes.",
+            "Prüfung fehlgeschlagen":"Check failed", "APT-Prüfung fehlgeschlagen":"APT check failed",
+            "Änderungen werden im Hintergrund geprüft …":"Checking changes in the background …",
+            "Vorgemerkte Änderungen bleiben erhalten":"Queued changes have been kept",
+            "Keine Paketdetails verfügbar.":"No package details available.", "Keine Eigenschaften verfügbar.":"No properties available.",
+            "Version auswählen":"Select version", "Für dieses Paket wurden keine verfügbaren Versionen gefunden.":"No available versions were found for this package.",
+            "Installierte Dateien":"Installed files", "Das Paket ist nicht installiert oder dpkg konnte die Dateiliste nicht lesen.":"The package is not installed or dpkg could not read its file list.",
+            "Paketeigenschaften":"Package properties", "Installierte Dateien anzeigen":"Show installed files",
+            "Installieren vormerken":"Queue for installation", "Neu installieren vormerken":"Queue for reinstallation",
+            "Entfernen vormerken":"Queue for removal", "Vollständig entfernen (Purge) vormerken":"Queue for purge",
+            "Version auswählen …":"Select version …", "Versionssperre aufheben vormerken":"Queue unhold",
+            "Version sperren vormerken":"Queue hold", "Abhängigkeiten und Konflikte …":"Dependencies and conflicts …",
+            "Eigenschaften …":"Properties …", "Installierte Dateien anzeigen …":"Show installed files …",
+            "Schriftgröße":"Font size", "Schriftgröße in Punkt:":"Font size in points:",
+            "Ungültiges DEB-Paket":"Invalid DEB package", "Paketverlauf anzeigen":"Show package history",
+            "Keine Paketänderungen durch LunaPaket protokolliert.":"No package changes have been logged by LunaPaket.",
+            "Paketquellen":"Repositories", "Paketquellen verwalten":"Manage repositories",
+            "Sicherheitsupdates":"Security updates", "Sicherheitsupdates installieren":"Install security updates",
+            "Bitte mindestens ein Update auswählen.":"Please select at least one update.",
+            "APT-Vorschau fehlgeschlagen":"APT preview failed", "Abhängigkeiten und Konflikte":"Dependencies and conflicts",
+        })
+        dialog.setWindowTitle(translations.get(dialog.windowTitle(), dialog.windowTitle()))
+        for w in dialog.findChildren(QWidget):
+            if isinstance(w, (QPushButton, QLabel, QCheckBox, QRadioButton, QGroupBox)):
+                w.setText(translations.get(w.text(), w.text()))
+            elif isinstance(w, QComboBox):
+                for i in range(w.count()): w.setItemText(i, translations.get(w.itemText(i), w.itemText(i)))
+            elif isinstance(w, QTableWidget):
+                for i in range(w.columnCount()):
+                    h=w.horizontalHeaderItem(i)
+                    if h: h.setText(translations.get(h.text(),h.text()))
+        for menu in dialog.findChildren(QMenu): menu.setTitle(translations.get(menu.title(),menu.title()))
+
     def translate_main_window(self):
         translations = {
             "LunaPaket – Paketverwaltung":"LunaPaket – Package Manager",
@@ -521,8 +735,45 @@ class Window(QMainWindow):
             "Debian-Paketverwaltung":"Debian package manager",
             "Fenstergröße und Fensterposition merken":"Remember window size and position",
             "Heruntergeladene Paketdateien nach erfolgreicher Installation löschen":"Delete downloaded package files after successful installation",
-            "Schließen":"Close"
+            "Schließen":"Close", "Paketverlauf anzeigen …":"Show package history …",
+            "Paketverlauf":"Package history", "Installierte, entfernte und aktualisierte Pakete. Der Verlauf ist auf maximal 1 MB begrenzt.":"Installed, removed and upgraded packages. History is limited to 1 MB.",
+            "Noch keine Paketänderungen durch LunaPaket protokolliert.":"No package changes have been logged by LunaPaket yet.",
+            "Sicherheitsupdates werden gesucht …":"Searching for security updates …", "System ist auf dem neuesten Stand":"System is up to date",
+            "Es sind keine Paketaktualisierungen verfügbar.\n\nDas System ist aktuell.":"No package updates are available.\n\nThe system is up to date.",
+            "Schriftgröße":"Font size", "Schriftgröße in Punkt:":"Font size in points:",
+            "Schriftgröße auf {size} pt gesetzt":"Font size set to {size} pt",
+            "Sicherheitsupdates verwalten":"Manage security updates", "Auswahl":"Selection", "Installiert":"Installed", "Verfügbar":"Available", "Sicherheitsquelle":"Security origin",
+            "Ausgewählte zurückstellen":"Defer selected", "Ausgewählte wieder aktivieren":"Reactivate selected", "Jetzt nach Updates suchen":"Check for updates now", "Ausgewählte installieren":"Install selected", "Verlauf anzeigen":"Show history",
+            "Automatisch nach Sicherheitsupdates suchen":"Automatically check for security updates", "Prüfintervall:":"Check interval:", "Alle 15 Minuten":"Every 15 minutes", "Alle 30 Minuten":"Every 30 minutes", "Stündlich":"Hourly", "Alle 6 Stunden":"Every 6 hours", "Täglich":"Daily", "Zurückgestellt":"Deferred",
+            "Paketquellen (Repository-Verwaltung)":"Repositories (repository management)", "APT-Paketquellen aktivieren, bearbeiten und verwalten.":"Enable, edit and manage APT repositories.",
+            "Aktiviert":"Enabled", "Typ:":"Type:", "Adresse:":"Address:", "Distribution:":"Distribution:", "Bereiche:":"Components:",
+            "Ausgewählte Paketquelle bearbeiten":"Edit selected repository", "Hoch":"Up", "Runter":"Down", "Neu":"New", "Löschen":"Delete", "Übernehmen":"Apply", "Abbrechen":"Cancel",
+            "Einstellungen – Distribution":"Distribution settings", "⚠  Diese Einstellungen betreffen die elementaren Bestandteile Ihres Systems. Überdenken Sie solche Änderungen daher eingehend.":"⚠  These settings affect essential components of your system. Consider such changes carefully.",
+            "Paketaktualisierungsverhalten (vorgegebene Distribution)":"Package upgrade policy (default distribution)", "Anwenden":"Apply", "Immer die höchste Version bevorzugen":"Always prefer the highest version", "Immer die installierte Version bevorzugen":"Always prefer the installed version", "Version bevorzugen von:":"Prefer version from:", "Anwenden":"Apply"
         }
+        translations.update({
+            "Paketquellen verwalten":"Manage repositories", "Paketlisten aktualisieren":"Refresh package lists",
+            "System aktualisieren":"Upgrade system", "Sicherheitsupdates verwalten":"Manage security updates",
+            "Vormerkung löschen":"Clear queue", "Vorgemerkte Änderungen anwenden":"Apply queued changes",
+            "Keine vorgemerkten Änderungen":"No queued changes", "Bereit":"Ready",
+            "Datei":"File", "Beenden":"Quit", "Paketquellen":"Repositories", "Einstellungen":"Settings",
+            "Hilfe":"Help", "Paket":"Package", "Beschreibung":"Description", "Nicht installiert":"Not installed",
+            "Installiert":"Installed", "Alle Pakete":"All packages", "Aufräumen":"Cleanup", "Vorgemerkt":"Queued",
+            "Pakete suchen …":"Search packages …", "Suchergebnisse":"Search results", "Installierte Pakete":"Installed packages",
+            "Suchen":"Search", "DEB-Pakete öffnen …":"Open DEB packages …",
+            "Paketquellen prüfen / Paketlisten aktualisieren":"Check repositories / refresh package lists",
+            "Paketquellen anzeigen":"Show repositories", "Distribution …":"Distribution …",
+            "Schriftgröße …":"Font size …", "Allgemeine Einstellungen …":"General settings …",
+            "Über LunaPaket":"About LunaPaket", "Paketverlauf anzeigen …":"Show package history …",
+            "Paketaktion läuft …":"Package operation in progress …", "Änderungen werden im Hintergrund geprüft …":"Checking changes in the background …",
+            "Keine entbehrlichen Pakete gefunden":"No removable packages found",
+            "Paketkatalog wird geladen …":"Loading package catalog …",
+            "Paketkatalog wird noch geladen.":"The package catalog is still loading.",
+            "Paketaktion läuft …":"Package operation in progress …",
+            "Keine vorgemerkten Änderungen":"No queued changes",
+            "Paketliste wird aktualisiert …":"Refreshing package lists …",
+            "System wird aktualisiert …":"Upgrading system …",
+        })
         mapping = translations if self.language == "en" else {v: k for k, v in translations.items()}
 
         current_title = self.windowTitle()
@@ -534,6 +785,16 @@ class Window(QMainWindow):
             current_title = current_title.replace(english_prefix, german_prefix, 1)
         self.setWindowTitle(current_title)
 
+        # The main package table is a QTableView backed by a custom model;
+        # translate its model headers and package status values explicitly.
+        if hasattr(self, "table") and hasattr(self.table, "package_model"):
+            self.table.package_model.language = self.language
+            self.table.package_model.headerDataChanged.emit(Qt.Horizontal, 0, 4)
+            if self.table.package_model.rowCount():
+                self.table.package_model.dataChanged.emit(
+                    self.table.package_model.index(0, 3),
+                    self.table.package_model.index(self.table.package_model.rowCount()-1, 3),
+                    [Qt.DisplayRole])
         for obj in self.findChildren(QWidget):
             if isinstance(obj, (QPushButton, QLabel, QCheckBox, QRadioButton, QGroupBox)):
                 value = obj.text()
@@ -639,6 +900,7 @@ class Window(QMainWindow):
         apply_btn.clicked.connect(save)
         cancel_btn.clicked.connect(d.reject)
         ok_btn.clicked.connect(lambda: (save(), d.accept()))
+        self.translate_dialog(d)
         d.exec()
 
     def show_settings(self):
@@ -708,67 +970,16 @@ class Window(QMainWindow):
         self._sync_settings_permissions()
         super().closeEvent(event)
     def rows(self, data):
-        # Vollständige Paketliste ohne Seitenlimit. Die Qt-Items werden in
-        # kleinen automatischen Portionen erzeugt, damit die GUI Ereignisse
-        # weiter verarbeitet und nicht einfriert.
+        # Ein Modell-Reset übernimmt den gesamten Katalog in einem Schritt.
+        # Qt erzeugt keine individuellen Items für jede sichtbare Tabellenzelle.
         self._rows_generation = getattr(self, "_rows_generation", 0) + 1
-        generation = self._rows_generation
-        self.table.setSortingEnabled(False)
-        self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
-        self.table.clearContents()
-        self._rows_pending = data
-        self._rows_offset = 0
-        self._rows_chunk_size = 300
-        self.table.setRowCount(len(data))
-        self.status.setText((f"0 of {len(data)} packages displayed …" if self.language == "en" else f"0 von {len(data)} Paketen werden angezeigt …"))
+        self.table.package_model.replace_rows(data, self.queue)
         self.table.setUpdatesEnabled(True)
-        QTimer.singleShot(0, lambda g=generation: self._fill_rows_chunk(g))
-
-    def _fill_rows_chunk(self, generation=None):
-        if generation is None:
-            generation = getattr(self, "_rows_generation", 0)
-        if generation != getattr(self, "_rows_generation", 0):
-            return
-        data = self._rows_pending
-        start = self._rows_offset
-        end = min(start + self._rows_chunk_size, len(data))
-        self.table.setUpdatesEnabled(False)
-        for i in range(start, end):
-            r = data[i]
-            name = r[0]
-            installed = len(r) > 2 and str(r[2]) == "Installiert"
-            action = self.queue.get(name, "")
-            checked = installed
-            if action in ("install", "reinstall") or action.startswith("version:"):
-                checked = True
-            elif action in ("remove", "purge"):
-                checked = False
-            check = QTableWidgetItem("")
-            check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
-            check.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-            check.setData(Qt.UserRole, name)
-            check.setData(Qt.UserRole + 1, installed)
-            self.table.setItem(i, 0, check)
-            for c, v in enumerate(r):
-                display_value = str(v)
-                if self.language == "en":
-                    display_value = {"Installiert": "Installed", "Nicht installiert": "Not installed",
-                                     "Vorgemerkt": "Queued"}.get(display_value, display_value)
-                it = QTableWidgetItem(display_value)
-                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                it.setData(Qt.UserRole, name)
-                self.table.setItem(i, c + 1, it)
-        self._rows_offset = end
-        self.table.setUpdatesEnabled(True)
-        if end < len(data):
-            self.status.setText((f"{end} of {len(data)} packages displayed …" if self.language == "en" else f"{end} von {len(data)} Paketen werden angezeigt …"))
-            QTimer.singleShot(1, lambda g=generation: self._fill_rows_chunk(g))
-        else:
-            self.table.blockSignals(False)
-            self._table_catalog_ready = True
-            self.apply_table_filters()
-            self.status.setText((f"{len(data)} packages loaded · Categories are filtered without reloading" if self.language == "en" else f"{len(data)} Pakete vollständig geladen · Kategorien werden ohne Neuladen gefiltert"))
+        self._table_catalog_ready = True
+        self.apply_table_filters()
+        count=len(data)
+        self.status.setText((f"{count} packages loaded · Categories are filtered without reloading" if self.language == "en" else f"{count} Pakete vollständig geladen · Kategorien werden ohne Neuladen gefiltert"))
 
     def checkbox_changed(self, item):
         if item.column() != 0 or self.table.signalsBlocked():
@@ -843,12 +1054,12 @@ class Window(QMainWindow):
         self.update_queue_label()
         self.status.setText(f"{changed} Aufräum-Pakete {'zur Entfernung vorgemerkt' if checked else 'aus der Vormerkung entfernt'}.")
     def choose_font_size(self):
-        size, ok = QInputDialog.getInt(self, "Schriftgröße", "Schriftgröße in Punkt:", self.font_size, 8, 24, 1)
+        size, ok = QInputDialog.getInt(self, "Font size" if self.language == "en" else "Schriftgröße", "Font size in points:" if self.language == "en" else "Schriftgröße in Punkt:", self.font_size, 8, 24, 1)
         if ok:
             self.font_size = size
             self.settings.setValue("font_size", size)
             font = QApplication.font(); font.setPointSize(size); QApplication.setFont(font)
-            self.status.setText(f"Schriftgröße auf {size} pt gesetzt")
+            self.status.setText((f"Font size set to {size} pt" if self.language == "en" else f"Schriftgröße auf {size} pt gesetzt"))
     def search_pkgs(self):
         # Der Katalog wird genau einmal aufgebaut. Solange die erste
         # Tabellenbefüllung läuft, dürfen Filter-/Sidebar-Klicks keinen
@@ -863,69 +1074,35 @@ class Window(QMainWindow):
             return
         self._catalog_loading = True
         self.status.setText("Paketkatalog wird einmalig im Hintergrund geladen …")
-        self.search_job = FunctionJob(self.collect_catalog)
+        self.status.setText("Paketkatalog: 0 Pakete eingelesen …" if self.language != "en" else "Package catalog: 0 packages read …")
+        self.search_job = FunctionJob(self.collect_catalog, with_progress=True)
+        self.search_job.progress.connect(self.catalog_progress)
         self.search_job.result.connect(self.catalog_loaded)
         self.search_job.failed.connect(self.catalog_load_failed)
         self.search_job.start()
 
+    def catalog_progress(self, current, total):
+        """Zeigt den laufenden Katalogaufbau sichtbar im Statusbereich an."""
+        if self.language == "en":
+            self.status.setText(f"Reading package catalog: {current:,} / {total:,} packages …")
+        else:
+            self.status.setText(f"Paketkatalog wird eingelesen: {current:,} / {total:,} Pakete …")
+
     def apply_row_filter(self, row):
-        """Aktualisiert nur die Sichtbarkeit einer geänderten Tabellenzeile."""
-        if self.catalog_cache is None or not getattr(self, "_table_catalog_ready", False):
-            return
-        if row < 0 or row >= self.table.rowCount():
-            return
-        check = self.table.item(row, 0)
-        name_item = self.table.item(row, 1)
-        if check is None or name_item is None:
-            self.table.setRowHidden(row, True)
-            return
-        name = str(check.data(Qt.UserRole) or name_item.text())
-        installed = bool(check.data(Qt.UserRole + 1))
-        action = self.queue.get(name)
-        category = self.sidebar.currentRow()
-        autoremove = self.catalog_cache.get("autoremove", set())
-        show = not (category == 1 and not installed or category == 2 and installed or category == 3 and name.split(":", 1)[0] not in autoremove or category == 4 and not action)
-        term = self.search.text().strip().casefold()
-        if show and term:
-            searchable = " ".join(self.table.item(row, col).text() for col in range(1, 5) if self.table.item(row, col))
-            show = term in searchable.casefold()
-        self.table.setRowHidden(row, not show)
+        """Aktualisiert den gefilterten Modellindex ohne tausende setRowHidden-Aufrufe."""
+        self.apply_table_filters()
 
     def apply_table_filters(self):
         if self.catalog_cache is None or not getattr(self, "_table_catalog_ready", False):
             return
-        term = self.search.text().strip().casefold()
         category = self.sidebar.currentRow()
-        upgradable = self.catalog_cache["upgradable"]
-        held = self.catalog_cache["held"]
         autoremove = self.catalog_cache.get("autoremove", set())
-        visible = 0
-        self.table.setUpdatesEnabled(False)
-        for row in range(self.table.rowCount()):
-            check = self.table.item(row, 0)
-            name_item = self.table.item(row, 1)
-            if check is None or name_item is None:
-                self.table.setRowHidden(row, True)
-                continue
-            name = str(check.data(Qt.UserRole) or name_item.text())
-            installed = bool(check.data(Qt.UserRole + 1))
-            key = name.split(":", 1)[0]
-            action = self.queue.get(name)
-            show = True
-            if category == 1 and not installed: show = False
-            elif category == 2 and installed: show = False
-            elif category == 3 and key not in autoremove: show = False
-            elif category == 4 and not action: show = False
-            if show and term:
-                searchable = " ".join(self.table.item(row, col).text() for col in range(1, 5) if self.table.item(row, col))
-                if term not in searchable.casefold(): show = False
-            self.table.setRowHidden(row, not show)
-            if show: visible += 1
-        self.table.setUpdatesEnabled(True)
+        visible = self.table.package_model.apply_filter(
+            category, self.search.text().strip(), autoremove, self.queue)
         self.status.setText((f"{visible} packages shown · Full list remains in memory" if self.language == "en" else f"{visible} Pakete angezeigt · Gesamtliste bleibt im Speicher"))
 
     @staticmethod
-    def collect_catalog():
+    def collect_catalog(progress=None):
         """
         Nutzt apt-cache pkgnames als maßgebliche Paketnamensliste (wie die
         bisherige vollständige LunaPaket-Liste) und python-apt für Details.
@@ -963,10 +1140,15 @@ class Window(QMainWindow):
         rows = []
         upgradable = set()
         autoremove = set()
-        for name in names:
+        total_names = len(names)
+        if progress:
+            progress(0, total_names)
+        for position, name in enumerate(names, 1):
             entry = candidates.get(name.split(":", 1)[0])
             if entry is None:
                 rows.append((name, "", "Nicht installiert", ""))
+                if progress and (position % 250 == 0 or position == total_names):
+                    progress(position, total_names)
                 continue
             package = entry[1]
             installed = package.installed
@@ -982,6 +1164,8 @@ class Window(QMainWindow):
                 upgradable.add(name.split(":", 1)[0])
             if package.is_auto_removable:
                 autoremove.add(name.split(":", 1)[0])
+            if progress and (position % 250 == 0 or position == total_names):
+                progress(position, total_names)
 
         _, hold_out = cmd(["apt-mark", "showhold"])
         held = set(x.strip().split(":", 1)[0]
@@ -1049,27 +1233,27 @@ class Window(QMainWindow):
         self.details_job.failed.connect(lambda e: self.details.setPlainText("Fehler: "+e))
         self.details_job.start()
     def package_context_menu(self, pos):
-        item = self.table.itemAt(pos)
-        if item is None:
+        index = self.table.indexAt(pos)
+        if not index.isValid():
             return
-        self.table.selectRow(item.row())
+        self.table.selectRow(index.row())
         name = self.selected()
         if not name:
             return
         menu = QMenu(self)
-        menu.addAction("Installieren vormerken", lambda: self.mark("install"))
-        menu.addAction("Neu installieren vormerken", lambda: self.mark("reinstall"))
-        menu.addAction("Entfernen vormerken", lambda: self.mark("remove"))
-        menu.addAction("Vollständig entfernen (Purge) vormerken", lambda: self.mark("purge"))
+        menu.addAction("Queue for installation" if self.language == "en" else "Installieren vormerken", lambda: self.mark("install"))
+        menu.addAction("Queue for reinstallation" if self.language == "en" else "Neu installieren vormerken", lambda: self.mark("reinstall"))
+        menu.addAction("Queue for removal" if self.language == "en" else "Entfernen vormerken", lambda: self.mark("remove"))
+        menu.addAction("Queue for purge" if self.language == "en" else "Vollständig entfernen (Purge) vormerken", lambda: self.mark("purge"))
         menu.addSeparator()
-        menu.addAction("Version auswählen …", self.choose_version)
+        menu.addAction("Select version …" if self.language == "en" else "Version auswählen …", self.choose_version)
         held = self.package_is_held(name)
-        menu.addAction("Versionssperre aufheben vormerken" if held else "Version sperren vormerken",
+        menu.addAction(("Queue unhold" if held else "Queue hold") if self.language == "en" else ("Versionssperre aufheben vormerken" if held else "Version sperren vormerken"),
                        lambda: self.mark("unhold" if held else "hold"))
         menu.addSeparator()
-        menu.addAction("Abhängigkeiten und Konflikte …", self.show_dependency_analysis)
-        menu.addAction("Eigenschaften …", self.show_properties)
-        menu.addAction("Installierte Dateien anzeigen …", self.show_package_files)
+        menu.addAction("Dependencies and conflicts …" if self.language == "en" else "Abhängigkeiten und Konflikte …", self.show_dependency_analysis)
+        menu.addAction("Properties …" if self.language == "en" else "Eigenschaften …", self.show_properties)
+        menu.addAction("Show installed files …" if self.language == "en" else "Installierte Dateien anzeigen …", self.show_package_files)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def package_is_held(self, name):
@@ -1089,7 +1273,7 @@ class Window(QMainWindow):
         if not versions:
             QMessageBox.information(self, "Version auswählen", "Für dieses Paket wurden keine verfügbaren Versionen gefunden.")
             return
-        version, ok = QInputDialog.getItem(self, "Version auswählen", f"Version für {name}:", versions, 0, False)
+        version, ok = QInputDialog.getItem(self, "Select version" if self.language == "en" else "Version auswählen", (f"Version for {name}:" if self.language == "en" else f"Version für {name}:"), versions, 0, False)
         if ok and version:
             self.queue[name] = "version:" + version
             self.update_queue_label()
@@ -1097,18 +1281,22 @@ class Window(QMainWindow):
 
     def update_queue_label(self):
         if not self.queue:
-            self.queue_label.setText("Keine vorgemerkten Änderungen")
+            self.queue_label.setText("No queued changes" if self.language == "en" else "Keine vorgemerkten Änderungen")
         else:
-            labels = {"install":"Installieren", "reinstall":"Neu installieren", "remove":"Entfernen", "purge":"Vollständig entfernen", "hold":"Version sperren", "unhold":"Versionssperre aufheben"}
-            self.queue_label.setText("Vorgemerkt: " + ", ".join(f"{k} ({labels.get(v, v)})" for k, v in self.queue.items()))
+            labels_de = {"install":"Installieren", "reinstall":"Neu installieren", "remove":"Entfernen", "purge":"Vollständig entfernen", "hold":"Version sperren", "unhold":"Versionssperre aufheben"}
+            labels_en = {"install":"Install", "reinstall":"Reinstall", "remove":"Remove", "purge":"Purge", "hold":"Hold", "unhold":"Unhold"}
+            labels = labels_en if self.language == "en" else labels_de
+            prefix = "Queued: " if self.language == "en" else "Vorgemerkt: "
+            self.queue_label.setText(prefix + ", ".join(f"{k} ({labels.get(v, v)})" for k, v in self.queue.items()))
 
     def show_properties(self):
         name = self.selected()
         if not name:
             return
         _, out = cmd(["apt-cache", "show", name])
-        d = QDialog(self); d.setWindowTitle("Paketeigenschaften – " + name); d.resize(820, 560)
-        lay = QVBoxLayout(d); t = QTextEdit(); t.setReadOnly(True); t.setPlainText(out or "Keine Eigenschaften verfügbar."); lay.addWidget(t)
+        english = self.language == "en"
+        d = QDialog(self); d.setWindowTitle(("Package properties – " if english else "Paketeigenschaften – ") + name); d.resize(820, 560)
+        lay = QVBoxLayout(d); t = QTextEdit(); t.setReadOnly(True); t.setPlainText(out or ("No properties available." if english else "Keine Eigenschaften verfügbar.")); lay.addWidget(t)
         bb = QDialogButtonBox(QDialogButtonBox.Close); bb.rejected.connect(d.reject); bb.accepted.connect(d.accept); lay.addWidget(bb); d.exec()
 
     def show_package_files(self):
@@ -1116,10 +1304,11 @@ class Window(QMainWindow):
         if not name:
             return
         r, out = cmd(["dpkg", "-L", name])
+        english = self.language == "en"
         if r != 0:
-            QMessageBox.information(self, "Installierte Dateien", "Das Paket ist nicht installiert oder dpkg konnte die Dateiliste nicht lesen.\n\n" + out)
+            QMessageBox.information(self, "Installed files" if english else "Installierte Dateien", ("The package is not installed or dpkg could not read its file list.\n\n" if english else "Das Paket ist nicht installiert oder dpkg konnte die Dateiliste nicht lesen.\n\n") + out)
             return
-        d = QDialog(self); d.setWindowTitle("Installierte Dateien – " + name); d.resize(760, 520)
+        d = QDialog(self); d.setWindowTitle(("Installed files – " if english else "Installierte Dateien – ") + name); d.resize(760, 520)
         lay = QVBoxLayout(d); t = QTextEdit(); t.setReadOnly(True); t.setPlainText(out); lay.addWidget(t)
         bb = QDialogButtonBox(QDialogButtonBox.Close); bb.rejected.connect(d.reject); lay.addWidget(bb); d.exec()
 
@@ -1217,6 +1406,7 @@ class Window(QMainWindow):
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         layout.addWidget(buttons)
+        self.translate_dialog(dlg)
         if dlg.exec() != QDialog.Accepted:
             self.status.setText("Aufräumen abgebrochen – keine Pakete entfernt")
             return
@@ -1230,33 +1420,24 @@ class Window(QMainWindow):
         if not n: QMessageBox.information(self,"LunaPaket","Bitte zuerst ein Paket auswählen."); return
         self.queue[n]=action; self.update_queue_label(); self.refresh_checkbox(n)
     def refresh_checkbox(self, name):
-        for row in range(self.table.rowCount()):
-            item=self.table.item(row,0)
-            if item and item.data(Qt.UserRole)==name:
-                self.table.blockSignals(True)
-                installed = bool(item.data(Qt.UserRole + 1))
-                action = self.queue.get(name, "")
-                checked = installed
-                if action in ("install", "reinstall") or action.startswith("version:"):
-                    checked = True
-                elif action in ("remove", "purge"):
-                    checked = False
-                item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-                self.table.blockSignals(False)
-                break
+        model=self.table.package_model; installed=False
+        for row,values in enumerate(model.rows):
+            if values and values[0]==name: installed=model.installed[row]; break
+        action=self.queue.get(name, ""); checked=installed
+        if action in ("install","reinstall") or action.startswith("version:"): checked=True
+        elif action in ("remove","purge"): checked=False
+        model.set_checked_for_name(name,checked)
+
     def clear_queue(self):
         self.queue.clear(); self.update_queue_label()
-        self.table.blockSignals(True)
-        for row in range(self.table.rowCount()):
-            item=self.table.item(row,0)
-            if item:
-                item.setCheckState(Qt.Checked if bool(item.data(Qt.UserRole + 1)) else Qt.Unchecked)
-        self.table.blockSignals(False)
+        model=self.table.package_model; model.checked=list(model.installed)
+        if model.rowCount(): model.dataChanged.emit(model.index(0,0),model.index(model.rowCount()-1,0),[Qt.CheckStateRole])
+
     def commit(self):
         if not self.queue:
             return
         actions = dict(self.queue)
-        self.status.setText("Änderungen werden im Hintergrund geprüft …")
+        self.status.setText("Checking changes in the background …" if self.language == "en" else "Änderungen werden im Hintergrund geprüft …")
         self.set_busy(True)
         self.preview_job = FunctionJob(lambda: self.build_preview(actions))
         self.preview_job.result.connect(lambda result: self.show_commit_preview(actions, result))
@@ -1293,39 +1474,44 @@ class Window(QMainWindow):
     def show_commit_preview(self, actions, preview):
         self.set_busy(False)
         dlg = QDialog(self)
-        dlg.setWindowTitle("Paketaktionen bestätigen")
+        en = self.language == "en"
+        dlg.setWindowTitle("Confirm package actions" if en else "Paketaktionen bestätigen")
         dlg.resize(800, 560)
         layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("Prüfe die geplanten Aktionen. Entferne Häkchen, um einzelne Aktionen abzuwählen."))
+        layout.addWidget(QLabel("Review the planned actions. Uncheck items to exclude individual actions." if en else "Prüfe die geplanten Aktionen. Entferne Häkchen, um einzelne Aktionen abzuwählen."))
         listing = QListWidget()
-        labels = {"install":"Installieren", "reinstall":"Neu installieren", "remove":"Entfernen",
-                  "purge":"Vollständig entfernen", "hold":"Version sperren", "unhold":"Versionssperre aufheben"}
+        labels = ({"install":"Install", "reinstall":"Reinstall", "remove":"Remove",
+                   "purge":"Purge", "hold":"Hold version", "unhold":"Release version hold"} if en else
+                  {"install":"Installieren", "reinstall":"Neu installieren", "remove":"Entfernen",
+                   "purge":"Vollständig entfernen", "hold":"Version sperren", "unhold":"Versionssperre aufheben"})
         for name, action in actions.items():
             label = f"{labels.get(action, action)}: {name}"
             if action.startswith("version:"):
-                label = f"Version {action.split(':', 1)[1]} installieren: {name}"
+                label = (f"Install version {action.split(':', 1)[1]}: {name}" if en else
+                         f"Version {action.split(':', 1)[1]} installieren: {name}")
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, name)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
             listing.addItem(item)
         layout.addWidget(listing, 2)
-        layout.addWidget(QLabel("APT-Prüfung (Simulation, noch keine Änderungen ausgeführt):"))
+        layout.addWidget(QLabel("APT check (simulation; no changes have been made):" if en else "APT-Prüfung (Simulation, noch keine Änderungen ausgeführt):"))
         details = QTextEdit()
         details.setReadOnly(True)
         details.setPlainText(preview)
         layout.addWidget(details, 1)
-        auto_close = QCheckBox("Fenster nach erfolgreicher Aktion schließen")
+        auto_close = QCheckBox("Close window after successful action" if en else "Fenster nach erfolgreicher Aktion schließen")
         auto_close.setChecked(True)
         layout.addWidget(auto_close)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
-        buttons.button(QDialogButtonBox.Ok).setText("Jetzt ausführen")
-        buttons.button(QDialogButtonBox.Cancel).setText("Abbrechen")
+        buttons.button(QDialogButtonBox.Ok).setText("Run now" if en else "Jetzt ausführen")
+        buttons.button(QDialogButtonBox.Cancel).setText("Cancel" if en else "Abbrechen")
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         layout.addWidget(buttons)
+        self.translate_dialog(dlg)
         if dlg.exec() != QDialog.Accepted:
-            self.status.setText("Vorgemerkte Änderungen bleiben erhalten")
+            self.status.setText("Queued changes have been kept" if en else "Vorgemerkte Änderungen bleiben erhalten")
             return
         actions = {listing.item(i).data(Qt.UserRole): actions[listing.item(i).data(Qt.UserRole)]
                    for i in range(listing.count()) if listing.item(i).checkState() == Qt.Checked}
@@ -1352,8 +1538,14 @@ class Window(QMainWindow):
         shell = "set -e; " + " && ".join(" ".join("'" + x.replace("'", "'\\''") + "'" for x in c) for c in commands)
         expected = sum(1 for action in actions.values()
                        if action in ("install", "reinstall", "remove", "purge") or action.startswith("version:"))
-        self.run_action_job(privileged(["/bin/sh", "-c", shell]), "Paketaktionen",
-                            f"{len(actions)} ausgewählte Paketaktion(en) werden ausgeführt.", expected,
+        action_title = "Package actions" if self.language == "en" else "Paketaktionen"
+        action_description = (
+            f"{len(actions)} selected package action(s) are being executed."
+            if self.language == "en" else
+            f"{len(actions)} ausgewählte Paketaktion(en) werden ausgeführt."
+        )
+        self.run_action_job(privileged(["/bin/sh", "-c", shell]), action_title,
+                            action_description, expected,
                             auto_close=auto_close.isChecked())
 
     def show_package_history(self):
@@ -1367,12 +1559,17 @@ class Window(QMainWindow):
         view = QPlainTextEdit()
         view.setReadOnly(True)
         history = read_package_history()
-        view.setPlainText(history if history else "Noch keine Paketänderungen durch LunaPaket protokolliert.")
+        if self.language == "en":
+            history = history.replace(r"\n", "\n")
+            for de, en in (("Zeit:", "Time:"), ("Befehl:", "Command:"), ("Ergebnis:", "Result:"), ("Erfolgreich", "Successful"), ("Fehler (Exit-Code", "Error (exit code"), ("Paketänderungen:", "Package changes:"), ("Installiert:", "Installed:"), ("Entfernt:", "Removed:"), ("Aktualisiert:", "Upgraded:"), ("Erneut installiert:", "Reinstalled:")):
+                history = history.replace(de, en)
+        view.setPlainText(history if history else ("No package changes have been logged by LunaPaket yet." if self.language == "en" else "Noch keine Paketänderungen durch LunaPaket protokolliert."))
         layout.addWidget(view, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
+        self.translate_dialog(dialog)
         dialog.exec()
 
     def set_busy(self, busy):
@@ -1408,9 +1605,9 @@ class Window(QMainWindow):
         return None, None
 
     def run_action_job(self, args, title, description, expected=0, auto_close=True):
-        self.status.setText("Paketaktion läuft …")
+        self.status.setText("Package operation in progress …" if self.language == "en" else "Paketaktion läuft …")
         self.set_busy(True)
-        dialog = ActionProgressDialog(self, title, description)
+        dialog = ActionProgressDialog(self, title, description, english=self.language == "en")
         dialog.auto_close.setChecked(bool(auto_close))
         self.action_stream = StreamJob(args)
         completed = set()
@@ -1434,7 +1631,7 @@ class Window(QMainWindow):
             dialog.finish(code)
             self.set_busy(False)
             self.details.setPlainText(output[-18000:])
-            self.status.setText("Paketaktion abgeschlossen" if code == 0 else f"Paketaktion fehlgeschlagen (APT-Code {code})")
+            self.status.setText(("Package operation completed" if code == 0 else f"Package operation failed (APT code {code})") if self.language == "en" else ("Paketaktion abgeschlossen" if code == 0 else f"Paketaktion fehlgeschlagen (APT-Code {code})"))
             if code == 0:
                 self.catalog_cache = None
                 self._table_catalog_ready = False
@@ -1444,12 +1641,12 @@ class Window(QMainWindow):
         dialog.exec()
 
     def run_job(self,args):
-        self.status.setText("APT arbeitet im Hintergrund …"); self.set_busy(True)
+        self.status.setText("APT is working in the background …" if self.language == "en" else "APT arbeitet im Hintergrund …"); self.set_busy(True)
         self.job=Job(args); self.job.finished_text.connect(self.job_done); self.job.start()
     def job_done(self,r,o):
         self.set_busy(False)
         self.details.setPlainText(o[-18000:])
-        self.status.setText("Abgeschlossen" if r==0 else "Fehler – Details unten")
+        self.status.setText(("Completed" if r == 0 else "Error – see details below") if self.language == "en" else ("Abgeschlossen" if r==0 else "Fehler – Details unten"))
         if r == 0:
             self.catalog_cache = None
             self._table_catalog_ready = False
@@ -1462,7 +1659,7 @@ class Window(QMainWindow):
         self.catalog_cache = None
         self._table_catalog_ready = False
         # Erst Paketlisten aktualisieren und Upgrade-Kandidaten ermitteln.
-        self.status.setText("Paketquellen werden aktualisiert …")
+        self.status.setText("Updating package sources …" if self.language == "en" else "Paketquellen werden aktualisiert …")
         self.set_busy(True)
         self.upgrade_check_job = FunctionJob(self.check_upgrades)
         self.upgrade_check_job.result.connect(self.upgrade_check_done)
@@ -1502,28 +1699,38 @@ class Window(QMainWindow):
         return update_output, packages, security_packages
 
     def upgrade_check_failed(self, error):
+        en = self.language == "en"
         self.set_busy(False)
-        self.status.setText("Aktualisierungsprüfung fehlgeschlagen")
-        QMessageBox.critical(self, "System aktualisieren", str(error))
+        self.status.setText("Update check failed" if en else "Aktualisierungsprüfung fehlgeschlagen")
+        QMessageBox.critical(
+            self,
+            "System update failed" if en else "System aktualisieren",
+            (str(error).replace("Paketlisten konnten nicht aktualisiert werden.", "Could not refresh package lists.")
+                    .replace("Aktualisierungen konnten nicht ermittelt werden.", "Could not determine available updates.")
+                    .replace("Sicherheitsaktualisierungen konnten nicht erkannt werden.", "Could not identify security updates.")
+             if en else str(error))
+        )
 
     def upgrade_check_done(self, result):
         update_output, packages, security_packages = result
         self.set_busy(False)
+        en = self.language == "en"
         if not packages:
-            self.status.setText("System ist auf dem neuesten Stand")
-            QMessageBox.information(self, "System aktualisieren",
-                                    "Es sind keine Paketaktualisierungen verfügbar.\n\nDas System ist aktuell.")
+            self.status.setText("System is up to date" if en else "System ist auf dem neuesten Stand")
+            QMessageBox.information(self, "System update" if en else "System aktualisieren",
+                "No package updates are available.\n\nThe system is up to date." if en else
+                "Es sind keine Paketaktualisierungen verfügbar.\n\nDas System ist aktuell.")
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Verfügbare Aktualisierungen – {len(packages)} Pakete")
+        dlg.setWindowTitle((f"Available updates – {len(packages)} packages" if en else f"Verfügbare Aktualisierungen – {len(packages)} Pakete"))
         dlg.resize(900, 590)
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel(
-            f"{len(packages)} Aktualisierung(en) gefunden, davon {len(security_packages)} Sicherheitsaktualisierung(en).\n"
-            "Noch wurde nichts installiert."
+            (f"{len(packages)} update(s) found, including {len(security_packages)} security update(s).\nNothing has been installed yet." if en else
+             f"{len(packages)} Aktualisierung(en) gefunden, davon {len(security_packages)} Sicherheitsaktualisierung(en).\nNoch wurde nichts installiert.")
         ))
         table = QTableWidget(len(packages), 4)
-        table.setHorizontalHeaderLabels(["Paket", "Neue Version", "Quelle / Architektur", "Art"])
+        table.setHorizontalHeaderLabels(["Package", "New version", "Source / architecture", "Type"] if en else ["Paket", "Neue Version", "Quelle / Architektur", "Art"])
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.horizontalHeader().setStretchLastSection(True)
@@ -1534,23 +1741,24 @@ class Window(QMainWindow):
             name = name_arch.split("/", 1)[0]
             version = fields[1] if len(fields) > 1 else ""
             source = fields[2].strip("[]") if len(fields) > 2 else ""
-            kind = "Sicherheitsupdate" if name.split(":", 1)[0] in security_set else "Normales Update"
+            is_security = name.split(":", 1)[0] in security_set
+            kind = (("Security update" if is_security else "Regular update") if en else ("Sicherheitsupdate" if is_security else "Normales Update"))
             for col, value in enumerate((name, version, source, kind)):
                 table.setItem(row, col, QTableWidgetItem(value))
         lay.addWidget(table, 3)
-        lay.addWidget(QLabel("APT-Prüfung und verfügbare Pakete:"))
+        lay.addWidget(QLabel("APT check and available packages:" if en else "APT-Prüfung und verfügbare Pakete:"))
         log = QTextEdit(); log.setReadOnly(True); log.setMaximumHeight(110)
-        log.setPlainText("Paketlisten erfolgreich aktualisiert.\n" + "\n".join(packages))
+        log.setPlainText(("Package lists updated successfully.\n" if en else "Paketlisten erfolgreich aktualisiert.\n") + "\n".join(packages))
         lay.addWidget(log, 1)
-        auto_close = QCheckBox("Fenster nach erfolgreicher Aktion schließen")
+        auto_close = QCheckBox("Close window after successful action" if en else "Fenster nach erfolgreicher Aktion schließen")
         auto_close.setChecked(True)
         lay.addWidget(auto_close)
         buttons = QDialogButtonBox()
-        cancel = buttons.addButton("Abbrechen", QDialogButtonBox.RejectRole)
+        cancel = buttons.addButton("Cancel" if en else "Abbrechen", QDialogButtonBox.RejectRole)
         security_btn = None
         if security_packages:
-            security_btn = buttons.addButton("Nur Sicherheitsupdates installieren", QDialogButtonBox.ActionRole)
-        all_btn = buttons.addButton("Alle Aktualisierungen installieren", QDialogButtonBox.AcceptRole)
+            security_btn = buttons.addButton("Install security updates only" if en else "Nur Sicherheitsupdates installieren", QDialogButtonBox.ActionRole)
+        all_btn = buttons.addButton("Install all updates" if en else "Alle Aktualisierungen installieren", QDialogButtonBox.AcceptRole)
         lay.addWidget(buttons)
         choice = {"mode": None}
         cancel.clicked.connect(dlg.reject)
@@ -1558,16 +1766,20 @@ class Window(QMainWindow):
         if security_btn:
             security_btn.clicked.connect(lambda: (choice.update(mode="security"), dlg.accept()))
         if dlg.exec() != QDialog.Accepted or not choice["mode"]:
-            self.status.setText("Aktualisierung abgebrochen – nichts installiert")
+            self.status.setText("Update cancelled – nothing installed" if en else "Aktualisierung abgebrochen – nichts installiert")
             return
         selected = security_packages if choice["mode"] == "security" else packages
-        self.start_upgrade_install(selected, security_only=(choice["mode"] == "security"),
-                                   auto_close=auto_close.isChecked())
+        self.start_upgrade_install(selected, security_only=(choice["mode"] == "security"), auto_close=auto_close.isChecked())
 
     def start_upgrade_install(self, packages, security_only=False, auto_close=True):
-        title = "Sicherheitsaktualisierungen installieren" if security_only else "System wird aktualisiert"
-        description = f"{len(packages)} Paketaktualisierung(en) werden installiert."
-        progress = ActionProgressDialog(self, title, description)
+        en = self.language == "en"
+        if en:
+            title = "Installing security updates" if security_only else "Updating system"
+            description = f"Installing {len(packages)} package update(s)."
+        else:
+            title = "Sicherheitsaktualisierungen installieren" if security_only else "System wird aktualisiert"
+            description = f"{len(packages)} Paketaktualisierung(en) werden installiert."
+        progress = ActionProgressDialog(self, title, description, english=en)
         progress.auto_close.setChecked(bool(auto_close))
         self.set_busy(True)
         if security_only:
@@ -1585,18 +1797,20 @@ class Window(QMainWindow):
             if apt_percent is not None:
                 progress.set_progress(apt_percent, apt_message)
                 return
-            unpack_match = re.match(r"^(?:Unpacking|Preparing to unpack)\s+([^ :]+)", line)
-            setup_match = re.match(r"^Setting up\s+([^ :]+)", line)
+            # dpkg progress output follows the system locale; normalize the
+            # common German and English package-action prefixes for the UI.
+            unpack_match = re.match(r"^(?:Unpacking|Preparing to unpack|Entpacken von|Entpacke)\s+([^ :]+)", line)
+            setup_match = re.match(r"^(?:Setting up|Einrichten von|Richte ein)\s+([^ :]+)", line)
             if unpack_match:
                 package = unpack_match.group(1)
                 unpacked.add(package)
                 percent = min(50, int(len(unpacked) * 50 / max(1, len(packages))))
-                progress.set_progress(percent, package + " (Entpacken)")
+                progress.set_progress(percent, package + (" (Unpacking)" if en else " (Entpacken)"))
             elif setup_match:
                 package = setup_match.group(1)
                 configured.add(package)
                 percent = 50 + min(49, int(len(configured) * 49 / max(1, len(packages))))
-                progress.set_progress(percent, package + " (Einrichten)")
+                progress.set_progress(percent, package + (" (Configuring)" if en else " (Einrichten)"))
             elif line:
                 progress.set_progress(None, line[:180])
 
@@ -1605,11 +1819,15 @@ class Window(QMainWindow):
             progress.finish(rc)
             self.set_busy(False)
             if rc == 0:
-                self.status.setText("Sicherheitsaktualisierungen abgeschlossen" if security_only else "Systemaktualisierung abgeschlossen")
+                self.status.setText(
+                    ("Security updates completed" if security_only else "System update completed")
+                    if en else
+                    ("Sicherheitsaktualisierungen abgeschlossen" if security_only else "Systemaktualisierung abgeschlossen")
+                )
                 self.catalog_cache = None
                 self._table_catalog_ready = False
             else:
-                self.status.setText("Fehler bei der Aktualisierung")
+                self.status.setText("Update failed" if en else "Fehler bei der Aktualisierung")
             self.search_pkgs()
         self.upgrade_stream.finished_text.connect(finished)
         self.upgrade_stream.start()
@@ -1655,15 +1873,15 @@ class Window(QMainWindow):
         def done(items):
             self._security_check_running = False
             active = [x for x in items if not x["deferred"]]
-            self.status.setText(f"Automatische Sicherheitsprüfung: {len(active)} offene Sicherheitsupdates")
+            self.status.setText((f"Automatic security check: {len(active)} pending security updates" if self.language == "en" else f"Automatische Sicherheitsprüfung: {len(active)} offene Sicherheitsupdates"))
             previous = self.settings.value("security/last_count", -1, type=int)
             self.settings.setValue("security/last_count", len(active))
             self.settings.setValue("security/last_check", __import__("datetime").datetime.now().astimezone().strftime("%d.%m.%Y %H:%M"))
             if len(active) > max(0, previous):
-                self.status.setText(f"Neue Sicherheitsupdates gefunden: {len(active)}")
+                self.status.setText((f"New security updates found: {len(active)}" if self.language == "en" else f"Neue Sicherheitsupdates gefunden: {len(active)}"))
         def failed(error):
             self._security_check_running = False
-            self.status.setText("Automatische Sicherheitsprüfung fehlgeschlagen")
+            self.status.setText("Automatic security check failed" if self.language == "en" else "Automatische Sicherheitsprüfung fehlgeschlagen")
         self.security_silent_job.result.connect(done)
         self.security_silent_job.failed.connect(failed)
         self.security_silent_job.start()
@@ -1715,7 +1933,7 @@ class Window(QMainWindow):
         return items
 
     def manage_security_updates(self):
-        self.status.setText("Sicherheitsupdates werden gesucht …")
+        self.status.setText("Searching for security updates …" if self.language == "en" else "Sicherheitsupdates werden gesucht …")
         self.set_busy(True)
         self.security_manage_job = FunctionJob(self.find_security_updates)
         self.security_manage_job.result.connect(self.security_updates_dialog)
@@ -1730,10 +1948,11 @@ class Window(QMainWindow):
         deferred = self._security_deferred()
         for item in items:
             item["deferred"] = deferred.get(item["package"]) == item["candidate"]
-        dlg = QDialog(self); dlg.setWindowTitle("Sicherheitsupdates verwalten"); dlg.resize(980, 650)
+        dlg = QDialog(self); dlg.setWindowTitle("Manage security updates" if self.language == "en" else "Sicherheitsupdates verwalten"); dlg.resize(980, 650)
         layout = QVBoxLayout(dlg)
         active = sum(not x["deferred"] for x in items)
-        layout.addWidget(QLabel(f"{len(items)} Sicherheitsupdate(s) gefunden · {active} aktiv · {len(items)-active} zurückgestellt"))
+        summary = (f"{len(items)} security update(s) found · {active} active · {len(items)-active} deferred" if self.language == "en" else f"{len(items)} Sicherheitsupdate(s) gefunden · {active} aktiv · {len(items)-active} zurückgestellt")
+        layout.addWidget(QLabel(summary))
         table = QTableWidget(len(items), 6)
         table.setHorizontalHeaderLabels(["Auswahl", "Paket", "Installiert", "Verfügbar", "Status", "Sicherheitsquelle"])
         table.setEditTriggers(QTableWidget.NoEditTriggers); table.horizontalHeader().setStretchLastSection(True)
@@ -1811,18 +2030,19 @@ class Window(QMainWindow):
             for r,entry in enumerate(hist):
                 for c,key in enumerate(("time","action","package","version","result")):
                     view.setItem(r,c,QTableWidgetItem(str(entry.get(key,""))))
-            hl.addWidget(view); b=QPushButton("Schließen"); b.clicked.connect(hd.accept); hl.addWidget(b); hd.exec()
+            hl.addWidget(view); b=QPushButton("Schließen"); b.clicked.connect(hd.accept); hl.addWidget(b); self.translate_dialog(hd); hd.exec()
         defer_btn.clicked.connect(defer_selected); restore_btn.clicked.connect(restore_selected)
         # Dialog schließen und Sicherheitsupdate-Suche erneut im Hintergrund starten.
         search_btn.clicked.connect(lambda: (dlg.accept(), self.manage_security_updates()))
         install_btn.clicked.connect(install_selected); history_btn.clicked.connect(show_history)
         close.clicked.connect(dlg.accept)
+        self.translate_dialog(dlg)
         dlg.exec()
 
     def run_security_install(self, chosen):
         names = [x["package"] for x in chosen]
-        progress = ActionProgressDialog(self, "Sicherheitsupdates installieren",
-                                        f"{len(names)} ausgewählte Sicherheitsupdates werden installiert.")
+        progress = ActionProgressDialog(self, "Install security updates" if self.language == "en" else "Sicherheitsupdates installieren",
+                                        (f"Installing {len(names)} selected security updates." if self.language == "en" else f"{len(names)} ausgewählte Sicherheitsupdates werden installiert."), english=self.language == "en")
         self.set_busy(True)
         args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "--only-upgrade", "install", *names])
         self.security_install_stream = StreamJob(args)
@@ -1840,9 +2060,9 @@ class Window(QMainWindow):
                 for item in chosen: deferred.pop(item["package"], None)
                 self.settings.setValue("security/deferred", json.dumps(deferred, ensure_ascii=False))
                 self.settings.sync()
-                self.status.setText("Sicherheitsupdates installiert")
+                self.status.setText("Security updates installed" if self.language == "en" else "Sicherheitsupdates installiert")
             else:
-                self.status.setText("Installation der Sicherheitsupdates fehlgeschlagen")
+                self.status.setText("Security update installation failed" if self.language == "en" else "Installation der Sicherheitsupdates fehlgeschlagen")
             self.search_pkgs()
         self.security_install_stream.finished_text.connect(finished)
         self.security_install_stream.start(); progress.exec()
@@ -1859,10 +2079,14 @@ class Window(QMainWindow):
 
     def manage_sources(self):
         files = self._source_files()
-        d = QDialog(self); d.setWindowTitle("Paketquellen (Repository-Verwaltung)"); d.resize(1050, 650)
+        english = self.language == "en"
+        d = QDialog(self)
+        d.setWindowTitle("Repositories (repository management)" if english else "Paketquellen (Repository-Verwaltung)")
+        d.resize(1050, 650)
         layout = QVBoxLayout(d)
-        layout.addWidget(QLabel("APT-Paketquellen aktivieren, bearbeiten und verwalten."))
-        table = QTableWidget(0, 5); table.setHorizontalHeaderLabels(["Aktiviert", "Typ", "Adresse", "Distribution", "Bereiche"])
+        layout.addWidget(QLabel("Enable, edit and manage APT repositories." if english else "APT-Paketquellen aktivieren, bearbeiten und verwalten."))
+        table = QTableWidget(0, 5)
+        table.setHorizontalHeaderLabels(["Enabled", "Type", "Address", "Distribution", "Components"] if english else ["Aktiviert", "Typ", "Adresse", "Distribution", "Bereiche"])
         table.setSelectionBehavior(QAbstractItemView.SelectRows); table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.horizontalHeader().setStretchLastSection(True); table.setColumnWidth(0, 85); table.setColumnWidth(1, 80)
         layout.addWidget(table, 1)
@@ -1901,9 +2125,9 @@ class Window(QMainWindow):
                     table.setItem(r,c,item)
                 table.item(r,0).setData(Qt.UserRole, entry)
         load_entries()
-        editor_box=QGroupBox("Ausgewählte Paketquelle bearbeiten"); form=QFormLayout(editor_box)
+        editor_box=QGroupBox("Edit selected repository" if english else "Ausgewählte Paketquelle bearbeiten"); form=QFormLayout(editor_box)
         typ=QComboBox(); typ.addItems(["deb","deb-src"]); uri=QLineEdit(); suite=QLineEdit(); components=QLineEdit()
-        form.addRow("Typ:",typ); form.addRow("Adresse:",uri); form.addRow("Distribution:",suite); form.addRow("Bereiche:",components); layout.addWidget(editor_box)
+        form.addRow("Type:" if english else "Typ:",typ); form.addRow("Address:" if english else "Adresse:",uri); form.addRow("Distribution:",suite); form.addRow("Components:" if english else "Bereiche:",components); layout.addWidget(editor_box)
         def selected_entry():
             r=table.currentRow(); return source_entries[r] if 0<=r<len(source_entries) else None
         def fill_form():
@@ -1940,7 +2164,7 @@ class Window(QMainWindow):
                         if re.search(r"(?im)^Enabled:",raw): raw=re.sub(r"(?im)^Enabled:.*$","Enabled: no",raw)
                         else: raw=raw.rstrip()+"\nEnabled: no\n"
                 if raw!=original: Path(path).write_text(raw,encoding="utf-8")
-            QMessageBox.information(d,"Paketquellen","Änderungen gespeichert. Aktualisiere anschließend die Paketlisten.")
+            QMessageBox.information(d, "Repositories" if english else "Paketquellen", "Changes saved. Refresh the package lists afterwards." if english else "Änderungen gespeichert. Aktualisiere anschließend die Paketlisten.")
             load_entries()
         def apply_form():
             e=selected_entry()
@@ -1972,15 +2196,15 @@ class Window(QMainWindow):
                 Path(e["path"]).write_text("\n".join(lines)+"\n",encoding="utf-8")
             source_entries.remove(e); load_entries()
         actions=QHBoxLayout()
-        for label,fn in (("Hoch",lambda:move(-1)),("Runter",lambda:move(1)),("Neu",add_entry),("Löschen",delete_entry),("Übernehmen",apply_form)):
+        for label,fn in ((("Up",lambda:move(-1)),("Down",lambda:move(1)),("New",add_entry),("Delete",delete_entry),("Apply",apply_form)) if english else (("Hoch",lambda:move(-1)),("Runter",lambda:move(1)),("Neu",add_entry),("Löschen",delete_entry),("Übernehmen",apply_form))):
             b=QPushButton(label); b.clicked.connect(fn); actions.addWidget(b)
         actions.addStretch(1); layout.addLayout(actions)
-        buttons=QDialogButtonBox(); save=buttons.addButton("OK",QDialogButtonBox.AcceptRole); cancel=buttons.addButton("Abbrechen",QDialogButtonBox.RejectRole)
+        buttons=QDialogButtonBox(); save=buttons.addButton("OK",QDialogButtonBox.AcceptRole); cancel=buttons.addButton("Cancel" if english else "Abbrechen",QDialogButtonBox.RejectRole)
         save.clicked.connect(lambda:(apply_form(),save_all(),d.accept())); cancel.clicked.connect(d.reject); layout.addWidget(buttons)
         d.exec()
 
     def check_sources(self):
-        progress=ActionProgressDialog(self,"Paketquellen prüfen","APT prüft alle konfigurierten Paketquellen und meldet fehlerhafte oder nicht erreichbare Repositories.")
+        progress=ActionProgressDialog(self, "Check repositories" if self.language == "en" else "Paketquellen prüfen", "APT checks all configured repositories and reports invalid or unreachable sources." if self.language == "en" else "APT prüft alle konfigurierten Paketquellen und meldet fehlerhafte oder nicht erreichbare Repositories.", english=self.language == "en")
         job=StreamJob(privileged(["apt","update"]))
         job.output.connect(progress.append_output)
         result={"code":1}
@@ -1989,12 +2213,12 @@ class Window(QMainWindow):
         job.finished_text.connect(done)
         job.start(); progress.exec()
         if job.isRunning(): job.wait()
-        if result["code"] == 0: QMessageBox.information(self,"Paketquellen","Die Paketlisten wurden erfolgreich aktualisiert.")
-        else: QMessageBox.warning(self,"Paketquellen","Mindestens eine Paketquelle konnte nicht fehlerfrei aktualisiert werden. Details stehen im Prüfprotokoll.")
+        if result["code"] == 0: QMessageBox.information(self, "Repositories" if self.language == "en" else "Paketquellen", "Package lists were refreshed successfully." if self.language == "en" else "Die Paketlisten wurden erfolgreich aktualisiert.")
+        else: QMessageBox.warning(self, "Repositories" if self.language == "en" else "Paketquellen", "At least one repository could not be refreshed successfully. See the check log for details." if self.language == "en" else "Mindestens eine Paketquelle konnte nicht fehlerfrei aktualisiert werden. Details stehen im Prüfprotokoll.")
 
     def install_local_deb(self, paths=None):
         if paths is None:
-            paths,_=QFileDialog.getOpenFileNames(self,"Lokale DEB-Dateien auswählen","","Debian-Pakete (*.deb)")
+            paths,_=QFileDialog.getOpenFileNames(self, "Select local DEB files" if self.language == "en" else "Lokale DEB-Dateien auswählen", "", "Debian packages (*.deb)" if self.language == "en" else "Debian-Pakete (*.deb)")
         else:
             paths=[os.path.abspath(x) for x in paths if x.lower().endswith(".deb") and os.path.isfile(x)]
         if not paths: return
@@ -2041,17 +2265,18 @@ class Window(QMainWindow):
 
         # Eigenes Fenster für eine per "Öffnen mit" übergebene DEB-Datei.
         dialog=QDialog(self)
-        dialog.setWindowTitle("Lokales Debian-Paket")
+        english = self.language == "en"
+        dialog.setWindowTitle("Local Debian package" if english else "Lokales Debian-Paket")
         dialog.resize(680,420)
         layout=QVBoxLayout(dialog)
-        heading=QLabel("Ausgewählte Debian-Pakete")
+        heading=QLabel("Selected Debian packages" if english else "Ausgewählte Debian-Pakete")
         heading.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(heading)
-        info=QLabel("Prüfe Paketstatus und Version. Wähle anschließend die gewünschte Aktion.")
+        info=QLabel("Check package status and version, then choose the desired action." if english else "Prüfe Paketstatus und Version. Wähle anschließend die gewünschte Aktion.")
         info.setWordWrap(True)
         layout.addWidget(info)
         table=QTableWidget(len(details),4)
-        table.setHorizontalHeaderLabels(["Datei / Paket","Version","Installierter Status","Aktion"])
+        table.setHorizontalHeaderLabels(["File / package","Version","Installed status","Action"] if english else ["Datei / Paket","Version","Installierter Status","Aktion"])
         table.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
         table.horizontalHeader().setSectionResizeMode(1,QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(2,QHeaderView.ResizeToContents)
@@ -2070,16 +2295,16 @@ class Window(QMainWindow):
             installed=bool(qrc==0 and parts and parts[0]=="installed")
             installed_version=parts[1] if len(parts)>1 else ""
             values=[os.path.basename(path),version,
-                    (f"Installiert: {installed_version}" if installed else "Nicht installiert"),
-                    ("Erneut installieren" if installed else "Installieren")]
+                    (f"Installed: {installed_version}" if english else f"Installiert: {installed_version}") if installed else ("Not installed" if english else "Nicht installiert"),
+                    (("Reinstall" if english else "Erneut installieren") if installed else ("Install" if english else "Installieren"))]
             for col,value in enumerate(values):
                 table.setItem(row,col,QTableWidgetItem(value))
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         layout.addWidget(table,1)
         buttons=QDialogButtonBox()
-        install_btn=buttons.addButton("Installieren / aktualisieren",QDialogButtonBox.AcceptRole)
-        reinstall_btn=buttons.addButton("Erneut installieren",QDialogButtonBox.ActionRole)
-        cancel_btn=buttons.addButton("Abbrechen",QDialogButtonBox.RejectRole)
+        install_btn=buttons.addButton("Install / upgrade" if english else "Installieren / aktualisieren",QDialogButtonBox.AcceptRole)
+        reinstall_btn=buttons.addButton("Reinstall" if english else "Erneut installieren",QDialogButtonBox.ActionRole)
+        cancel_btn=buttons.addButton("Cancel" if english else "Abbrechen",QDialogButtonBox.RejectRole)
         reinstall_btn.setEnabled(bool(reinstall_paths))
         install_btn.clicked.connect(dialog.accept)
         reinstall_btn.clicked.connect(lambda: (dialog.setProperty("force_reinstall",True),dialog.accept()))
@@ -2093,34 +2318,63 @@ class Window(QMainWindow):
         else:
             normal_paths=list(normal_paths)
         if not normal_paths:
-            QMessageBox.information(self,"Keine Installation","Es gibt keine neuen oder aktualisierbaren Pakete. Für eine Neuinstallation bitte „Erneut installieren“ wählen.")
+            QMessageBox.information(self, "No installation" if english else "Keine Installation", "There are no new or upgradable packages. Choose “Reinstall” to reinstall a package." if english else "Es gibt keine neuen oder aktualisierbaren Pakete. Für eine Neuinstallation bitte „Erneut installieren“ wählen.")
             return
 
         apt_args=["apt","install","-y"]
         if reinstall:
             apt_args.append("--reinstall")
         args=privileged([*apt_args,*normal_paths])
-        self.run_action_job(args,"Lokale DEB installieren","Lokale Debian-Pakete werden installiert; bereits installierte Pakete werden bei Auswahl mit APT --reinstall erneut installiert.")
+        self.run_action_job(args, "Install local DEB" if english else "Lokale DEB installieren", "Installing local Debian packages; selected already-installed packages will be reinstalled using APT --reinstall." if english else "Lokale Debian-Pakete werden installiert; bereits installierte Pakete werden bei Auswahl mit APT --reinstall erneut installiert.")
 
     def show_dependency_analysis(self):
-        name=self.selected()
+        english = self.language == "en"
+        name = self.selected()
         if not name:
-            name,ok=QInputDialog.getText(self,"Abhängigkeitsanalyse","Paketname:")
-            if not ok or not name.strip(): return
-            name=name.strip()
-        sections=[]
-        for title,args in [("Benötigte Abhängigkeiten",["apt-cache","depends",name]),("Rückwärtsabhängigkeiten (Pakete, die dieses Paket benötigen)",["apt-cache","rdepends",name]),("Konflikte / Ersetzungen",["apt-cache","show",name])]:
-            rc,out=cmd(args)
-            if title.startswith("Konflikte"):
-                fields=[]
+            name, ok = QInputDialog.getText(self, "Dependency analysis" if english else "Abhängigkeitsanalyse", "Package name:" if english else "Paketname:")
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+
+        labels = [
+            ("Required dependencies" if english else "Benötigte Abhängigkeiten", ["apt-cache", "depends", name]),
+            ("Reverse dependencies (packages that depend on this package)" if english else "Rückwärtsabhängigkeiten (Pakete, die dieses Paket benötigen)", ["apt-cache", "rdepends", name]),
+            ("Conflicts / Replacements" if english else "Konflikte / Ersetzungen", ["apt-cache", "show", name]),
+        ]
+        sections = []
+        for title, args in labels:
+            if english:
+                try:
+                    result = subprocess.run(args, text=True, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, timeout=1800,
+                                            env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+                    rc, out = result.returncode, result.stdout
+                except Exception as exc:
+                    rc, out = 1, str(exc)
+            else:
+                rc, out = cmd(args)
+            if "Conflicts" in title or "Konflikte" in title:
+                fields = []
                 for line in out.splitlines():
-                    if line.startswith(("Conflicts:","Breaks:","Replaces:","Depends:","Pre-Depends:")): fields.append(line)
-                out="\n".join(fields) or "Keine entsprechenden Konflikt-/Abhängigkeitsfelder in den Paketmetadaten gefunden."
-            sections.append(title+"\n"+"="*len(title)+"\n"+(out.strip() or "Keine Angaben verfügbar."))
-        d=QDialog(self); d.setWindowTitle("Abhängigkeitsanalyse – "+name); d.resize(850,600)
-        lay=QVBoxLayout(d); t=QPlainTextEdit(); t.setReadOnly(True); t.setPlainText("\n\n".join(sections)); lay.addWidget(t)
-        note=QLabel("Hinweis: Die endgültige Konflikt- und Entfernungsprüfung erfolgt zusätzlich durch APT-Simulation vor jeder Paketänderung."); note.setWordWrap(True); lay.addWidget(note)
-        b=QDialogButtonBox(QDialogButtonBox.Close); b.rejected.connect(d.reject); b.accepted.connect(d.accept); lay.addWidget(b); d.exec()
+                    if line.startswith(("Conflicts:", "Breaks:", "Replaces:", "Depends:", "Pre-Depends:")):
+                        fields.append(line)
+                fallback = "No relevant conflict or dependency fields were found in the package metadata." if english else "Keine entsprechenden Konflikt-/Abhängigkeitsfelder in den Paketmetadaten gefunden."
+                out = "\n".join(fields) or fallback
+            no_data = "No information available." if english else "Keine Angaben verfügbar."
+            sections.append(title + "\n" + "=" * len(title) + "\n" + (out.strip() or no_data))
+
+        d = QDialog(self)
+        d.setWindowTitle(("Dependency analysis – " if english else "Abhängigkeitsanalyse – ") + name)
+        d.resize(850, 600)
+        lay = QVBoxLayout(d)
+        t = QPlainTextEdit(); t.setReadOnly(True); t.setPlainText("\n\n".join(sections)); lay.addWidget(t)
+        note_text = ("Note: APT simulation also performs the final conflict and removal checks before each package change." if english else "Hinweis: Die endgültige Konflikt- und Entfernungsprüfung erfolgt zusätzlich durch APT-Simulation vor jeder Paketänderung.")
+        note = QLabel(note_text); note.setWordWrap(True); lay.addWidget(note)
+        b = QDialogButtonBox(QDialogButtonBox.Close); b.rejected.connect(d.reject); b.accepted.connect(d.accept); lay.addWidget(b)
+        if english:
+            d.setWindowTitle("Dependency analysis – " + name)
+            b.button(QDialogButtonBox.Close).setText("Close")
+        d.exec()
 
     def sources(self):
         files=["/etc/apt/sources.list"]
@@ -2130,7 +2384,8 @@ class Window(QMainWindow):
         for f in files:
             try:text+=f"### {f}\n"+open(f,encoding="utf-8",errors="replace").read()+"\n"
             except OSError:pass
-        d=QDialog(self); d.setWindowTitle("Paketquellen"); d.resize(800,500); lay=QVBoxLayout(d); t=QTextEdit(); t.setReadOnly(True); t.setPlainText(text or "Keine Paketquellen gefunden."); lay.addWidget(t); b=QDialogButtonBox(QDialogButtonBox.Close); b.rejected.connect(d.reject); lay.addWidget(b); d.exec()
+        english = self.language == "en"
+        d=QDialog(self); d.setWindowTitle("Repositories" if english else "Paketquellen"); d.resize(800,500); lay=QVBoxLayout(d); t=QTextEdit(); t.setReadOnly(True); t.setPlainText(text or ("No repositories found." if english else "Keine Paketquellen gefunden.")); lay.addWidget(t); b=QDialogButtonBox(QDialogButtonBox.Close); b.rejected.connect(d.reject); lay.addWidget(b); d.exec()
 def main():
     relaunch_as_root()
     app=QApplication(sys.argv)

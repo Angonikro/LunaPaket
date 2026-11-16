@@ -1,4 +1,26 @@
+# Changelog
+
+## 0.1.37
+- Paketübersicht für 70.549 Pakete optimiert; der vollständige Paketbestand bleibt im Speicher.
+- Kategorie- und Statusfilter für „Alle Pakete“, „Installiert“, „Nicht installiert“, „Aufräumen“ und „Vorgemerkt“ beschleunigt.
+- Tabellenmodell für die große Paketliste überarbeitet, um unnötige Zeilen- und Zellaktualisierungen zu vermeiden.
+- Bedienung und Darstellung der Paket-Checkboxen korrigiert; weiße Kontrollkästchen im dunklen Theme wiederhergestellt.
+- Kontextmenü und Paketvormerkungen in der modellbasierten Tabelle korrigiert.
+- Englische Oberfläche weiter vervollständigt: Hauptfenster, Statusmeldungen, Paketaktionen, Sicherheitsupdates und Paketquellen.
+- Paketdialoge für installierte Dateien, Abhängigkeitsanalyse und Paketeigenschaften sprachabhängig überarbeitet.
+- Versionsauswahldialog übersetzt; Fenstertitel und Versionsbeschriftung werden passend zur gewählten Sprache angezeigt.
+- Dynamische Status- und Fortschrittsmeldungen sowie Bestätigungsdialoge auf feste deutsche Textzuweisungen geprüft und sprachabhängig korrigiert.
+- Aktionsfortschrittsdialog: Fenstertitel und dynamische Beschreibung werden jetzt abhängig von der gewählten Sprache angezeigt (Englisch/Deutsch).
+- Englische Übersetzungen der Dialoge für Sicherheitsupdates, Paketquellen und Distributionseinstellungen ergänzt.
+- Paketverlauf, Schriftgrößendialog, Statusmeldungen und zugehörige Menüeinträge ins Englische übertragen.
+- Bestehende Paketverwaltungsfunktionen unverändert gelassen.
+- Die Haupt-Paketliste verwendet `QTableView` mit einem eigenen `QAbstractTableModel`.
+- Der vollständige Katalog wird als Datenmodell übernommen; Qt muss dadurch nicht mehr
+- für jede Zelle ein separates `QTableWidgetItem` erzeugen. Checkboxen und vorgemerkte
+- Aktionen bleiben mit der Paketliste synchronisiert. Die Anzeige bleibt vollständig.
+
 ## 0.1.36
+
 - Fehlerhafte doppelte Maskierung in den DPKG-Auswertungsmustern behoben; Erstinstallationen, erneute Installationen, Entfernungen, vollständige Entfernungen und Upgrades werden dadurch zuverlässig erkannt.
 - Paketverlauf schreibt wieder echte Zeilenumbrüche statt sichtbarer `\n`-Sequenzen.
 - Der Bereich „Aufräumen“ wird über dieselbe DPKG-Ereigniserfassung protokolliert; tatsächlich entfernte Pakete erscheinen als Verlaufseinträge.
@@ -15,7 +37,6 @@
 - Fehlerprotokoll unter `~/.local/share/LunaPaket/logs/apt-errors.log`; Begrenzung auf 512 KB plus eine rotierte Sicherung.
 - Erfolgreiche APT-Aktionen erzeugen keine eigenen Fehlerprotokolleinträge.
 
-# Änderungsprotokoll LunaPaket
 
 ## 0.1.35
 - Im Bereich „Aufräumen“ ein sichtbares Sammelkästchen „Alle Pakete vormerken“ ergänzt. Es merkt alle von APT erkannten entbehrlichen, installierten Pakete gemeinsam zur Entfernung vor; erneutes Abwählen nimmt diese Sammelvormerkungen zurück.
@@ -82,3 +103,38 @@
 - Fehlerhafte sichtbare `\\n`-Zeichen im Dialog „Über LunaPaket“ beseitigt.
 - Infofenster übersichtlicher mit Programmname, Versionsnummer, Goldisoft 2026 und Beschreibung formatiert.
 - Keine Änderung der Versionsnummer.
+
+## 0.1.37 – Qt-Tabellenumbau
+- Haupt-Paketliste von `QTableWidget` auf `QTableView` mit eigenem `QAbstractTableModel` umgestellt.
+- Paketkatalog wird mit einem Modell-Reset übernommen, statt für jede Tabellenzelle einzelne `QTableWidgetItem`-Objekte anzulegen.
+- Checkbox-Zustände, Vormerkungen, Auswahl, Kontextmenü, Suche und Kategorienfilter an das Datenmodell angebunden.
+- Die vollständige Paketliste bleibt erhalten; es gibt kein Seitenlimit und keine gekürzte Anzeige.
+- Versionsnummer bleibt wie beauftragt bei 0.1.37.
+
+
+## 0.1.37 – Hauptfenster-Sprachkorrektur
+- Tabellenüberschriften und Paketstatus werden im englischen UI korrekt angezeigt.
+- Warteschlangenmeldung und Warteschlangenaktionen folgen der gewählten Sprache.
+
+## 0.1.37 – zusätzliche Sprachkorrekturen
+- Weitere englische Übersetzungen für Hauptfenster, Kontextmenüs sowie Paketaktions- und Aufräumdialoge ergänzt.
+- Dynamisch erzeugte Bestätigungsdialoge werden vor der Anzeige durch die Dialogübersetzung geführt.
+- Paketbestand, Ladeablauf und übrige Paketverwaltungslogik unverändert gelassen.
+
+### Sprachkorrektur – Aktionsfenster (0.1.37)
+- Dynamische Texte des Aktionsfortschritts werden im englischen Modus konsequent englisch dargestellt.
+- Bestätigungsdialog, Aktionsbezeichnungen, APT-Prüfhinweis und Statusmeldung sind sprachabhängig.
+- Paketbestand, Lade-/Zählverhalten und Paketverarbeitung unverändert.
+
+## 0.1.37 – Sprachkorrektur
+- Korrigiert die Statusmeldung nach Abbruch der Paketaktions-Bestätigung: Sie folgt jetzt der aktiven Spracheinstellung.
+
+## 0.1.37 – Filter performance
+- Kategorie- und Suchfilter arbeiten jetzt über eine kompakte sichtbare Zeilenliste im bestehenden Tabellenmodell.
+- Beim Wechsel zwischen Alle Pakete, Installiert, Nicht installiert, Aufräumen und Vorgemerkt entfallen die zehntausenden einzelnen `setRowHidden()`-Aufrufe.
+- Der vollständige Paketbestand, Checkbox-Zustände und Vormerkungen bleiben im Quellmodell erhalten.
+
+## 0.1.37 – Sprachkorrekturen (16.11.2026)
+- Weitere englische Übersetzungen für Statusmeldungen beim APT-Hintergrundlauf und beim Aktualisieren der Paketquellen ergänzt.
+- Sicherheitsupdate-Dialog: Fenstertitel und dynamische Zusammenfassung werden jetzt abhängig von der gewählten Sprache angezeigt.
+- Dynamische Statusmeldungen für Sicherheitsprüfungen und abgeschlossene/fehlgeschlagene Paketaktionen sprachabhängig gemacht.
