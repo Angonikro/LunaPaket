@@ -1,15 +1,22 @@
-# LunaPaket 0.1.40
+# LunaPaket 0.1.41 – Flathub-Testversion
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
-LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates über eine
+LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates sowie Flatpak-Anwendungen aus Flathub über eine
 grafische Oberfläche auf Basis von Python 3 und PySide6.
 
-![LunaPaket](lunapaket.png)
+![LunaPaket](lunapaket1.png)
+
+![LunaPaket](lunapaket2.png)
 
 [Github Seite](https://github.com/Angonikro/LunaPaket/)
 
 ## Funktionen
 
+- Umschaltung zwischen APT- und Flathub-Ansicht direkt in der Oberfläche
+- Flathub-Katalog mit installierten und verfügbaren Flatpak-Anwendungen
+- App-Namen und App-Beschreibungen in Deutsch oder Englisch, sofern AppStream eine Übersetzung bereitstellt
+- Flatpak-Anwendungen installieren und entfernen (benutzerspezifisch)
+- App-Symbole aus dem lokalen Flatpak-Appstream-Cache, sofern vorhanden
 - Thematische Softwarebereiche
 - Paketübersicht mit installierten und nicht installierten Paketen
 - Paketsuche und Paketdetails
@@ -52,7 +59,7 @@ sudo apt update
 sudo apt install python3 python3-apt python3-pyside6.qtcore \
   python3-pyside6.qtgui python3-pyside6.qtwidgets \
   libxcb-cursor0 libxkbcommon-x11-0 libxcb-xinerama0 \
-  apt dpkg pkexec polkitd desktop-file-utils shared-mime-info
+  apt dpkg flatpak pkexec polkitd desktop-file-utils shared-mime-info
 ```
 
 ## LunaPaket direkt aus der ZIP starten
@@ -61,7 +68,7 @@ ZIP-Datei entpacken und in den Projektordner wechseln:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.40_GITHUB.zip -d ~/Programme
+unzip LunaPaket_0.1.41_GITHUB.zip -d ~/Programme
 cd ~/Programme/LunaPaket
 ```
 
@@ -94,7 +101,7 @@ Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./lunapaket_0.1.40_all.deb
+sudo apt install ./lunapaket_0.1.41_all.deb
 ```
 
 Anschließend über das Anwendungsmenü oder mit `lunapaket` starten.
@@ -111,7 +118,7 @@ chmod +x build_deb.sh
 ./build_deb.sh
 ```
 
-Das Skript erstellt `dist/lunapaket_0.1.40_all.deb`.
+Das Skript erstellt `dist/lunapaket_0.1.41_all.deb`.
 Zum Bauen wird `dpkg-deb` benötigt.
 
 

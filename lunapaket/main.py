@@ -1,16 +1,17 @@
 #!/usr/bin/python3
-import os, sys, subprocess, re, pwd, json, shlex
+import os, sys, subprocess, re, pwd, json, shlex, shutil, html, gzip, hashlib, time, urllib.request, xml.etree.ElementTree as ET
 from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
-VERSION="0.1.40"
+from shiboken6 import isValid
+VERSION="0.1.41"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
 # dadurch in mehreren Bereichen erscheinen.
 TOPIC_CATEGORIES = [
-    ("amateurfunk", "Amateurfunk", "Amateur Radio", r"\b(hamradio|amateur.?radio|gnuradio|gqrx|rtl.?sdr|soapysdr|direwolf|fldigi|chirp|qsstv|wsjtx|js8call|hamlib|ax25|aprs|cqrlog|xastir|qtel|sdrangel)\b"),
+    ("amateurfunk", "Amateurfunk", "Amateur Radio", r"\b(hamradio|amateur.?radio|radio.?signal|gnuradio|gqrx|rtl.?sdr|soapysdr|direwolf|fldigi|chirp|qsstv|wsjtx|js8call|hamlib|ax25|aprs|cqrlog|xastir|qtel|sdrangel)\b"),
     ("network", "Internet & Netzwerk", "Internet & Network", r"\b(network|netzwerk|browser|firefox|chromium|curl|wget|ssh|openssh|ftp|sftp|wifi|wireless|wireshark|tcpdump|nmap| traceroute|dns|vpn)\b"),
     ("audio", "Audio & Musik", "Audio & Music", r"\b(audio|musik|music|sound|alsa|pulseaudio|pipewire|vlc|audacity|ardour|lmms|mpd|mplayer|rhythmbox|strawberry|lame|flac|vorbis)\b"),
     ("video", "Video & Multimedia", "Video & Multimedia", r"\b(video|multimedia|ffmpeg|ffplay|handbrake|makemkv|mkvtoolnix|kdenlive|shotcut|obs-studio|mpv|totem|dvd|bluray|gstreamer)\b"),
@@ -50,8 +51,16 @@ class PackageTableModel(QAbstractTableModel):
             if role == Qt.UserRole: return self.rows[source_row][0]
             if role == Qt.UserRole+1: return self.installed[source_row]
             return None
+        if role == Qt.DecorationRole and c == 1 and len(self.rows[source_row]) > 5:
+            icon_path = self.rows[source_row][5]
+            if icon_path and os.path.isfile(icon_path):
+                return QIcon(icon_path)
+            return QIcon.fromTheme("application-x-executable")
         if role == Qt.DisplayRole:
-            value = str(self.rows[source_row][c-1] if c-1 < len(self.rows[source_row]) else "")
+            if c == 1 and len(self.rows[source_row]) > 6:
+                value = str(self.rows[source_row][6] or self.rows[source_row][0])
+            else:
+                value = str(self.rows[source_row][c-1] if c-1 < len(self.rows[source_row]) else "")
             if getattr(self, "language", "de") == "en" and c == 3:
                 value = {"Nicht installiert": "Not installed", "Installiert": "Installed"}.get(value, value)
             return value
@@ -205,11 +214,11 @@ def log_apt_problem(args, returncode, output):
         # Ein einzelner Fehler darf die Größenbegrenzung nicht umgehen.
         details = details[-(max_bytes - 4096):]
         entry = (
-            f"\\n{'=' * 72}\\n"
-            f"Zeit: {timestamp}\\n"
-            f"Befehl: {command}\\n"
-            f"Exit-Code: {returncode}\\n"
-            f"Ausgabe:\\n{details.rstrip()}\\n"
+            f"\n{'=' * 72}\n"
+            f"Zeit: {timestamp}\n"
+            f"Befehl: {command}\n"
+            f"Exit-Code: {returncode}\n"
+            f"Ausgabe:\n{details.rstrip()}\n"
         ).encode("utf-8", errors="replace")
         if log_file.exists() and log_file.stat().st_size + len(entry) > max_bytes:
             if backup_file.exists():
@@ -246,7 +255,8 @@ def relaunch_as_root():
     os.execvp(command[0], command)
 def cmd(args):
     try:
-        p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=1800)
+        timeout = 90 if len(args) > 1 and args[0] == "flatpak" and args[1] in ("remote-ls", "remotes", "list") else 1800
+        p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout)
     except Exception as exc:
         if is_apt_command(args):
             log_apt_problem(args, 1, str(exc))
@@ -254,6 +264,37 @@ def cmd(args):
     if p.returncode != 0 and is_apt_command(args):
         log_apt_problem(args, p.returncode, p.stdout)
     return p.returncode,p.stdout
+
+def flatpak_user_cmd(args):
+    """Führt einen Flatpak-Befehl im echten Desktop-Benutzerkonto aus.
+
+    LunaPaket läuft für APT mit pkexec als root. Ein einfaches `flatpak --user`
+    würde deshalb /root/.local/share/flatpak verwenden. PKEXEC_UID/SUDO_UID
+    identifiziert den angemeldeten Benutzer; runuser wechselt vor dem Flatpak-
+    Aufruf zu diesem Konto und setzt dessen Home-/XDG-Pfade explizit.
+    """
+    uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+    account = pwd.getpwuid(uid)
+    if os.geteuid() != 0 or uid == os.getuid():
+        return cmd(args)
+    runuser = shutil.which("runuser")
+    if not runuser:
+        return 127, "runuser is required to access the desktop user's Flatpak installation."
+    user_env = [
+        f"HOME={account.pw_dir}",
+        f"USER={account.pw_name}",
+        f"LOGNAME={account.pw_name}",
+        f"XDG_CONFIG_HOME={Path(account.pw_dir) / '.config'}",
+        f"XDG_DATA_HOME={Path(account.pw_dir) / '.local' / 'share'}",
+    ]
+    command = [runuser, "-u", account.pw_name, "--", "env", *user_env, *[str(x) for x in args]]
+    try:
+        timeout = 90 if len(args) > 1 and args[0] in ("flatpak",) and args[1] in ("remote-ls", "remotes", "list") else 1800
+        p = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=timeout)
+        return p.returncode, p.stdout
+    except Exception as exc:
+        return 1, str(exc)
 class Job(QThread):
     finished_text=Signal(int,str)
     def __init__(self,args): super().__init__(); self.args=args
@@ -312,7 +353,7 @@ def package_snapshot():
     """Ermittelt die aktuell installierten Pakete samt Version."""
     try:
         result = subprocess.run(
-            ["dpkg-query", "-W", "-f=${binary:Package}\\t${Version}\\t${db:Status-Status}\\n"],
+            ["dpkg-query", "-W", "-f=${binary:Package}\\t${Version}\\t${db:Status-Status}\n"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120
         )
         if result.returncode != 0:
@@ -454,11 +495,18 @@ class StreamJob(QThread):
             self.finished_text.emit(1, str(exc))
 
 class FunctionJob(QThread):
+    # A central strong-reference set prevents Python from collecting a QThread
+    # when a view is switched quickly and its per-view job list is reset.
+    _live_jobs = set()
     result=Signal(object)
     failed=Signal(str)
     progress=Signal(int, int)
     def __init__(self, fn, with_progress=False):
-        super().__init__(); self.fn=fn; self.with_progress=with_progress
+        super().__init__()
+        self.fn=fn
+        self.with_progress=with_progress
+        self._live_jobs.add(self)
+        self.finished.connect(lambda job=self: self._live_jobs.discard(job))
     def run(self):
         try:
             result = self.fn(self.progress.emit) if self.with_progress else self.fn()
@@ -546,6 +594,7 @@ class Window(QMainWindow):
         self.catalog_cache = None
         self._catalog_loading = False
         self._table_catalog_ready = False
+        self._table_mode = None
         self._theme_placeholder = True
         # Auch bei pkexec muss LunaPaket die Einstellungen des angemeldeten
         # Desktop-Benutzers verwenden und nicht /root/.config.
@@ -564,6 +613,7 @@ class Window(QMainWindow):
         self.apply_theme()
         w=QWidget(); self.setCentralWidget(w); outer=QHBoxLayout(w)
         main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = main_splitter
         main_splitter.setChildrenCollapsible(False)
         main_splitter.setHandleWidth(7)
         outer.addWidget(main_splitter)
@@ -600,14 +650,25 @@ class Window(QMainWindow):
         self.sidebar.setFixedHeight(5 * 40 + 12)
         self.topic_sidebar.setFixedHeight(len(TOPIC_CATEGORIES) * 40 + 12)
         content=QWidget(); main_splitter.addWidget(content); main_splitter.setStretchFactor(0, 0); main_splitter.setStretchFactor(1, 1); main_splitter.setSizes([280, 1320]); l=QVBoxLayout(content)
-        h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>" + ("Debian package manager" if self.language == "en" else "Debian-Paketverwaltung")); self._main_subtitle_label = title; h.addWidget(title); h.addStretch()
+        h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>" + ("Package management: Debian / Flathub" if self.language == "en" else "Paketverwaltung: Debian / Flathub")); self._main_subtitle_label = title; h.addWidget(title)
+        h.addSpacing(14)
+        self.apt_mode_btn = QPushButton("🐧  APT (Debian)")
+        self.flatpak_mode_btn = QPushButton("🧊  Flathub (Flatpak)")
+        self.apt_mode_btn.setCheckable(True); self.flatpak_mode_btn.setCheckable(True)
+        self.apt_mode_btn.clicked.connect(lambda: self.set_package_mode("apt"))
+        self.flatpak_mode_btn.clicked.connect(lambda: self.set_package_mode("flatpak"))
+        h.addWidget(self.apt_mode_btn); h.addWidget(self.flatpak_mode_btn); h.addStretch()
         self.repo_btn=QPushButton("Paketquellen verwalten")
         self.repo_btn.setToolTip("APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren")
         self.repo_btn.clicked.connect(self.manage_sources)
         h.addWidget(self.repo_btn)
         self.update_btn=QPushButton("Paketlisten aktualisieren"); self.update_btn.clicked.connect(self.update_lists); h.addWidget(self.update_btn)
-        up=QPushButton("System aktualisieren"); up.clicked.connect(self.upgrade); h.addWidget(up)
-        sec=QPushButton("Sicherheitsupdates verwalten"); sec.clicked.connect(self.manage_security_updates); h.addWidget(sec); l.addLayout(h)
+        self.flatpak_update_btn = QPushButton("Flathub-Updates suchen")
+        self.flatpak_update_btn.clicked.connect(self.check_flatpak_updates)
+        self.flatpak_update_btn.setVisible(False)
+        h.addWidget(self.flatpak_update_btn)
+        self.upgrade_btn=QPushButton("System aktualisieren"); self.upgrade_btn.clicked.connect(self.upgrade); h.addWidget(self.upgrade_btn)
+        self.security_updates_btn=QPushButton("Sicherheitsupdates verwalten"); self.security_updates_btn.clicked.connect(self.manage_security_updates); h.addWidget(self.security_updates_btn); l.addLayout(h)
         self.security_auto_timer = QTimer(self)
         self.security_auto_timer.timeout.connect(self.check_security_updates_silently)
         self.configure_security_timer()
@@ -625,7 +686,7 @@ class Window(QMainWindow):
         self.work_splitter.setHandleWidth(7)
         upper_panel = QWidget(); upper_layout = QVBoxLayout(upper_panel)
         upper_layout.setContentsMargins(0, 0, 0, 0)
-        self.table=PackageTableView(self); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.selectionModel().selectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); upper_layout.addWidget(self.table, 1)
+        self.table=PackageTableView(self); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.setIconSize(QSize(44,44)); self.table.verticalHeader().setDefaultSectionSize(54); self.table.selectionModel().selectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); upper_layout.addWidget(self.table, 1)
         row=QHBoxLayout()
         clear_queue_btn=QPushButton("Vormerkung löschen")
         clear_queue_btn.clicked.connect(self.clear_queue)
@@ -633,20 +694,61 @@ class Window(QMainWindow):
         apply_queue_btn=QPushButton("Vorgemerkte Änderungen anwenden")
         apply_queue_btn.clicked.connect(self.apply_queued_changes)
         row.addWidget(apply_queue_btn)
+        self.apt_queue_widgets = [clear_queue_btn, apply_queue_btn]
+        # Dieselben Vormerkungsaktionen wie in der APT-Ansicht werden auch
+        # für Flatpak verwendet; nur die Ausführung unterscheidet sich intern.
+        self.flatpak_queue_widgets = self.apt_queue_widgets
         upper_layout.addLayout(row)
         lower_panel = QWidget(); lower_layout = QVBoxLayout(lower_panel)
         lower_layout.setContentsMargins(0, 0, 0, 0)
-        self.details=QTextEdit(); self.details.setReadOnly(True); lower_layout.addWidget(self.details, 1)
+        self.details_title = QLabel("Anwendungsdetails")
+        self.details_title.setStyleSheet("font-weight: bold; color: #b99aff;")
+        lower_layout.addWidget(self.details_title)
+        self.lower_content = QSplitter(Qt.Horizontal)
+        self.lower_content.setChildrenCollapsible(False)
+        self.lower_content.setHandleWidth(6)
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMinimumWidth(320)
+        self.lower_content.addWidget(self.details)
+        self.flatpak_gallery = QWidget()
+        self.flatpak_gallery_layout = QHBoxLayout(self.flatpak_gallery)
+        self.flatpak_gallery_layout.setContentsMargins(4, 4, 4, 4)
+        self.flatpak_gallery_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.flatpak_gallery_scroll = QScrollArea()
+        self.flatpak_gallery_scroll.setWidgetResizable(True)
+        self.flatpak_gallery_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.flatpak_gallery_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.flatpak_gallery_scroll.setWidget(self.flatpak_gallery)
+        self.lower_content.addWidget(self.flatpak_gallery_scroll)
+        self.lower_content.setStretchFactor(0, 0)
+        self.lower_content.setStretchFactor(1, 1)
+        lower_layout.addWidget(self.lower_content, 1)
+        self.lower_content.setSizes([560, 840])
+        self.flatpak_screenshot = QLabel()  # compatibility placeholder; gallery is used instead
+        self.flatpak_screenshot.setVisible(False)
         self.queue_label=QLabel("Keine vorgemerkten Änderungen"); lower_layout.addWidget(self.queue_label); self.status=QLabel("Bereit"); lower_layout.addWidget(self.status)
         self.work_splitter.addWidget(upper_panel); self.work_splitter.addWidget(lower_panel)
         self.work_splitter.setStretchFactor(0, 4); self.work_splitter.setStretchFactor(1, 1)
         self.work_splitter.setSizes([560, 180])
         saved_h = self.settings.value("layout/horizontal_splitter")
         saved_v = self.settings.value("layout/vertical_splitter")
-        if saved_h: main_splitter.restoreState(saved_h)
-        if saved_v: self.work_splitter.restoreState(saved_v)
-        main_splitter.splitterMoved.connect(lambda *_: self.settings.setValue("layout/horizontal_splitter", main_splitter.saveState()))
-        self.work_splitter.splitterMoved.connect(lambda *_: self.settings.setValue("layout/vertical_splitter", self.work_splitter.saveState()))
+        # Standardwerte nur beim allerersten Start setzen. Gespeicherte Werte
+        # werden nach dem Layout-Aufbau erneut angewendet, damit Qt sie nicht
+        # durch die anfänglichen Widget-Größen überschreibt.
+        if not saved_h:
+            main_splitter.setSizes([220, 1100])
+        if not saved_v:
+            self.work_splitter.setSizes([680, 150])
+        def save_splitter_states(*_):
+            self.settings.setValue("layout/horizontal_splitter", main_splitter.saveState())
+            self.settings.setValue("layout/vertical_splitter", self.work_splitter.saveState())
+        main_splitter.splitterMoved.connect(save_splitter_states)
+        self.work_splitter.splitterMoved.connect(save_splitter_states)
+        QTimer.singleShot(0, lambda: (
+            main_splitter.restoreState(saved_h) if saved_h else None,
+            self.work_splitter.restoreState(saved_v) if saved_v else None
+        ))
         l.addWidget(self.work_splitter, 1)
         # Hauptmenü „Datei“ mit den wichtigsten Datei- und Programmaktionen.
         file_menu = self.menuBar().addMenu("Datei")
@@ -718,6 +820,12 @@ class Window(QMainWindow):
             QMessageBox.about(self, title, about_html)
 
         help_menu.addAction("Über LunaPaket", show_about)
+        self.flatpak_mode = False
+        self.flatpak_queue = {}
+        self.flatpak_catalog = []
+        self.flatpak_loading = False
+        self.table.package_model.flatpak_mode = False
+        self.set_package_mode("apt", initial=True)
         self.translate_main_window()
         self.load_installed()
         if self.remember_window_enabled and self.settings.contains("window/geometry"):
@@ -918,6 +1026,14 @@ class Window(QMainWindow):
             action.setText(mapping.get(action.text(), action.text()))
         for menu in self.findChildren(QMenu):
             menu.setTitle(mapping.get(menu.title(), menu.title()))
+        # Visibility is based on the active package mode, never on translated button text.
+        if hasattr(self, "flatpak_mode"):
+            apt_visible = not self.flatpak_mode
+            self.repo_btn.setVisible(apt_visible)
+            self.update_btn.setVisible(apt_visible)
+            self.upgrade_btn.setVisible(apt_visible)
+            self.security_updates_btn.setVisible(apt_visible)
+            self.flatpak_update_btn.setVisible(self.flatpak_mode)
 
     def _sync_settings_permissions(self):
         # Settings belong to the logged-in desktop user even when the GUI
@@ -1020,17 +1136,66 @@ class Window(QMainWindow):
         remember = QCheckBox()
         remember.setChecked(self.remember_window_enabled)
         cache = QCheckBox()
+        catalog_label = QLabel()
+        catalog_retention = QComboBox()
+        catalog_retention.addItem("1 day" if self.language == "en" else "1 Tag", 1)
+        catalog_retention.addItem("3 days" if self.language == "en" else "3 Tage", 3)
+        catalog_retention.addItem("7 days" if self.language == "en" else "7 Tage", 7)
+        catalog_retention.addItem("14 days" if self.language == "en" else "14 Tage", 14)
+        catalog_retention.addItem("30 days" if self.language == "en" else "30 Tage", 30)
+        catalog_retention.addItem("Never expire" if self.language == "en" else "Nie automatisch löschen", 0)
+        current_retention = int(self.settings.value("cache/appstream_retention_days", 7))
+        retention_index = catalog_retention.findData(current_retention)
+        catalog_retention.setCurrentIndex(retention_index if retention_index >= 0 else 2)
+        catalog_row = QHBoxLayout()
+        catalog_row.addWidget(catalog_label)
+        catalog_row.addWidget(catalog_retention, 1)
+        flathub_catalog_label = QLabel()
+        flathub_catalog_retention = QComboBox()
+        for label, days in (
+            (("1 day" if self.language == "en" else "1 Tag"), 1),
+            (("3 days" if self.language == "en" else "3 Tage"), 3),
+            (("7 days" if self.language == "en" else "7 Tage"), 7),
+            (("14 days" if self.language == "en" else "14 Tage"), 14),
+            (("30 days" if self.language == "en" else "30 Tage"), 30),
+            (("Never expire" if self.language == "en" else "Nie automatisch löschen"), 0),
+        ):
+            flathub_catalog_retention.addItem(label, days)
+        flathub_days = int(self.settings.value("cache/flathub_catalog_retention_days", 7))
+        flathub_index = flathub_catalog_retention.findData(flathub_days)
+        flathub_catalog_retention.setCurrentIndex(flathub_index if flathub_index >= 0 else 2)
+        flathub_catalog_row = QHBoxLayout()
+        flathub_catalog_row.addWidget(flathub_catalog_label)
+        flathub_catalog_row.addWidget(flathub_catalog_retention, 1)
+        delete_catalog = QPushButton()
+        refresh_catalog = QPushButton()
         def update_settings_language():
             english = self.language == "en"
             dlg.setWindowTitle("LunaPaket – Settings" if english else "LunaPaket – Einstellungen")
             remember.setText("Remember window size and position" if english else "Fenstergröße und Fensterposition merken")
             remember.setToolTip("Saves the window size and position on exit and restores them next time." if english else "Speichert Größe und Position beim Schließen und stellt sie beim nächsten Start wieder her.")
             cache.setText("Delete downloaded package files after successful installation" if english else "Heruntergeladene Paketdateien nach erfolgreicher Installation löschen")
+            catalog_label.setText("Keep APT image catalog:" if english else "APT-Bilderkatalog speichern für:")
+            flathub_catalog_label.setText(
+                "Keep Flathub application list:" if english else "Flathub-Anwendungsliste speichern für:"
+            )
+            retention_labels = (
+                ["1 day", "3 days", "7 days", "14 days", "30 days", "Never expire"]
+                if english else ["1 Tag", "3 Tage", "7 Tage", "14 Tage", "30 Tage", "Nie automatisch löschen"]
+            )
+            for item_index, item_label in enumerate(retention_labels):
+                catalog_retention.setItemText(item_index, item_label)
+            delete_catalog.setText("Delete saved APT catalog" if english else "Gespeicherten APT-Katalog löschen")
+            refresh_catalog.setText("Refresh APT AppStream catalog now" if english else "APT-AppStream-Katalog jetzt aktualisieren")
             buttons.button(QDialogButtonBox.Close).setText("Close" if english else "Schließen")
         cache.setChecked(self.clean_cache_enabled)
         cache.setChecked(self.clean_cache_enabled)
         layout.addWidget(remember)
         layout.addWidget(cache)
+        layout.addLayout(catalog_row)
+        layout.addLayout(flathub_catalog_row)
+        layout.addWidget(refresh_catalog)
+        layout.addWidget(delete_catalog)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(dlg.reject)
         buttons.accepted.connect(dlg.accept)
@@ -1041,6 +1206,17 @@ class Window(QMainWindow):
             self.language = language_combo.currentData()
             self.settings.setValue("language", self.language)
             self.translate_main_window()
+            # Modeabhängige Schaltflächen und Beschriftungen sofort neu setzen.
+            # Dadurch hängt die Sichtbarkeit nicht davon ab, ob die Anwendung
+            # nach einem Sprachwechsel neu gestartet wurde.
+            self.set_package_mode("flatpak" if self.flatpak_mode else "apt")
+            self.translate_main_window()
+            self._populate_topic_sidebar()
+            if self.flatpak_mode and self.flatpak_catalog:
+                selected_app = self.selected_flatpak_id()
+                self.apply_table_filters()
+                if selected_app:
+                    self.show_flatpak_details(selected_app)
             update_settings_language()
             self._sync_settings_permissions()
         def theme_changed(index):
@@ -1055,18 +1231,634 @@ class Window(QMainWindow):
             self.settings.setValue("package/clean_cache_after_install", self.clean_cache_enabled)
             self._sync_settings_permissions()
         cache.toggled.connect(cache_changed)
+        def retention_changed(index):
+            value = int(catalog_retention.currentData())
+            self.settings.setValue("cache/appstream_retention_days", value)
+            self._apt_appstream_cache = None
+            self._sync_settings_permissions()
+        catalog_retention.currentIndexChanged.connect(retention_changed)
+        def flathub_retention_changed(index):
+            value = int(flathub_catalog_retention.currentData())
+            self.settings.setValue("cache/flathub_catalog_retention_days", value)
+        flathub_catalog_retention.currentIndexChanged.connect(flathub_retention_changed)
+        def delete_saved_catalog():
+            english = self.language == "en"
+            title = "Delete APT image catalog" if english else "APT-Bilderkatalog löschen"
+            question = (
+                "Delete the saved APT image catalog and downloaded AppStream metadata?\n"
+                "Downloaded screenshot images will be kept."
+                if english else
+                "Den gespeicherten APT-Bilderkatalog und die heruntergeladenen AppStream-Metadaten löschen?\n"
+                "Bereits heruntergeladene Screenshot-Bilder bleiben erhalten."
+            )
+            answer = QMessageBox.question(
+                dlg, title, question,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if answer != QMessageBox.Yes:
+                return
+            cache_root = Path.home() / ".cache" / "LunaPaket"
+            removed = 0
+            try:
+                for pattern in ("apt-appstream-index-*.json", "flathub_catalog.json"):
+                    for item in cache_root.glob(pattern):
+                        try:
+                            item.unlink()
+                            removed += 1
+                        except OSError:
+                            pass
+                appstream_dir = cache_root / "appstream"
+                if appstream_dir.exists():
+                    for item in appstream_dir.iterdir():
+                        if item.is_file():
+                            try:
+                                item.unlink()
+                                removed += 1
+                            except OSError:
+                                pass
+                self._apt_appstream_cache = None
+                QMessageBox.information(
+                    dlg, title,
+                    (f"Saved catalog files deleted ({removed})." if english else
+                     f"Gespeicherte Katalogdateien gelöscht ({removed}).")
+                )
+            except Exception as error:
+                QMessageBox.warning(dlg, title, str(error))
+        delete_catalog.clicked.connect(delete_saved_catalog)
+
+        def refresh_saved_catalog():
+            if getattr(self, "_apt_catalog_refresh_running", False):
+                return
+            english = self.language == "en"
+            refresh_catalog.setEnabled(False)
+            refresh_catalog.setText("Refreshing catalog …" if english else "Katalog wird aktualisiert …")
+            self._apt_catalog_refresh_running = True
+            self.status.setText(
+                "Refreshing APT AppStream catalog in the background …" if english
+                else "APT-AppStream-Katalog wird im Hintergrund aktualisiert …"
+            )
+            self.apt_catalog_refresh_job = FunctionJob(lambda: self._read_apt_appstream_metadata(force_refresh=True))
+
+            def refresh_done(data):
+                self._apt_catalog_refresh_running = False
+                self._apt_appstream_cache = data
+                refresh_catalog.setEnabled(True)
+                refresh_catalog.setText(
+                    "Refresh APT AppStream catalog now" if self.language == "en"
+                    else "APT-AppStream-Katalog jetzt aktualisieren"
+                )
+                self.status.setText(
+                    (f"APT AppStream catalog updated ({len(data)} packages)." if self.language == "en"
+                     else f"APT-AppStream-Katalog aktualisiert ({len(data)} Pakete).")
+                )
+                if not self.flatpak_mode:
+                    selected_name = self.selected()
+                    if selected_name:
+                        self.show_apt_screenshots(selected_name)
+                QMessageBox.information(
+                    dlg,
+                    "APT AppStream" if self.language == "en" else "APT-AppStream",
+                    (f"Catalog refreshed. {len(data)} package entries loaded." if self.language == "en"
+                     else f"Katalog aktualisiert. {len(data)} Paketeinträge geladen.")
+                )
+
+            def refresh_failed(error):
+                self._apt_catalog_refresh_running = False
+                refresh_catalog.setEnabled(True)
+                refresh_catalog.setText(
+                    "Refresh APT AppStream catalog now" if self.language == "en"
+                    else "APT-AppStream-Katalog jetzt aktualisieren"
+                )
+                self.status.setText(
+                    ("APT AppStream refresh failed: " if self.language == "en" else "APT-AppStream-Aktualisierung fehlgeschlagen: ")
+                    + str(error)
+                )
+                QMessageBox.warning(dlg, "APT AppStream", str(error))
+
+            self.apt_catalog_refresh_job.result.connect(refresh_done)
+            self.apt_catalog_refresh_job.failed.connect(refresh_failed)
+            self.apt_catalog_refresh_job.start()
+
+        refresh_catalog.clicked.connect(refresh_saved_catalog)
         dlg.exec()
 
     def closeEvent(self, event):
+        # QThreads müssen vor dem Zerstören des Fensters fertig sein.
+        # Netzwerk-Bildabrufe haben ein begrenztes Timeout.
+        for job in list(FunctionJob._live_jobs):
+            if job.isRunning():
+                job.wait(15000)
         if self.remember_window_enabled:
             self.settings.setValue("window/geometry", self.saveGeometry())
         if hasattr(self, "work_splitter"):
             self.settings.setValue("layout/vertical_splitter", self.work_splitter.saveState())
+        if hasattr(self, "main_splitter"):
+            self.settings.setValue("layout/horizontal_splitter", self.main_splitter.saveState())
         self._sync_settings_permissions()
         super().closeEvent(event)
+    def _populate_topic_sidebar(self):
+        """Zeigt dieselben zwölf Themenkategorien in APT und Flathub."""
+        self.topic_sidebar.blockSignals(True)
+        self.topic_sidebar.clear()
+        for _key, label_de, label_en, _pattern in TOPIC_CATEGORIES:
+            self.topic_sidebar.addItem(label_en if self.language == "en" else label_de)
+        self.topic_sidebar.setCurrentRow(-1)
+        self.topic_sidebar.blockSignals(False)
+
+    def set_package_mode(self, mode, initial=False):
+        """Schaltet zwischen dem unveränderten APT-Katalog und Flathub um."""
+        flatpak = mode == "flatpak"
+        self.flatpak_mode = flatpak
+        self.table.package_model.flatpak_mode = flatpak
+        self.table.setIconSize(QSize(44, 44) if flatpak else QSize(16, 16))
+        self.table.verticalHeader().setDefaultSectionSize(54 if flatpak else 30)
+        self.apt_mode_btn.setChecked(not flatpak)
+        self.flatpak_mode_btn.setChecked(flatpak)
+        for widget in [self.repo_btn, self.update_btn]:
+            widget.setVisible(not flatpak)
+        self.flatpak_update_btn.setVisible(flatpak)
+        self.flatpak_update_btn.setText("Check for Flathub updates" if self.language == "en" else "Flathub-Updates suchen")
+        # System- und Sicherheitsupdates bleiben ausschließlich APT-Funktionen.
+        self.upgrade_btn.setVisible(not flatpak)
+        self.security_updates_btn.setVisible(not flatpak)
+        for widget in self.apt_queue_widgets:
+            widget.setVisible(True)
+        if self.language == "en":
+            self.apt_queue_widgets[0].setText("Clear queue")
+            self.apt_queue_widgets[1].setText("Apply queued changes")
+        else:
+            self.apt_queue_widgets[0].setText("Vormerkung löschen")
+            self.apt_queue_widgets[1].setText("Vorgemerkte Änderungen anwenden")
+        self.topic_sidebar.setVisible(True)
+        self._populate_topic_sidebar()
+        self.flatpak_gallery_scroll.setVisible(True)
+        self.cleanup_select_all.setVisible(False)
+        if flatpak:
+            self.sidebar.blockSignals(True)
+            self.sidebar.clear()
+            self.sidebar.addItems(
+                ["All applications", "Installed", "Not installed", "Cleanup"] if self.language == "en"
+                else ["Alle Anwendungen", "Installiert", "Nicht installiert", "Aufräumen"])
+            self.sidebar.setCurrentRow(0)
+            self.sidebar.blockSignals(False)
+            self.search.setPlaceholderText(
+                "Search Flathub applications …" if self.language == "en"
+                else "Flathub-Anwendungen suchen …")
+            self.filter.setVisible(False)
+            self.details_title.setText("Application details" if self.language == "en" else "Anwendungsdetails")
+            self.details.setPlainText(
+                "Select an application from the list. App information will appear here."
+                if self.language == "en" else
+                "Wähle eine Anwendung aus der Liste aus. Die App-Informationen erscheinen hier.")
+            self.clear_flatpak_gallery()
+            self.flatpak_gallery_layout.addWidget(QLabel(
+                "App images appear here when Flathub provides screenshots."
+                if self.language == "en" else
+                "App-Bilder erscheinen hier, sofern Flathub Screenshots bereitstellt."))
+            if self.flatpak_catalog:
+                self.apply_table_filters()
+            else:
+                self.load_flatpak_catalog()
+        else:
+            self.clear_flatpak_gallery()
+            self.flatpak_gallery_layout.addWidget(QLabel(
+                "Select an APT package to view available screenshots."
+                if self.language == "en" else
+                "Wähle ein APT-Paket aus, um verfügbare Screenshots anzuzeigen."))
+            self.details_title.setText("Package details" if self.language == "en" else "Paketdetails")
+            self.topic_sidebar.blockSignals(True)
+            self.topic_sidebar.setCurrentRow(-1)
+            self.topic_sidebar.blockSignals(False)
+            self.sidebar.blockSignals(True)
+            self.sidebar.clear()
+            self.sidebar.addItems(
+                ["All packages", "Installed", "Not installed", "Cleanup", "Queued"] if self.language == "en"
+                else ["Alle Pakete", "Installiert", "Nicht installiert", "Aufräumen", "Vorgemerkt"])
+            self.sidebar.setCurrentRow(0)
+            self.sidebar.blockSignals(False)
+            self.filter.setVisible(True)
+            self.search.setPlaceholderText(
+                "Search packages …" if self.language == "en" else "Pakete suchen …")
+            if (self.catalog_cache is not None and self._table_catalog_ready
+                    and self._table_mode == "apt"):
+                self.apply_table_filters()
+            elif self.catalog_cache is not None:
+                # Der APT-Katalog kann fertig geworden sein, während Flathub
+                # aktiv war. Beim Zurückwechseln die gespeicherten Daten anzeigen.
+                self.rows(self.catalog_cache["rows"])
+            elif not initial:
+                self.search_pkgs()
+        self.update_queue_label()
+        if flatpak:
+            # Beim erneuten Wechsel zu Flathub ist der Katalog häufig bereits
+            # vollständig geladen. Dann darf der Status nicht wieder auf
+            # „Loading“ zurückgesetzt werden.
+            if self.flatpak_catalog:
+                count = len(self.flatpak_catalog)
+                self.status.setText(
+                    f"{count} Flatpak applications found · Flathub" if self.language == "en"
+                    else f"{count} Flatpak-Anwendungen gefunden · Flathub")
+            else:
+                self.status.setText(
+                    "Loading Flathub catalog …" if self.language == "en"
+                    else "Flathub wird geladen …")
+        else:
+            self.status.setText("APT mode active" if self.language == "en" else "APT-Modus aktiv")
+
+    @staticmethod
+    def _flatpak_icon_path(app_id):
+        roots = [
+            Path.home() / ".local/share/flatpak/appstream",
+            Path("/var/lib/flatpak/appstream"),
+        ]
+        for base in roots:
+            if not base.exists():
+                continue
+            try:
+                for path in base.glob(f"*/**/icons/*/*/{app_id}.*"):
+                    if path.suffix.lower() in (".png", ".svg", ".webp"):
+                        return str(path)
+                for path in base.glob(f"*/**/icons/*/{app_id}.*"):
+                    if path.suffix.lower() in (".png", ".svg", ".webp"):
+                        return str(path)
+            except OSError:
+                pass
+        return ""
+
+    @staticmethod
+    def _read_flatpak_appstream_metadata():
+        """Liest optionale AppStream-Metadaten aus dem lokalen Flatpak-Cache."""
+        metadata = {}
+        roots = [Path.home() / ".local/share/flatpak/appstream",
+                 Path("/var/lib/flatpak/appstream")]
+        files = []
+        for base in roots:
+            if base.exists():
+                files.extend(base.glob("*/**/active/appstream.xml.gz"))
+                files.extend(base.glob("*/**/active/appstream.xml"))
+        for path in files:
+            try:
+                opener = gzip.open if path.suffix == ".gz" else open
+                with opener(path, "rb") as stream:
+                    for _event, elem in ET.iterparse(stream, events=("end",)):
+                        if elem.tag.rsplit("}", 1)[-1] != "component":
+                            continue
+                        def node_text(node):
+                            return " ".join("".join(node.itertext()).split()) if node is not None else ""
+                        def child_node(parent, tag):
+                            return next((x for x in parent if x.tag.rsplit("}",1)[-1] == tag), None)
+                        def localized_child(parent, tag):
+                            default_node = next((x for x in parent
+                                                 if x.tag.rsplit("}",1)[-1] == tag
+                                                 and not x.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")), None)
+                            if default_node is None:
+                                default_node = child_node(parent, tag)
+                            default_value = node_text(default_node)
+                            translations = {}
+                            for candidate in parent:
+                                if candidate.tag.rsplit("}",1)[-1] != tag:
+                                    continue
+                                locale = candidate.attrib.get("{http://www.w3.org/XML/1998/namespace}lang", "").strip()
+                                value = node_text(candidate)
+                                if locale and value:
+                                    translations[locale] = value
+                            return default_value, translations
+                        app_id = node_text(child_node(elem, "id"))
+                        if app_id:
+                            app_name, app_name_locales = localized_child(elem, "name")
+                            app_summary, app_summary_locales = localized_child(elem, "summary")
+                            description_node = next((x for x in elem
+                                                     if x.tag.rsplit("}",1)[-1] == "description"
+                                                     and not x.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")), None)
+                            if description_node is None:
+                                description_node = child_node(elem, "description")
+                            app_description = node_text(description_node)
+                            app_description_locales = {}
+                            if description_node is not None:
+                                for candidate in elem:
+                                    if candidate.tag.rsplit("}",1)[-1] != "description":
+                                        continue
+                                    locale = candidate.attrib.get("{http://www.w3.org/XML/1998/namespace}lang", "").strip()
+                                    value = node_text(candidate)
+                                    if locale and value:
+                                        app_description_locales[locale] = value
+                            developer = ""
+                            developer_locales = {}
+                            for node in elem.iter():
+                                if node.tag.rsplit("}",1)[-1] == "developer":
+                                    developer, developer_locales = localized_child(node, "name")
+                                    break
+                            homepage = ""
+                            for node in elem:
+                                if node.tag.rsplit("}",1)[-1] == "url" and node.attrib.get("type") == "homepage":
+                                    homepage = (node.text or "").strip()
+                            screenshots = []
+                            for node in elem.iter():
+                                if node.tag.rsplit("}",1)[-1] == "screenshot":
+                                    image_url = ""
+                                    caption = ""
+                                    for sub in node.iter():
+                                        tag = sub.tag.rsplit("}",1)[-1]
+                                        if tag == "image" and sub.text and not image_url:
+                                            image_url = sub.text.strip()
+                                        elif tag == "caption" and sub.text and not caption:
+                                            caption = sub.text.strip()
+                                    if image_url:
+                                        screenshots.append((image_url, caption))
+                            category_values = []
+                            categories_node = next((x for x in elem if x.tag.rsplit("}", 1)[-1] == "categories"), None)
+                            if categories_node is not None:
+                                for category_node in categories_node:
+                                    if category_node.tag.rsplit("}", 1)[-1] == "category":
+                                        value = " ".join("".join(category_node.itertext()).split())
+                                        if value:
+                                            category_values.append(value)
+                            metadata[app_id] = {
+                                "name": app_name,
+                                "summary": app_summary,
+                                "description": app_description,
+                                "localized": {
+                                    "name": app_name_locales,
+                                    "summary": app_summary_locales,
+                                    "description": app_description_locales,
+                                    "developer": developer_locales,
+                                },
+                                "developer": developer,
+                                "license": node_text(child_node(elem, "project_license")),
+                                "homepage": homepage,
+                                "screenshots": screenshots,
+                                "categories": category_values,
+                            }
+                        elem.clear()
+            except Exception:
+                continue
+        return metadata
+
+    @staticmethod
+    def _flatpak_icon_index(roots=None):
+        """Indexiert Flatpak-AppStream-Icons, auch wenn 'active' ein Symlink ist."""
+        if roots is None:
+            roots = [
+                Path.home() / ".local/share/flatpak/appstream",
+                Path("/var/lib/flatpak/appstream"),
+            ]
+        index = {}
+        for base in roots:
+            base = Path(base)
+            if not base.exists():
+                continue
+            try:
+                # Flatpak verwendet für AppStream häufig einen 'active'-Symlink.
+                # Path.glob("**") läuft nicht zuverlässig durch solche Symlinks.
+                for current, dirs, files in os.walk(str(base), followlinks=True):
+                    current_path = Path(current)
+                    if "icons" not in current_path.parts:
+                        continue
+                    for filename in files:
+                        suffix = Path(filename).suffix.lower()
+                        if suffix not in (".png", ".svg", ".webp"):
+                            continue
+                        icon_id = Path(filename).stem
+                        index.setdefault(icon_id, str(Path(current) / filename))
+            except OSError:
+                continue
+        return index
+
+    @staticmethod
+    def collect_flatpak_catalog(retention_days=7):
+        """Load Flathub from a fresh local cache, otherwise refresh it in the background."""
+        if not shutil.which("flatpak"):
+            raise RuntimeError("Flatpak is not installed / Flatpak ist nicht installiert.")
+
+        def flatpak_query(args, timeout=35):
+            try:
+                proc = subprocess.run(args, text=True, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, timeout=timeout,
+                                      stdin=subprocess.DEVNULL,
+                                      env={**os.environ, "GIO_USE_VFS": "local"})
+                return proc.returncode, proc.stdout
+            except subprocess.TimeoutExpired:
+                return 124, "Flatpak query timed out / Flatpak-Abfrage hat zu lange gedauert"
+            except Exception as exc:
+                return 1, str(exc)
+
+        # The default Flatpak queries worked before the previous scope rewrite.
+        # Avoid four sequential remote calls, each previously allowed 30 minutes.
+        rc, out = flatpak_query(["flatpak", "list", "--app",
+                                 "--columns=application,version"], 15)
+        installed = {}
+        if rc == 0:
+            for line in out.splitlines():
+                parts = re.split(r"\s+", line.strip(), maxsplit=1)
+                if parts and parts[0].strip():
+                    installed[parts[0].strip()] = parts[1].strip() if len(parts) > 1 else ""
+
+        cache_file = Path.home() / ".cache" / "LunaPaket" / "flathub_catalog.json"
+        try:
+            cache_fresh = (
+                cache_file.is_file()
+                and (retention_days == 0
+                     or time.time() - cache_file.stat().st_mtime < retention_days * 86400)
+            )
+            if cache_fresh:
+                cached_rows = json.loads(cache_file.read_text(encoding="utf-8"))
+                if isinstance(cached_rows, list):
+                    # Icon-Dateien können sich nach Flatpak-Installationen,
+                    # -Entfernungen oder AppStream-Aktualisierungen ändern.
+                    # Deshalb niemals alte Icon-Pfade blind aus dem JSON-Cache
+                    # übernehmen, sondern den lokalen AppStream-Iconbestand
+                    # bei jedem Katalogladen erneut indizieren.
+                    current_icon_index = Window._flatpak_icon_index()
+                    current_appstream = Window._read_flatpak_appstream_metadata()
+                    refreshed_rows = []
+                    for row in cached_rows:
+                        if not isinstance(row, list) or len(row) < 8:
+                            continue
+                        row = list(row)
+                        row[2] = "Installiert" if row[0] in installed else "Nicht installiert"
+                        row[5] = current_icon_index.get(row[0], "")
+                        meta = dict(row[7]) if isinstance(row[7], dict) else {}
+                        fresh_meta = current_appstream.get(row[0], {})
+                        if fresh_meta:
+                            # Neue AppStream-Sprachvarianten auch in bereits
+                            # vorhandene Katalog-Caches übernehmen.
+                            meta.update(fresh_meta)
+                            if len(row) > 3:
+                                row[3] = fresh_meta.get("summary") or row[3]
+                            if len(row) > 6:
+                                row[6] = fresh_meta.get("name") or row[6]
+                        meta["installed_scopes"] = []
+                        row[7] = meta
+                        refreshed_rows.append(tuple(row))
+                    if refreshed_rows:
+                        return refreshed_rows
+        except (OSError, ValueError, TypeError):
+            pass
+
+        rc, out = flatpak_query(["flatpak", "remote-ls", "--app",
+                                 "--columns=application,version", "flathub"], 40)
+        remote_rows = {}
+        if rc == 0:
+            for line in out.splitlines():
+                parts = re.split(r"\s+", line.strip(), maxsplit=1)
+                if parts and parts[0].strip():
+                    remote_rows[parts[0].strip()] = parts[1].strip() if len(parts) > 1 else ""
+        elif not installed:
+            raise RuntimeError("Flathub catalog could not be loaded / Flathub-Katalog konnte nicht geladen werden: " + out)
+
+        for app_id, values in installed.items():
+            remote_rows.setdefault(app_id, values)
+
+        # Inspect local configuration, not the network, to select the installation scope.
+        rc, remote_output = flatpak_query(["flatpak", "remotes", "--columns=name,options"], 10)
+        remote_scope = "--user"
+        if rc == 0:
+            for line in remote_output.splitlines():
+                fields = line.split("\t")
+                if fields and fields[0].strip() == "flathub":
+                    remote_scope = "--user" if len(fields) > 1 and "user" in fields[1].lower() else "--system"
+                    break
+
+        appstream_metadata = Window._read_flatpak_appstream_metadata()
+        icon_index = Window._flatpak_icon_index()
+        rows = []
+        for app_id, version in sorted(remote_rows.items(), key=lambda x: (
+                str(appstream_metadata.get(x[0], {}).get("name") or x[0]).casefold())):
+            is_installed = app_id in installed
+            meta = dict(appstream_metadata.get(app_id, {}))
+            name = meta.get("name") or app_id
+            description = meta.get("summary") or name
+            meta["remote_scope"] = remote_scope
+            meta["installed_scopes"] = []  # resolved before uninstall if necessary
+            rows.append((app_id, version, "Installiert" if is_installed else "Nicht installiert",
+                         description, "flathub", icon_index.get(app_id, ""), name, meta))
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            temporary = cache_file.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(cache_file)
+        except OSError:
+            pass
+        return rows
+
+    def load_flatpak_catalog(self):
+        if self.flatpak_loading:
+            return
+        self.flatpak_loading = True
+        self.status.setText("Flathub-Katalog wird im Hintergrund geladen …")
+        retention_days = int(self.settings.value("cache/flathub_catalog_retention_days", 7))
+        self.flatpak_job = FunctionJob(lambda: self.collect_flatpak_catalog(retention_days))
+        self.flatpak_job.result.connect(self.flatpak_catalog_loaded)
+        self.flatpak_job.failed.connect(self.flatpak_catalog_failed)
+        self.flatpak_job.start()
+
+    def flatpak_catalog_loaded(self, rows):
+        self.flatpak_loading = False
+        self.flatpak_catalog = rows
+        # Ergebnisse dürfen im Hintergrund gespeichert werden, aber nur die
+        # aktive Flathub-Ansicht darf das gemeinsame Tabellenmodell aktualisieren.
+        if not self.flatpak_mode:
+            return
+        self.apply_table_filters()
+        if not self.table.currentIndex().isValid():
+            self.details_title.setText("Application details" if self.language == "en" else "Anwendungsdetails")
+            self.details.setPlainText(
+                "Select an application from the list. App information will appear here."
+                if self.language == "en" else
+                "Wähle eine Anwendung aus der Liste aus. Die App-Informationen erscheinen hier."
+            )
+        self.status.setText(
+            f"{len(rows)} Flatpak applications found · Flathub" if self.language == "en"
+            else f"{len(rows)} Flatpak-Anwendungen gefunden · Flathub")
+
+    def flatpak_catalog_failed(self, error):
+        self.flatpak_loading = False
+        if not self.flatpak_mode:
+            return
+        self.table.package_model.replace_rows([], {})
+        self._table_mode = "flatpak"
+        self.status.setText("Flathub: " + str(error))
+
+    def queue_flatpak_action(self, app_id, action):
+        if action is None:
+            self.flatpak_queue.pop(app_id, None)
+        else:
+            self.flatpak_queue[app_id] = action
+        self.update_queue_label()
+        self.apply_table_filters()
+
+    def selected_flatpak_id(self):
+        index = self.table.currentIndex()
+        if not index.isValid():
+            return None
+        return str(self.table.package_model.data(index, Qt.UserRole) or "")
+
+    def install_selected_flatpak(self):
+        app_id = self.selected_flatpak_id()
+        if not app_id:
+            QMessageBox.information(
+                self, "Flathub",
+                "Please select an application first." if self.language == "en"
+                else "Bitte zuerst eine Anwendung auswählen."
+            )
+            return
+        self.status.setText(f"{app_id} wird installiert …")
+        self.set_busy(True)
+        self.flatpak_action_job = FunctionJob(lambda: cmd(self._flatpak_command_for_action(app_id, "install")))
+        def finished(result):
+            rc, output = result
+            self.set_busy(False)
+            self.details.setPlainText(output)
+            if rc == 0:
+                self.load_flatpak_catalog()
+            else:
+                self.status.setText(
+                    "Flatpak installation failed." if self.language == "en"
+                    else "Flatpak-Installation fehlgeschlagen."
+                )
+        self.flatpak_action_job.result.connect(finished)
+        self.flatpak_action_job.failed.connect(
+            lambda e: (
+                self.set_busy(False),
+                self.status.setText(("Flatpak error: " if self.language == "en" else "Flatpak-Fehler: ") + str(e))
+            )
+        )
+        self.flatpak_action_job.start()
+
+    def remove_selected_flatpak(self):
+        app_id = self.selected_flatpak_id()
+        if not app_id:
+            QMessageBox.information(self, "Flathub", "Bitte zuerst eine Anwendung auswählen.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove Flatpak application" if self.language == "en" else "Flatpak entfernen",
+            (f"Really remove {app_id}?" if self.language == "en" else f"{app_id} wirklich entfernen?"),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.set_busy(True)
+        self.flatpak_action_job = FunctionJob(lambda: cmd(self._flatpak_command_for_action(app_id, "remove")))
+        def finished(result):
+            rc, output = result
+            self.set_busy(False)
+            self.details.setPlainText(output)
+            if rc == 0:
+                self.load_flatpak_catalog()
+            else:
+                self.status.setText(
+                    "Flatpak removal failed." if self.language == "en"
+                    else "Flatpak-Deinstallation fehlgeschlagen."
+                )
+        self.flatpak_action_job.result.connect(finished)
+        self.flatpak_action_job.failed.connect(lambda e: (self.set_busy(False), self.status.setText("Flatpak-Fehler: " + str(e))))
+        self.flatpak_action_job.start()
+
     def rows(self, data):
-        # Ein Modell-Reset übernimmt den gesamten Katalog in einem Schritt.
+        # Ein Modell-Reset übernimmt den gesamten APT-Katalog in einem Schritt.
         # Qt erzeugt keine individuellen Items für jede sichtbare Tabellenzelle.
+        self._table_mode = "apt"
         self._rows_generation = getattr(self, "_rows_generation", 0) + 1
         self.table.setUpdatesEnabled(False)
         self.table.package_model.replace_rows(data, self.queue)
@@ -1089,6 +1881,15 @@ class Window(QMainWindow):
             return
         installed = bool(item.data(Qt.UserRole + 1))
         checked = item.checkState() == Qt.Checked
+        if self.flatpak_mode:
+            if checked and not installed:
+                self.flatpak_queue[name] = "install"
+            elif not checked and installed:
+                self.flatpak_queue[name] = "remove"
+            else:
+                self.flatpak_queue.pop(name, None)
+            self.update_queue_label()
+            return
         # Checked means installed / installation requested; unchecked means absent / removal requested.
         if checked and not installed:
             self.queue[name] = "install"
@@ -1126,6 +1927,15 @@ class Window(QMainWindow):
         self.sidebar_changed(6 + row)
 
     def sidebar_changed(self, _row):
+        if self.flatpak_mode:
+            if _row == 3:
+                # Cleanup is an action, not an application-list filter.
+                self.show_flatpak_cleanup_dialog()
+                self.sidebar.blockSignals(True)
+                self.sidebar.setCurrentRow(2)
+                self.sidebar.blockSignals(False)
+            self.apply_table_filters()
+            return
         # Das Sammelkästchen ist ausschließlich im Bereich „Aufräumen“ sichtbar.
         self.cleanup_select_all.blockSignals(True)
         self.cleanup_select_all.setChecked(False)
@@ -1180,6 +1990,12 @@ class Window(QMainWindow):
             self.apply_theme()
             self.status.setText((f"Font size set to {size} pt" if self.language == "en" else f"Schriftgröße auf {size} pt gesetzt"))
     def search_pkgs(self):
+        if getattr(self, "flatpak_mode", False):
+            if self.flatpak_catalog:
+                self.apply_table_filters()
+            else:
+                self.load_flatpak_catalog()
+            return
         # Der Katalog wird genau einmal aufgebaut. Solange die erste
         # Tabellenbefüllung läuft, dürfen Filter-/Sidebar-Klicks keinen
         # weiteren APT-Lesejob starten.
@@ -1215,7 +2031,86 @@ class Window(QMainWindow):
         topic_row = self.topic_sidebar.currentRow()
         return 6 + topic_row if topic_row >= 0 else max(0, self.sidebar.currentRow())
 
+    @staticmethod
+    def _flatpak_appstream_category_ids(topic_key):
+        """Nur eindeutige AppStream-Kategorien verwenden, keine Sammelbegriffe."""
+        mapping = {
+            "amateurfunk": {"hamradio"},
+            "network": {"network", "webbrowser", "chat", "email", "instantmessaging",
+                        "telephony", "ircclient", "feed", "news"},
+            "audio": {"audio", "music", "audioplayer", "midi", "sequencer",
+                      "synthesizer", "disc burning"},
+            "video": {"video", "audiovideo", "videoplayer", "tv"},
+            "graphics": {"graphics", "photography", "2dgraphics", "3dgraphics",
+                         "vectorgraphics", "rastergraphics", "publishing"},
+            "programming": {"development", "ide", "debugger", "building",
+                            "profiling", "revisioncontrol"},
+            "system": {"system", "settings", "utility", "filemanager",
+                       "filesystem", "terminalemulator", "monitor"},
+            "security": {"security", "encryption", "passwordmanager"},
+            "electronics": {"electronics", "hamradio"},
+            "office": {"office", "education", "wordprocessor", "spreadsheet",
+                       "presentation", "calendar", "dictionary"},
+            "games": {"game", "arcadegame", "boardgame", "cardgame",
+                      "logicgame", "strategygame", "actiongame"},
+            "science": {"science", "geography", "astronomy", "biology",
+                        "chemistry", "math", "numericalanalysis"},
+        }
+        return mapping.get(topic_key, set())
+
     def apply_table_filters(self):
+        if self.flatpak_mode:
+            term = self.search.text().strip().casefold()
+            row_filter = self.sidebar.currentRow()
+            topic_row = self.topic_sidebar.currentRow()
+            rows = []
+            for original_row in self.flatpak_catalog:
+                row = list(original_row)
+                meta = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
+                if len(row) > 6:
+                    row[6] = self._flatpak_localized_value(meta, "name", self.language, row[6] or row[0])
+                if len(row) > 3:
+                    row[3] = self._flatpak_localized_value(meta, "summary", self.language, row[3])
+                row = tuple(row)
+                installed = row[2] == "Installiert"
+                if row_filter == 1 and not installed:
+                    continue
+                if row_filter == 2 and installed:
+                    continue
+                searchable = " ".join(str(v) for v in row[:4]) + " " + str(row[6] if len(row) > 6 else row[0])
+                searchable_folded = searchable.casefold()
+                if term and term not in searchable_folded:
+                    continue
+                if topic_row >= 0:
+                    topic_key, _label_de, _label_en, pattern = TOPIC_CATEGORIES[topic_row]
+                    meta = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
+                    appstream_categories = {
+                        str(value).strip().casefold()
+                        for value in meta.get("categories", [])
+                        if str(value).strip()
+                    }
+                    # AppStream-Kategorien werden als vollständige IDs verglichen.
+                    # Allgemeine Oberbegriffe wie "Science" oder "Engineering"
+                    # dürfen nicht hunderte fachfremde Anwendungen einsortieren.
+                    category_match = bool(
+                        appstream_categories & self._flatpak_appstream_category_ids(topic_key)
+                    )
+                    # Fehlen passende AppStream-Kategorien, dienen gezielte
+                    # Begriffe aus Anwendungsname, ID und Beschreibung als Fallback.
+                    text_match = bool(re.search(pattern, searchable_folded, re.IGNORECASE))
+                    if not category_match and not text_match:
+                        continue
+                rows.append(row)
+            rows.sort(key=lambda row: str(row[6] if len(row) > 6 else row[0]).casefold())
+            self.table.package_model.replace_rows(rows, self.flatpak_queue)
+            self.table.package_model.flatpak_mode = True
+            self._table_mode = "flatpak"
+            # Dieses Flag gehört ausschließlich zum APT-Katalog. Ein geladener
+            # Flathub-Katalog darf den APT-Ladezustand nicht vortäuschen.
+            self.status.setText(
+                f"{len(rows)} Flatpak applications shown · Flathub" if self.language == "en"
+                else f"{len(rows)} Flatpak-Anwendungen angezeigt · Flathub")
+            return
         if self.catalog_cache is None or not getattr(self, "_table_catalog_ready", False):
             return
         category = self._current_sidebar_category()
@@ -1241,7 +2136,7 @@ class Window(QMainWindow):
         # Exakt dieselbe eindeutige Namensbasis wie apt-cache pkgnames.
         rc, names_out = cmd(["apt-cache", "pkgnames"])
         if rc != 0:
-            raise RuntimeError("Paketnamen konnten nicht aus APT gelesen werden.\\n" + names_out)
+            raise RuntimeError("Paketnamen konnten nicht aus APT gelesen werden.\n" + names_out)
         names = sorted({line.strip() for line in names_out.splitlines() if line.strip()},
                        key=str.casefold)
 
@@ -1329,21 +2224,469 @@ class Window(QMainWindow):
         self._catalog_loading = False
         self.catalog_cache = catalog
         self._table_catalog_ready = False
-        self.rows(catalog["rows"])
+        # APT-Ergebnisse nur anzeigen, wenn APT noch der aktive Modus ist.
+        # Beim zwischenzeitlichen Wechsel zu Flathub bleibt dessen Tabelle erhalten.
+        if not self.flatpak_mode:
+            self.rows(catalog["rows"])
 
     def catalog_load_failed(self, error):
         self._catalog_loading = False
-        self.status.setText("Fehler beim Laden: " + str(error))
+        if not self.flatpak_mode:
+            self.status.setText("Fehler beim Laden: " + str(error))
 
     def search_done(self, rows):
         self.rows(rows)
         if getattr(self, "search_again", False): self.search_pkgs()
     def selected(self):
         x=self.table.selectedItems(); return x[0].data(Qt.UserRole) if x else None
+    def clear_flatpak_gallery(self):
+        while self.flatpak_gallery_layout.count():
+            item = self.flatpak_gallery_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def _screenshot_caption(self, caption, fallback=""):
+        """Return one short caption in the active UI language, never a locale map."""
+        value = caption
+        if isinstance(value, dict):
+            preferred = ("de", "de_DE", "de-DE", "C", "en", "en_US", "en-US") if self.language != "en" else (
+                "en", "en_US", "en-US", "C", "de", "de_DE", "de-DE"
+            )
+            selected = ""
+            for key in preferred:
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    selected = candidate.strip()
+                    break
+            if not selected:
+                language_prefix = "en" if self.language == "en" else "de"
+                candidate = next((v for k, v in value.items()
+                                  if str(k).lower().replace("-", "_").startswith(language_prefix)
+                                  and isinstance(v, str) and v.strip()), "")
+                selected = candidate.strip() if candidate else ""
+            value = selected
+        if isinstance(value, (list, tuple)):
+            value = next((v for v in value if isinstance(v, str) and v.strip()), "")
+        if not isinstance(value, str):
+            value = ""
+        value = " ".join(value.replace("\\n", " ").split())
+        # Avoid dumping serialized dictionaries or unexpectedly long metadata.
+        if value.startswith("{") or value.startswith("[") or len(value) > 220:
+            value = ""
+        return value or fallback
+
+    @staticmethod
+    def _flatpak_localized_value(meta, field, language, fallback=""):
+        """Wählt AppStream-Texte passend zur UI-Sprache mit sauberem Fallback."""
+        localized = meta.get("localized", {}) if isinstance(meta, dict) else {}
+        values = localized.get(field, {}) if isinstance(localized, dict) else {}
+        if not isinstance(values, dict):
+            values = {}
+        wanted = "en" if language == "en" else "de"
+        # Exakte Sprachcodes zuerst, danach regionale Varianten (de_DE, en-GB …).
+        for key in (wanted, wanted + "_", wanted + "-"):
+            if key in values and isinstance(values[key], str) and values[key].strip():
+                return values[key].strip()
+        regional = next((value for key, value in values.items()
+                         if str(key).lower().replace("-", "_").startswith(wanted + "_")
+                         and isinstance(value, str) and value.strip()), "")
+        if regional:
+            return regional.strip()
+        base = meta.get(field, "") if isinstance(meta, dict) else ""
+        if isinstance(base, str) and base.strip():
+            return base.strip()
+        # Falls die Basissprache fehlt, Englisch/Deutsch als zweite Wahl nutzen.
+        alternate = "de" if wanted == "en" else "en"
+        candidate = values.get(alternate, "")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+        candidate = next((value for key, value in values.items()
+                          if str(key).lower().replace("-", "_").startswith(alternate + "_")
+                          and isinstance(value, str) and value.strip()), "")
+        return candidate.strip() if candidate else fallback
+
+    def show_flatpak_details(self, app_id):
+        """Zeigt die App-Detailseite im unteren Fensterbereich."""
+        row = next((item for item in self.flatpak_catalog if item[0] == app_id), None)
+        self.flatpak_screenshot.clear()
+        self.flatpak_screenshot.setVisible(False)
+        self.details_title.setText("Application details" if self.language == "en" else "Anwendungsdetails")
+        if not row:
+            self.details.setPlainText(
+                f"No details found for {app_id} in the Flathub catalog."
+                if self.language == "en" else
+                f"Keine Detaildaten für {app_id} im Flathub-Katalog gefunden."
+            )
+            return
+        meta = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
+        name = self._flatpak_localized_value(meta, "name", self.language,
+                                             row[6] if len(row) > 6 else row[0])
+        description = self._flatpak_localized_value(meta, "description", self.language,
+                                                    meta.get("description") or row[3]) or (
+            "No detailed description is available in the AppStream catalog."
+            if self.language == "en" else
+            "Für diese Anwendung ist keine ausführliche Beschreibung im AppStream-Katalog hinterlegt."
+        )
+        safe = lambda value: html.escape(str(value or ""))
+        if self.language == "en":
+            fields = [("App ID", row[0]), ("Version", row[1] or "Not specified"),
+                      ("Status", "Installed" if row[2] == "Installiert" else "Not installed"),
+                      ("Source", "Flathub / Flatpak"),
+                      ("Developer", self._flatpak_localized_value(meta, "developer", self.language, meta.get("developer")) or "Not provided in AppStream metadata"),
+                      ("License", meta.get("license") or "Not provided in AppStream metadata"),
+                      ("Homepage", meta.get("homepage") or "Not provided in AppStream metadata")]
+            details_heading = "Application details: "
+            description_heading = "Description"
+        else:
+            fields = [("App-ID", row[0]), ("Version", row[1] or "Nicht angegeben"),
+                      ("Status", row[2]), ("Quelle", "Flathub / Flatpak"),
+                      ("Entwickler", self._flatpak_localized_value(meta, "developer", self.language, meta.get("developer")) or "Keine Angabe im AppStream-Katalog"),
+                      ("Lizenz", meta.get("license") or "Keine Angabe im AppStream-Katalog"),
+                      ("Homepage", meta.get("homepage") or "Keine Angabe im AppStream-Katalog")]
+            details_heading = "Anwendungsdetails: "
+            description_heading = "Beschreibung"
+        table = "".join(f"<tr><td><b>{safe(k)}</b></td><td>{safe(v)}</td></tr>" for k,v in fields)
+        desc_html = "".join(f"<p>{safe(part)}</p>" for part in re.split(r"\n+", description) if part.strip())
+        shots = meta.get("screenshots", [])
+        shot_html = ""
+        # Screenshots werden ausschließlich als Bildergalerie angezeigt,
+        # ohne Bildunterschriften oder zusätzliche Textlinks.
+        self.details.setHtml(
+            "<html><body style='font-family:sans-serif;color:#e8e8ee;'>"
+            "<h2 style='color:#b99aff;'>" + safe(details_heading + name) + "</h2>"
+            "<table cellpadding='5' cellspacing='0'>" + table + "</table><hr>"
+            "<h3 style='color:#b99aff;'>" + safe(description_heading) + "</h3>" + desc_html +
+            "</body></html>"
+        )
+        self.clear_flatpak_gallery()
+        if shots:
+            self.flatpak_gallery_scroll.setVisible(True)
+            if not hasattr(self, "flatpak_image_jobs"):
+                self.flatpak_image_jobs = []
+            for image_url, caption in shots[:4]:
+                tile = QWidget()
+                tile_layout = QVBoxLayout(tile)
+                tile_layout.setContentsMargins(4, 4, 4, 4)
+                preview = QLabel(
+                    "Loading screenshot in the background …" if self.language == "en"
+                    else "Screenshot wird im Hintergrund geladen …"
+                )
+                preview.setAlignment(Qt.AlignCenter)
+                preview.setMinimumSize(220, 145)
+                preview.setMaximumSize(360, 190)
+                preview.setWordWrap(True)
+                preview.setStyleSheet("background:#20212a;border:1px solid #484858;border-radius:5px;padding:4px;")
+                tile_layout.addWidget(preview)
+                self.flatpak_gallery_layout.addWidget(tile)
+                def fetch_image(url=image_url):
+                    request = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.41"})
+                    with urllib.request.urlopen(request, timeout=12) as response:
+                        return response.read(8 * 1024 * 1024)
+                job = FunctionJob(fetch_image)
+                def image_loaded(data, target=preview, selected_app=app_id):
+                    if (not isValid(target) or not self.flatpak_mode
+                            or self.selected_flatpak_id() != selected_app):
+                        return
+                    pixmap = QPixmap()
+                    if pixmap.loadFromData(data):
+                        target.setPixmap(pixmap.scaled(340, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    else:
+                        target.setText("Image format not supported" if self.language == "en" else "Bildformat nicht unterstützt")
+                job.result.connect(image_loaded)
+                def image_failed(_error, target=preview, selected_app=app_id):
+                    if (isValid(target) and self.flatpak_mode
+                            and self.selected_flatpak_id() == selected_app):
+                        target.setText(
+                            "Image currently unavailable" if self.language == "en"
+                            else "Bild derzeit nicht verfügbar"
+                        )
+                job.failed.connect(image_failed)
+                self.flatpak_image_jobs.append(job)
+                job.start()
+        else:
+            self.flatpak_gallery_scroll.setVisible(True)
+            empty = QLabel("Für diese Anwendung sind keine Screenshots in den Flathub-Metadaten hinterlegt.")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setWordWrap(True)
+            self.flatpak_gallery_layout.addWidget(empty)
+
+    def _read_apt_appstream_metadata(self, force_refresh=False):
+        """Liest Debian DEP-11/AppStream-Metadaten einschließlich .yml.xz."""
+        result = {}
+        try:
+            import yaml
+        except Exception:
+            return result
+
+        import lzma
+        roots = [Path("/var/lib/apt/lists"), Path("/var/cache/app-info/xmls")]
+        files = []
+
+        # Debian Trixie stable APT DEP-11 metadata kann veraltete Screenshot-
+        # Hashes enthalten. Deshalb bevorzugt LunaPaket den aktuellen Katalog
+        # des offiziellen Debian-AppStream-Generators. Download/Parsing laufen
+        # bereits in FunctionJob und blockieren somit nicht die GUI.
+        try:
+            import platform, time
+            os_release = {}
+            try:
+                for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        os_release[key] = value.strip().strip('"')
+            except Exception:
+                pass
+            suite = os_release.get("VERSION_CODENAME") or os_release.get("UBUNTU_CODENAME") or "trixie"
+            machine = platform.machine().lower()
+            arch = {"aarch64": "arm64", "armv8l": "arm64", "x86_64": "amd64", "i386": "i386", "i686": "i386"}.get(machine, machine)
+            metadata_cache_dir = Path.home() / ".cache" / "LunaPaket"
+            metadata_cache_dir.mkdir(parents=True, exist_ok=True)
+            metadata_cache_file = metadata_cache_dir / f"apt-appstream-index-v2-{suite}-{arch}.json"
+            # Der bereits aufbereitete Index wird zuerst von der Festplatte
+            # gelesen. So muss der große AppStream-Katalog nicht bei jedem
+            # Programmstart erneut heruntergeladen und vollständig geparst werden.
+            retention_days = int(self.settings.value("cache/appstream_retention_days", 7))
+            index_is_fresh = (
+                metadata_cache_file.exists()
+                and (retention_days == 0 or time.time() - metadata_cache_file.stat().st_mtime < retention_days * 86400)
+            )
+            if index_is_fresh and not force_refresh:
+                try:
+                    cached_index = json.loads(metadata_cache_file.read_text(encoding="utf-8"))
+                    if isinstance(cached_index, dict):
+                        return cached_index
+                except Exception:
+                    pass
+            cache_dir = metadata_cache_dir / "appstream"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            for component in ("main", "contrib", "non-free", "non-free-firmware"):
+                cache_file = cache_dir / f"{suite}-{component}-{arch}.yml.gz"
+                component_cache_expired = (
+                    force_refresh
+                    or not cache_file.exists()
+                    or (retention_days != 0 and time.time() - cache_file.stat().st_mtime > retention_days * 86400)
+                )
+                if component_cache_expired:
+                    url = f"https://appstream.debian.org/data/{suite}/{component}/Components-{arch}.yml.gz"
+                    try:
+                        request = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.41 AppStream"})
+                        with urllib.request.urlopen(request, timeout=25) as response:
+                            payload = response.read(40 * 1024 * 1024)
+                        if payload[:2] == b"\x1f\x8b":
+                            temp_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+                            temp_file.write_bytes(payload)
+                            temp_file.replace(cache_file)
+                    except Exception:
+                        pass
+                if cache_file.exists():
+                    files.append(cache_file)
+        except Exception:
+            pass
+
+        for root in roots:
+            if root.exists():
+                files.extend(root.glob("*dep11*Components*.yml*"))
+                files.extend(root.glob("*Components*.yml*"))
+                files.extend(root.glob("*.xml.gz"))
+                files.extend(root.glob("*.xml"))
+        for path in sorted(set(files), key=lambda item: "LunaPaket" in str(item)):
+            try:
+                if path.name.endswith(".xz"):
+                    opener = lzma.open
+                elif path.name.endswith(".gz"):
+                    opener = gzip.open
+                else:
+                    opener = open
+                with opener(path, "rt", encoding="utf-8", errors="replace") as stream:
+                    if path.name.endswith((".xml", ".xml.gz")):
+                        for _event, elem in ET.iterparse(stream, events=("end",)):
+                            if elem.tag.rsplit("}", 1)[-1] != "component":
+                                continue
+                            package_names = []
+                            for node in elem.iter():
+                                if node.tag.rsplit("}", 1)[-1] in ("pkgname", "package"):
+                                    value = (node.text or "").strip()
+                                    if value:
+                                        package_names.append(value)
+                            screenshots = []
+                            for node in elem.iter():
+                                if node.tag.rsplit("}", 1)[-1] == "screenshot":
+                                    for sub in node.iter():
+                                        if sub.tag.rsplit("}", 1)[-1] == "image" and sub.text:
+                                            screenshots.append((sub.text.strip(), ""))
+                                            break
+                            for package_name in package_names:
+                                result[package_name] = {"screenshots": screenshots}
+                            elem.clear()
+                        continue
+
+                    documents = [doc for doc in yaml.safe_load_all(stream) if isinstance(doc, dict)]
+                base_url = ""
+                for doc in documents:
+                    base_url = (doc.get("MediaBaseUrl") or doc.get("media_base_url") or base_url)
+                for doc in documents:
+                    components = doc.get("Components") or doc.get("components")
+                    if isinstance(components, list):
+                        component_list = [item for item in components if isinstance(item, dict)]
+                    else:
+                        # DEP-11 legt Komponenten normalerweise als einzelne YAML-Dokumente ab.
+                        component_list = [doc] if (doc.get("Package") or doc.get("Pkgname") or doc.get("package")) else []
+                    for component in component_list:
+                        package_names = component.get("Package") or component.get("Pkgname") or component.get("package") or []
+                        if isinstance(package_names, str):
+                            package_names = [package_names]
+                        screenshots = []
+                        for shot in component.get("Screenshots") or component.get("screenshots") or []:
+                            if not isinstance(shot, dict):
+                                continue
+                            source = (shot.get("source-image") or shot.get("SourceImage") or
+                                      shot.get("source") or shot.get("Source") or {})
+                            url = source.get("url") or source.get("Url") or "" if isinstance(source, dict) else str(source or "")
+                            if not url:
+                                thumbs = shot.get("thumbnails") or shot.get("Thumbnails") or []
+                                if thumbs and isinstance(thumbs[0], dict):
+                                    url = thumbs[0].get("url") or thumbs[0].get("Url") or ""
+                            if url:
+                                if url.startswith("/") and base_url:
+                                    url = base_url.rstrip("/") + url
+                                elif not url.startswith(("http://", "https://")) and base_url:
+                                    url = base_url.rstrip("/") + "/" + url.lstrip("/")
+                                screenshots.append((url, shot.get("caption") or ""))
+                        for package_name in package_names:
+                            result[str(package_name)] = {"screenshots": screenshots}
+            except Exception:
+                continue
+        # Index atomar speichern, damit bei einem Abbruch keine beschädigte
+        # Cache-Datei zurückbleibt.
+        try:
+            if "metadata_cache_file" in locals():
+                temp_index = metadata_cache_file.with_suffix(".json.tmp")
+                temp_index.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+                temp_index.replace(metadata_cache_file)
+        except Exception:
+            pass
+        return result
+
+    @staticmethod
+    def _fetch_apt_screenshot(image_url):
+        """Liest ein APT-Bild zuerst aus dem lokalen Cache, sonst aus dem Netz."""
+        cache_dir = Path.home() / ".cache" / "LunaPaket" / "apt-screenshots"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / (hashlib.sha256(image_url.encode("utf-8")).hexdigest() + ".img")
+        if cache_file.is_file() and cache_file.stat().st_size:
+            try:
+                data = cache_file.read_bytes()
+                image = QImage.fromData(data)
+                if not image.isNull():
+                    return image.scaled(340, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            except Exception:
+                pass
+            try:
+                cache_file.unlink()
+            except OSError:
+                pass
+
+        request = urllib.request.Request(image_url, headers={"User-Agent": "LunaPaket/0.1.41"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = response.read(8 * 1024 * 1024)
+        image = QImage.fromData(data)
+        if image.isNull():
+            raise ValueError("Bildformat nicht unterstützt")
+        temp_file = cache_file.with_suffix(".img.tmp")
+        temp_file.write_bytes(data)
+        temp_file.replace(cache_file)
+        return image.scaled(340, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def show_apt_screenshots(self, package_name):
+        """Zeigt vorhandene Debian-AppStream-Screenshots rechts neben den APT-Details."""
+        self.clear_flatpak_gallery()
+        self.flatpak_gallery_scroll.setVisible(True)
+        cache = getattr(self, "_apt_appstream_cache", None)
+        if cache is None:
+            self.flatpak_gallery_layout.addWidget(QLabel("Debian-AppStream-Bilder werden gesucht …"))
+            self.apt_appstream_job = FunctionJob(self._read_apt_appstream_metadata)
+            def metadata_ready(data, name=package_name):
+                self._apt_appstream_cache = data
+                if self.selected() == name and not self.flatpak_mode:
+                    self.show_apt_screenshots(name)
+            self.apt_appstream_job.result.connect(metadata_ready)
+            self.apt_appstream_job.failed.connect(
+                lambda _e, name=package_name:
+                self._show_apt_gallery_empty(
+                    "Debian does not provide images for this package."
+                    if self.language == "en" else
+                    "Debian stellt für dieses Paket keine Bilder bereit."
+                ) if not self.flatpak_mode and self.selected() == name else None
+            )
+            self.apt_appstream_job.start()
+            return
+
+        meta = cache.get(package_name, {})
+        shots = meta.get("screenshots", [])
+        if not shots:
+            self._show_apt_gallery_empty(
+                "Für dieses APT-Paket sind keine Screenshots in den lokalen Debian-AppStream-Metadaten vorhanden."
+            )
+            return
+
+        if not hasattr(self, "apt_image_jobs"):
+            self.apt_image_jobs = []
+        for image_url, caption in shots[:4]:
+            tile = QWidget()
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(4, 4, 4, 4)
+            preview = QLabel("Lokaler Bildcache wird geprüft …" if self.language == "de" else "Checking local image cache …")
+            preview.setAlignment(Qt.AlignCenter)
+            preview.setMinimumSize(220, 145)
+            preview.setMaximumSize(360, 190)
+            preview.setWordWrap(True)
+            preview.setStyleSheet("background:#20212a;border:1px solid #484858;border-radius:5px;padding:4px;")
+            tile_layout.addWidget(preview)
+            self.flatpak_gallery_layout.addWidget(tile)
+            def fetch_image(url=image_url):
+                return self._fetch_apt_screenshot(url)
+            job = FunctionJob(fetch_image)
+            def image_loaded(data, target=preview, selected_package=package_name):
+                if (not isValid(target) or self.flatpak_mode or self.selected() != selected_package):
+                    return
+                if isinstance(data, QImage) and not data.isNull():
+                    # Dekodieren und Skalieren geschieht bereits im Worker;
+                    # der GUI-Thread übernimmt nur noch das Anzeigen.
+                    target.setPixmap(QPixmap.fromImage(data))
+                else:
+                    target.setText("Bildformat nicht unterstützt")
+            job.result.connect(image_loaded)
+            def image_failed(_error, target=preview, selected_package=package_name):
+                if isValid(target) and not self.flatpak_mode and self.selected() == selected_package:
+                    target.setText(
+                        "Image currently unavailable" if self.language == "en"
+                        else "Bild derzeit nicht verfügbar"
+                    )
+            job.failed.connect(image_failed)
+            self.apt_image_jobs.append(job)
+            job.start()
+
+    def _show_apt_gallery_empty(self, message):
+        self.clear_flatpak_gallery()
+        label = QLabel(message)
+        label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        self.flatpak_gallery_layout.addWidget(label)
+
     def details_for_selected(self):
+        if self.flatpak_mode:
+            app_id = self.selected_flatpak_id()
+            if app_id:
+                self.show_flatpak_details(app_id)
+            return
+        self.details_title.setText("Paketdetails")
         n=self.selected()
         if not n or self.table.currentColumn() == 0:
+            self.clear_flatpak_gallery()
+            self._show_apt_gallery_empty("Wähle ein APT-Paket aus. Verfügbare Debian-AppStream-Bilder erscheinen hier.")
             return
+        self.show_apt_screenshots(n)
         cache = getattr(self, "_details_cache", None)
         if cache is None:
             self._details_cache = {}; cache = self._details_cache
@@ -1358,11 +2701,39 @@ class Window(QMainWindow):
         self.details_job.result.connect(show_details)
         self.details_job.failed.connect(lambda e: self.details.setPlainText("Fehler: "+e))
         self.details_job.start()
+
     def package_context_menu(self, pos):
         index = self.table.indexAt(pos)
         if not index.isValid():
             return
+        self.table.setCurrentIndex(index)
         self.table.selectRow(index.row())
+        if self.flatpak_mode:
+            app_id = self.selected_flatpak_id()
+            if not app_id:
+                return
+            row = next((item for item in self.flatpak_catalog if item[0] == app_id), None)
+            if not row:
+                return
+            queued = self.flatpak_queue.get(app_id)
+            installed = row[2] == "Installiert"
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu { padding: 5px; }
+                QMenu::item { padding: 8px 30px 8px 12px; min-height: 22px; margin: 1px 0px; }
+                QMenu::separator { height: 1px; margin: 5px 8px; }
+            """)
+            if queued:
+                menu.addAction("Vormerkung aufheben", lambda: self.queue_flatpak_action(app_id, None))
+            elif installed:
+                menu.addAction("Entfernen vormerken", lambda: self.queue_flatpak_action(app_id, "remove"))
+            else:
+                menu.addAction("Installieren vormerken", lambda: self.queue_flatpak_action(app_id, "install"))
+            menu.addSeparator()
+            menu.addAction("Anwendungsdetails anzeigen", lambda checked=False, app=app_id: self.show_flatpak_details(app))
+            menu.addAction("App-ID kopieren", lambda: QApplication.clipboard().setText(app_id))
+            menu.exec(self.table.viewport().mapToGlobal(pos))
+            return
         name = self.selected()
         if not name:
             return
@@ -1422,14 +2793,15 @@ class Window(QMainWindow):
             self.refresh_checkbox(name)
 
     def update_queue_label(self):
-        if not self.queue:
+        active_queue = self.flatpak_queue if getattr(self, "flatpak_mode", False) else self.queue
+        if not active_queue:
             self.queue_label.setText("No queued changes" if self.language == "en" else "Keine vorgemerkten Änderungen")
         else:
             labels_de = {"install":"Installieren", "reinstall":"Neu installieren", "remove":"Entfernen", "purge":"Vollständig entfernen", "hold":"Version sperren", "unhold":"Versionssperre aufheben"}
             labels_en = {"install":"Install", "reinstall":"Reinstall", "remove":"Remove", "purge":"Purge", "hold":"Hold", "unhold":"Unhold"}
             labels = labels_en if self.language == "en" else labels_de
             prefix = "Queued: " if self.language == "en" else "Vorgemerkt: "
-            self.queue_label.setText(prefix + ", ".join(f"{k} ({labels.get(v, v)})" for k, v in self.queue.items()))
+            self.queue_label.setText(prefix + ", ".join(f"{k} ({labels.get(v, v)})" for k, v in active_queue.items()))
 
     def show_properties(self):
         name = self.selected()
@@ -1485,8 +2857,80 @@ class Window(QMainWindow):
 
         self.update_queue_label()
 
+    def _flatpak_command_for_action(self, app_id, action):
+        row = next((item for item in self.flatpak_catalog if item and item[0] == app_id), None)
+        meta = row[7] if row and len(row) > 7 and isinstance(row[7], dict) else {}
+        if action == "install":
+            scope = meta.get("remote_scope", "--user")
+            args = ["flatpak", "install", scope, "-y", "flathub", app_id]
+            return privileged(args) if scope == "--system" else args
+        # Flatpak selects the installed scope itself when only one exists.
+        # Do not force --user for a system-installed application.
+        return ["flatpak", "uninstall", "-y", app_id]
+
     def apply_queued_changes(self):
         """Führt ausschließlich die ausdrücklich vorgemerkten Paketaktionen aus."""
+        if self.flatpak_mode:
+            if not self.flatpak_queue:
+                QMessageBox.information(
+                    self,
+                    "Queued changes" if self.language == "en" else "Vorgemerkte Änderungen",
+                    "There are no queued Flatpak changes." if self.language == "en"
+                    else "Es sind keine Flatpak-Änderungen vorgemerkt."
+                )
+                return
+            actions = dict(self.flatpak_queue)
+            app_ids = list(actions)
+            self.status.setText(
+                "Applying queued Flatpak changes …" if self.language == "en"
+                else "Vorgemerkte Flatpak-Änderungen werden angewendet …"
+            )
+            self.set_busy(True)
+            def run_flatpak_queue():
+                outputs = []
+                failures = []
+                for app_id, action in actions.items():
+                    args = self._flatpak_command_for_action(app_id, action)
+                    try:
+                        rc, output = cmd(args)
+                    except Exception as error:
+                        rc, output = 1, str(error)
+                    outputs.append(output or f"{app_id}: exit {rc}")
+                    if rc != 0:
+                        failures.append(app_id)
+                return failures, "\n\n".join(outputs)
+            self.flatpak_queue_job = FunctionJob(run_flatpak_queue)
+            def finished(result):
+                failures, output = result
+                self.set_busy(False)
+                self.details.setPlainText(output)
+                for app_id in app_ids:
+                    if app_id not in failures:
+                        self.flatpak_queue.pop(app_id, None)
+                self.update_queue_label()
+                self.load_flatpak_catalog()
+                if failures:
+                    self.status.setText(
+                        ("Flatpak: Some queued actions failed: " if self.language == "en"
+                         else "Flatpak: Einige vorgemerkte Aktionen sind fehlgeschlagen: ")
+                        + ", ".join(failures)
+                    )
+                else:
+                    self.status.setText(
+                        "All queued Flatpak changes have been applied." if self.language == "en"
+                        else "Alle vorgemerkten Flatpak-Änderungen wurden ausgeführt."
+                    )
+            self.flatpak_queue_job.result.connect(finished)
+            self.flatpak_queue_job.failed.connect(
+                lambda error: (
+                    self.set_busy(False),
+                    self.status.setText(
+                        ("Flatpak error: " if self.language == "en" else "Flatpak-Fehler: ") + str(error)
+                    )
+                )
+            )
+            self.flatpak_queue_job.start()
+            return
         self.sync_queue_from_checkboxes()
         if not self.queue:
             QMessageBox.information(
@@ -1524,6 +2968,308 @@ class Window(QMainWindow):
             QMessageBox.information(self, "Entfernen", "Bitte zuerst Pakete auswählen oder vormerken.")
             return
         self.commit()
+
+    def check_flatpak_updates(self):
+        """Sucht App- und Runtime-Updates in Benutzer- und System-Flatpak."""
+        english = self.language == "en"
+        if not shutil.which("flatpak"):
+            QMessageBox.warning(self, "Flatpak", "Flatpak is not installed." if english else "Flatpak ist nicht installiert.")
+            return
+        self.flatpak_update_btn.setEnabled(False)
+        self.status.setText("Checking Flathub updates …" if english else "Flathub-Updates werden gesucht …")
+
+        def scan():
+            found = []
+            errors = []
+            for scope, flag in (("user", "--user"), ("system", "--system")):
+                # remote-ls erwartet das Remote als Positionsargument. Ohne
+                # "flathub" wird die Update-Abfrage nicht zuverlässig ausgeführt.
+                flatpak_args = ["flatpak", "remote-ls", "--updates", "--columns=ref", flag, "flathub"]
+                rc, output = flatpak_user_cmd(flatpak_args) if scope == "user" else cmd(flatpak_args)
+                if rc != 0:
+                    errors.append((scope, output.strip()))
+                    continue
+                for line in output.splitlines():
+                    ref = line.strip()
+                    if not ref or ref.lower() == "ref" or not (ref.startswith("app/") or ref.startswith("runtime/")):
+                        continue
+                    found.append((scope, ref))
+            # Ein Ref kann in beiden Installationen vorkommen und bleibt dann getrennt auswählbar.
+            return sorted(set(found), key=lambda item: (item[0], item[1])), errors
+
+        self.flatpak_update_scan_job = FunctionJob(scan)
+        def ready(result):
+            self.flatpak_update_btn.setEnabled(True)
+            updates, errors = result
+            if not updates:
+                self.status.setText("No Flatpak updates available." if english else "Keine Flatpak-Updates verfügbar.")
+                message = "No application or runtime updates are available." if english else "Es sind keine App- oder Runtime-Updates verfügbar."
+                if errors:
+                    message += "\n\n" + ("Some installation scopes could not be checked:" if english else "Einige Installationsbereiche konnten nicht geprüft werden:")
+                    message += "\n" + "\n".join(f"{scope}: {output}" for scope, output in errors)
+                    QMessageBox.warning(self, "Flatpak", message)
+                else:
+                    QMessageBox.information(self, "Flatpak", message)
+                return
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Available Flatpak updates" if english else "Verfügbare Flatpak-Updates")
+            dlg.resize(760, 560)
+            layout = QVBoxLayout(dlg)
+            update_count = len(updates)
+            if english:
+                intro_text = ("1 update found. Applications and runtimes are included." if update_count == 1 else
+                              f"{update_count} updates found. Applications and runtimes are included.")
+            else:
+                intro_text = ("1 Update gefunden. Anwendungen und Laufzeitumgebungen sind enthalten." if update_count == 1 else
+                              f"{update_count} Updates gefunden. Anwendungen und Laufzeitumgebungen sind enthalten.")
+            intro = QLabel(intro_text)
+            layout.addWidget(intro)
+            select_all = QCheckBox("Select all" if english else "Alle auswählen")
+            select_all.setChecked(True)
+            layout.addWidget(select_all)
+            scroll = QScrollArea(); scroll.setWidgetResizable(True)
+            content = QWidget(); rows_layout = QVBoxLayout(content)
+            checks = []
+            for scope, ref in updates:
+                kind = "Runtime" if ref.startswith("runtime/") else "Application"
+                kind_label = ("Runtime" if english else "Laufzeit") if kind == "Runtime" else ("Application" if english else "Anwendung")
+                scope_label = ("User" if scope == "user" else "System") if english else ("Benutzer" if scope == "user" else "System")
+                check = QCheckBox(f"{ref.split('/')[1]}   ·   {kind_label}   ·   {scope_label}")
+                check.setChecked(True)
+                check.setProperty("flatpak_scope", scope)
+                check.setProperty("flatpak_ref", ref)
+                checks.append(check); rows_layout.addWidget(check)
+            rows_layout.addStretch(1)
+            scroll.setWidget(content); layout.addWidget(scroll, 1)
+            select_all.toggled.connect(lambda checked: [item.setChecked(checked) for item in checks])
+            buttons = QDialogButtonBox()
+            update_selected = buttons.addButton("Update selected" if english else "Ausgewählte aktualisieren", QDialogButtonBox.AcceptRole)
+            update_all = buttons.addButton("Update all" if english else "Alle aktualisieren", QDialogButtonBox.ActionRole)
+            close_btn = buttons.addButton(QDialogButtonBox.Close)
+            close_btn.setText("Close" if english else "Schließen")
+            buttons.rejected.connect(dlg.reject)
+            close_btn.clicked.connect(dlg.reject)
+            layout.addWidget(buttons)
+
+            def start_updates(all_items=False):
+                selected = updates if all_items else [(item.property("flatpak_scope"), item.property("flatpak_ref")) for item in checks if item.isChecked()]
+                if not selected:
+                    QMessageBox.information(dlg, "Flatpak", "Select at least one update." if english else "Bitte mindestens ein Update auswählen.")
+                    return
+                question = (f"Install {len(selected)} selected update(s)?" if english else f"{len(selected)} ausgewählte Updates installieren?")
+                confirm = QMessageBox(dlg)
+                confirm.setIcon(QMessageBox.Question)
+                confirm.setWindowTitle("Flatpak")
+                confirm.setText(question)
+                confirm.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                confirm.setDefaultButton(QMessageBox.No)
+                yes_button = confirm.button(QMessageBox.Yes)
+                no_button = confirm.button(QMessageBox.No)
+                if english:
+                    yes_button.setText("Yes")
+                    no_button.setText("No")
+                else:
+                    yes_button.setText("Ja")
+                    no_button.setText("Nein")
+                if confirm.exec() != QMessageBox.Yes:
+                    return
+                dlg.accept()
+                self.flatpak_update_btn.setEnabled(False)
+                self.set_busy(True)
+                self.status.setText("Installing Flatpak updates …" if english else "Flatpak-Updates werden installiert …")
+                def install():
+                    results = []
+                    for scope, ref in selected:
+                        args = ["flatpak", "update", "-y", "--noninteractive", scope_flag(scope), ref]
+                        rc, output = cmd(privileged(args)) if scope == "system" else flatpak_user_cmd(args)
+                        results.append((scope, ref, rc, output))
+                    return results
+                self.flatpak_update_job = FunctionJob(install)
+                def installed(results):
+                    self.set_busy(False); self.flatpak_update_btn.setEnabled(True)
+                    failures = [(scope, ref, output) for scope, ref, rc, output in results if rc != 0]
+                    details = "\n\n".join(output.strip() or f"{ref}: exit {rc}" for scope, ref, rc, output in results)
+                    self.details.setPlainText(details)
+                    if failures:
+                        self.status.setText("Some Flatpak updates failed." if english else "Einige Flatpak-Updates sind fehlgeschlagen.")
+                        QMessageBox.warning(self, "Flatpak", ("Some updates could not be installed:" if english else "Einige Updates konnten nicht installiert werden:") + "\n\n" + "\n".join(ref for _scope, ref, _output in failures))
+                    else:
+                        self.status.setText("Flatpak updates completed." if english else "Flatpak-Updates abgeschlossen.")
+                        QMessageBox.information(self, "Flatpak", "All selected Flatpak updates were installed." if english else "Alle ausgewählten Flatpak-Updates wurden installiert.")
+                    self.load_flatpak_catalog()
+                self.flatpak_update_job.result.connect(installed)
+                self.flatpak_update_job.failed.connect(lambda error: (self.set_busy(False), self.flatpak_update_btn.setEnabled(True), QMessageBox.critical(self, "Flatpak", str(error))))
+                self.flatpak_update_job.start()
+
+            def scope_flag(scope):
+                return "--user" if scope == "user" else "--system"
+            update_selected.clicked.connect(lambda: start_updates(False))
+            update_all.clicked.connect(lambda: start_updates(True))
+            if errors:
+                intro.setText(intro.text() + "\n" + ("Warning: one installation scope could not be checked." if english else "Hinweis: Ein Installationsbereich konnte nicht geprüft werden."))
+            self.status.setText((f"{len(updates)} Flatpak update(s) available." if english else f"{len(updates)} Flatpak-Updates verfügbar."))
+            dlg.exec()
+        self.flatpak_update_scan_job.result.connect(ready)
+        self.flatpak_update_scan_job.failed.connect(lambda error: (self.flatpak_update_btn.setEnabled(True), self.status.setText("Flatpak update check failed" if english else "Flatpak-Updateprüfung fehlgeschlagen"), QMessageBox.warning(self, "Flatpak", str(error))))
+        self.flatpak_update_scan_job.start()
+
+    def show_flatpak_cleanup_dialog(self):
+        """Findet ungenutzte Flatpak-Runtimes getrennt in Benutzer- und Systeminstallation."""
+        if not shutil.which("flatpak"):
+            QMessageBox.warning(
+                self, "Flatpak",
+                "Flatpak is not installed." if self.language == "en"
+                else "Flatpak ist nicht installiert."
+            )
+            return
+
+        scopes = (
+            ["User installation", "System installation"] if self.language == "en"
+            else ["Benutzerinstallation", "Systeminstallation"]
+        )
+        scope, accepted = QInputDialog.getItem(
+            self,
+            "Flatpak cleanup" if self.language == "en" else "Flatpak aufräumen",
+            "Which installation should be checked?" if self.language == "en"
+            else "Welche Installation soll geprüft werden?",
+            scopes, 0, False
+        )
+        if not accepted:
+            return
+        system_scope = scope == scopes[1]
+        scope_flag = "--system" if system_scope else "--user"
+        scope_name = (
+            ("system installation" if self.language == "en" else "Systeminstallation")
+            if system_scope else
+            ("user installation" if self.language == "en" else "Benutzerinstallation")
+        )
+
+        self.status.setText(
+            (f"Checking unused runtimes in the {scope_name} …" if self.language == "en"
+             else f"Suche nach ungenutzten Runtimes in der {scope_name} …")
+        )
+        self.set_busy(True)
+
+        def preview():
+            # Read-only preview: explicitly decline Flatpak's own confirmation prompt.
+            result = subprocess.run(
+                ["flatpak", "uninstall", "--unused", scope_flag],
+                input="n\\n", text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, timeout=180
+            )
+            return result.returncode, result.stdout
+
+        self.flatpak_cleanup_preview_job = FunctionJob(preview)
+
+        def preview_ready(result):
+            self.set_busy(False)
+            rc, output = result
+            if rc not in (0, 1) and not output.strip():
+                QMessageBox.warning(
+                    self, "Flatpak",
+                    ("Could not check unused runtimes.\\n\\n" if self.language == "en"
+                     else "Ungenutzte Runtimes konnten nicht geprüft werden.\\n\\n") + output
+                )
+                return
+            refs = list(dict.fromkeys(re.findall(r"(?m)^\\s*(runtime/[^\\s]+)", output)))
+            if not refs:
+                QMessageBox.information(
+                    self,
+                    "Cleanup" if self.language == "en" else "Aufräumen",
+                    (f"No unused runtimes were found in the {scope_name}." if self.language == "en"
+                     else f"In der {scope_name} wurden keine ungenutzten Runtimes gefunden.")
+                )
+                self.status.setText(
+                    ("No unused runtimes found." if self.language == "en"
+                     else "Keine ungenutzten Runtimes gefunden.")
+                )
+                return
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle(
+                "Confirm Flatpak cleanup" if self.language == "en"
+                else "Flatpak-Aufräumen bestätigen"
+            )
+            dlg.resize(680, 440)
+            layout = QVBoxLayout(dlg)
+            intro = QLabel(
+                (f"{len(refs)} unused runtimes/extensions in the {scope_name} can be removed. "
+                 "Installed applications and app data will be kept.")
+                if self.language == "en"
+                else (f"{len(refs)} ungenutzte Runtimes/Erweiterungen in der {scope_name} können entfernt werden. "
+                      "Installierte Anwendungen und App-Daten bleiben erhalten.")
+            )
+            intro.setWordWrap(True)
+            layout.addWidget(intro)
+            listing = QListWidget()
+            listing.addItems(refs)
+            listing.setSelectionMode(QAbstractItemView.NoSelection)
+            layout.addWidget(listing, 1)
+            buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+            buttons.button(QDialogButtonBox.Ok).setText(
+                "Clean up now" if self.language == "en" else "Jetzt aufräumen"
+            )
+            buttons.button(QDialogButtonBox.Cancel).setText(
+                "Cancel" if self.language == "en" else "Abbrechen"
+            )
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
+            layout.addWidget(buttons)
+            if dlg.exec() != QDialog.Accepted:
+                self.status.setText(
+                    "Cleanup cancelled – nothing was removed." if self.language == "en"
+                    else "Aufräumen abgebrochen – nichts wurde entfernt."
+                )
+                return
+
+            self.status.setText(
+                (f"Removing unused runtimes from the {scope_name} …" if self.language == "en"
+                 else f"Ungenutzte Runtimes aus der {scope_name} werden entfernt …")
+            )
+            self.set_busy(True)
+            self.flatpak_cleanup_job = FunctionJob(
+                lambda: cmd(["flatpak", "uninstall", "--unused", scope_flag, "--assumeyes"])
+            )
+
+            def cleanup_finished(cleanup_result):
+                self.set_busy(False)
+                cleanup_rc, cleanup_output = cleanup_result
+                self.details.setPlainText(cleanup_output)
+                if cleanup_rc == 0:
+                    self.status.setText(
+                        (f"Removed unused runtimes from the {scope_name}." if self.language == "en"
+                         else f"Ungenutzte Runtimes aus der {scope_name} entfernt.")
+                    )
+                else:
+                    self.status.setText(
+                        ("Flatpak cleanup failed: " if self.language == "en"
+                         else "Flatpak-Aufräumen fehlgeschlagen: ") + cleanup_output
+                    )
+
+            self.flatpak_cleanup_job.result.connect(cleanup_finished)
+            self.flatpak_cleanup_job.failed.connect(
+                lambda error: (
+                    self.set_busy(False),
+                    self.status.setText(
+                        ("Flatpak cleanup error: " if self.language == "en"
+                         else "Flatpak-Aufräumfehler: ") + str(error)
+                    )
+                )
+            )
+            self.flatpak_cleanup_job.start()
+
+        self.flatpak_cleanup_preview_job.result.connect(preview_ready)
+        self.flatpak_cleanup_preview_job.failed.connect(
+            lambda error: (
+                self.set_busy(False),
+                self.status.setText(
+                    ("Could not check Flatpak cleanup: " if self.language == "en"
+                     else "Flatpak-Aufräumen konnte nicht geprüft werden: ") + str(error)
+                )
+            )
+        )
+        self.flatpak_cleanup_preview_job.start()
 
     def show_autoremove_dialog(self):
         if self.catalog_cache is None:
@@ -1577,6 +3323,14 @@ class Window(QMainWindow):
             self._syncing_queue_checkbox = False
 
     def clear_queue(self):
+        if self.flatpak_mode:
+            self.flatpak_queue.clear()
+            self.update_queue_label()
+            model = self.table.package_model
+            model.checked = list(model.installed)
+            if model.rowCount():
+                model.dataChanged.emit(model.index(0, 0), model.index(model.rowCount()-1, 0), [Qt.CheckStateRole])
+            return
         self.queue.clear(); self.update_queue_label()
         model=self.table.package_model; model.checked=list(model.installed)
         if model.rowCount(): model.dataChanged.emit(model.index(0,0),model.index(model.rowCount()-1,0),[Qt.CheckStateRole])
@@ -2377,7 +4131,7 @@ class Window(QMainWindow):
         for path in paths:
             rc,out=cmd(["dpkg-deb","-f",path,"Package","Version","Architecture","Description"])
             if rc != 0:
-                QMessageBox.warning(self,"Ungültiges DEB-Paket",f"{os.path.basename(path)} konnte nicht gelesen werden.\\n\\n{out}")
+                QMessageBox.warning(self,"Ungültiges DEB-Paket",f"{os.path.basename(path)} konnte nicht gelesen werden.\n\n{out}")
                 continue
             fields={}
             current_key=None
@@ -2385,7 +4139,7 @@ class Window(QMainWindow):
                 if line and not line[0].isspace() and ":" in line:
                     current_key,value=line.split(":",1); fields[current_key.strip()]=value.strip()
                 elif current_key == "Description" and line:
-                    fields[current_key] += "\\n" + line
+                    fields[current_key] += "\n" + line
             package=fields.get("Package","").strip()
             version=fields.get("Version","").strip()
             if not package:
@@ -2398,8 +4152,8 @@ class Window(QMainWindow):
                 parts=qout.strip().split("\t",1)
                 installed=bool(parts and parts[0] == "installed")
                 installed_version=parts[1] if len(parts)>1 else ""
-            details.append(f"{os.path.basename(path)}\\n{out.strip()}"+
-                           (f"\\nInstalliert: {installed_version}" if installed else "\\nStatus: derzeit nicht installiert"))
+            details.append(f"{os.path.basename(path)}\n{out.strip()}"+
+                           (f"\nInstalliert: {installed_version}" if installed else "\nStatus: derzeit nicht installiert"))
             if installed and installed_version == version:
                 reinstall_paths.append(path)
             else:

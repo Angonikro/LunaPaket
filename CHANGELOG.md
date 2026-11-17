@@ -1,4 +1,13 @@
-# Änderungsprotokoll LunaPaket
+# Changelog
+
+## 0.1.41 – Flathub-Testversion
+- Umschalter in der Oberfläche zwischen APT (Debian) und Flathub (Flatpak).
+- Separater Flathub-Katalog mit installierten und verfügbaren Anwendungen.
+- Flatpak-Anwendungen können benutzerspezifisch installiert und entfernt werden.
+- App-Symbole werden aus dem lokalen Flatpak-Appstream-Cache geladen, wenn vorhanden.
+- Die bestehende APT-Verwaltung bleibt als eigener Modus erhalten.
+- Apt App-Stream hinzugefügt. Leider haben die wenigsten Apps Bilder aber 0AD z.B. hat welche.
+- Der App-Stream wird beim ersten start runter geladen und dann gespeichert.
 
 ## 0.1.40 Purge-Vormerkung und Kontextmenü
 - Fehler behoben: Beim programmatischen Aktualisieren der Paket-Checkbox wurde eine ausdrücklich vorgemerkte Purge-Aktion als normales Entfernen überschrieben.
@@ -165,3 +174,17 @@
 - Weitere englische Übersetzungen für Statusmeldungen beim APT-Hintergrundlauf und beim Aktualisieren der Paketquellen ergänzt.
 - Sicherheitsupdate-Dialog: Fenstertitel und dynamische Zusammenfassung werden jetzt abhängig von der gewählten Sprache angezeigt.
 - Dynamische Statusmeldungen für Sicherheitsprüfungen und abgeschlossene/fehlgeschlagene Paketaktionen sprachabhängig gemacht.
+
+## 0.1.41 – APT-AppStream-Bildquelle korrigiert
+- Aktuelle Debian-AppStream-Generator-Metadaten werden für die erkannte Debian-Version und Architektur im Hintergrund geladen und lokal zwischengespeichert.
+- Die aktuellen Metadaten werden gegenüber den möglicherweise veralteten APT-DEP-11-Metadaten bevorzugt.
+- Screenshot-Quellen aus `source-image.url` werden korrekt ausgewertet; lokale APT-Metadaten bleiben als Rückfall erhalten.
+- Flathub-Funktionen und Versionsnummer unverändert.
+
+## 0.1.41 – Flathub-Updateverwaltung (Deutsch/Englisch)
+- Eigene Schaltfläche zum Suchen nach verfügbaren Flatpak-Updates in der Flathub-Ansicht ergänzt.
+- Prüfung der Benutzer- und Systeminstallation getrennt, damit Updates aus beiden Bereichen erkannt werden.
+- Verfügbare App- und Runtime-Updates werden einzeln aufgeführt und können ausgewählt oder gesammelt installiert werden.
+- Installation nutzt die passende Flatpak-Installation; Systemupdates fragen bei Bedarf Root-Rechte über pkexec an.
+- Oberfläche, Rückmeldungen und Bestätigungen sind auf Deutsch und Englisch verfügbar.
+- APT-Updatefunktionen und Versionsnummer 0.1.41 bleiben unverändert.
