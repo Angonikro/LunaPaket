@@ -1,18 +1,26 @@
-# LunaPaket 0.1.41 – Flathub-Testversion
+# LunaPaket 0.1.42 – APT, Flathub und Snap
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
-LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates sowie Flatpak-Anwendungen aus Flathub über eine
+LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates sowie Flatpak-Anwendungen aus Flathub und Snap-Anwendungen über eine
 grafische Oberfläche auf Basis von Python 3 und PySide6.
 
-![LunaPaket](lunapaket1.png)
-
-![LunaPaket](lunapaket2.png)
+![LunaPaket](lunapaket.png)
 
 [Github Seite](https://github.com/Angonikro/LunaPaket/)
 
 ## Funktionen
 
-- Umschaltung zwischen APT- und Flathub-Ansicht direkt in der Oberfläche
+- Umschaltung zwischen APT-, Flathub- und Snap-Ansicht direkt in der Oberfläche
+- Snap-Store-Suche mit Suchbegriffen und Store-Kategorien; Suchtreffer werden durch snapd passend zur Gerätearchitektur gefiltert
+- Installierte und verfügbare Snaps unterscheiden
+- Snap-Kanäle Stable, Candidate, Beta und Edge getrennt nach `channel-map` der offiziellen Snapcraft-v2-API prüfen; ein Store-Metadatenabruf liefert die Releases aller vier Kanäle
+- Ein gemeinsamer Snap-Master-Katalog je Gerätearchitektur lädt die Store-Kandidaten und die vollständige `channel-map` jedes Snaps einmalig (`~/.cache/LunaPaket/snap_catalog_store-master-<arch>.sqlite3`); Stable, Candidate, Beta und Edge werden daraus lokal abgeleitet und zusätzlich getrennt je Kanal gespeichert
+- Die Kanal-Auswahl zeigt die Anzahl der Einträge im jeweils gespeicherten, channel-geprüften Katalog
+- Ein Snap wird nur gezählt, wenn für den ausgewählten Track/Channel und die native Architektur ein veröffentlichter Release bestätigt wurde; installierte Snaps ohne Release in diesem Channel werden nicht künstlich ergänzt
+- Snap-Anwendungsdetails mit Beschreibung, Herausgeber, Lizenz und Website, sofern vom Store-Suchergebnis geliefert
+- Snaps installieren, entfernen und vorgemerkte Änderungen gemeinsam anwenden
+- Verfügbare Snap-Updates suchen sowie ausgewählte oder alle Snaps aktualisieren
+- Snap-Anwendungskatalog in einer lokalen SQLite-Datenbank speichern und bei fehlender Store-Verbindung offline anzeigen; Kategorieabfragen aktualisieren den Cache; Suchanfragen werden nicht in den gemeinsamen Katalogcache übernommen
 - Flathub-Katalog mit installierten und verfügbaren Flatpak-Anwendungen
 - App-Namen und App-Beschreibungen in Deutsch oder Englisch, sofern AppStream eine Übersetzung bereitstellt
 - Flatpak-Anwendungen installieren und entfernen (benutzerspezifisch)
@@ -21,6 +29,7 @@ grafische Oberfläche auf Basis von Python 3 und PySide6.
 - Paketübersicht mit installierten und nicht installierten Paketen
 - Paketsuche und Paketdetails
 - Pakete zur Installation oder Entfernung vormerken
+- Installierte grafische Anwendungen direkt über das Kontextmenü starten (APT, Flathub und Snap)
 - Systemaktualisierung und Aktualisierung der APT-Paketlisten
 - Paketquellen verwalten
 - Sicherheitsupdates anzeigen und einzeln bearbeiten
@@ -59,8 +68,16 @@ sudo apt update
 sudo apt install python3 python3-apt python3-pyside6.qtcore \
   python3-pyside6.qtgui python3-pyside6.qtwidgets \
   libxcb-cursor0 libxkbcommon-x11-0 libxcb-xinerama0 \
-  apt dpkg flatpak pkexec polkitd desktop-file-utils shared-mime-info
+  apt dpkg flatpak pkexec polkitd desktop-file-utils shared-mime-info libgtk-3-bin
 ```
+
+Snap-Unterstützung ist optional. Für den Snap-Modus zusätzlich installieren:
+
+```bash
+sudo apt install snapd
+```
+
+Hinweis zum Snap-Modus: Die Store-Kandidaten und die vollständige `channel-map` jedes geprüften Snaps werden einmalig in einem gemeinsamen Master-Katalog je Gerätearchitektur gespeichert (`~/.cache/LunaPaket/snap_catalog_store-master-<arch>.sqlite3`). Beim Wechsel zwischen Stable, Candidate, Beta und Edge werden die jeweiligen Kanal-Kataloge lokal aus diesen Daten abgeleitet und separat gespeichert. Bereits geladene Store-Metadaten und Channel-Informationen werden dadurch nicht für jeden Kanal erneut heruntergeladen. Der Katalog umfasst die über Store-Suche, snapd-Kategorien und den ergänzenden Community-Katalog gefundenen Kandidaten; er ist kein offizieller vollständiger Export sämtlicher Snap-Store-Einträge. Screenshots und Store-Icons werden separat im Cache gespeichert, sofern der Store sie bereitstellt. Installation und Entfernung erfolgen weiterhin ausschließlich über snapd.
 
 ## LunaPaket direkt aus der ZIP starten
 
@@ -68,7 +85,7 @@ ZIP-Datei entpacken und in den Projektordner wechseln:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.41_GITHUB.zip -d ~/Programme
+unzip LunaPaket_0.1.42_ApplicationStart.zip -d ~/Programme
 cd ~/Programme/LunaPaket
 ```
 
@@ -101,7 +118,7 @@ Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./lunapaket_0.1.41_all.deb
+sudo apt install ./lunapaket_0.1.42_all.deb
 ```
 
 Anschließend über das Anwendungsmenü oder mit `lunapaket` starten.
@@ -118,7 +135,7 @@ chmod +x build_deb.sh
 ./build_deb.sh
 ```
 
-Das Skript erstellt `dist/lunapaket_0.1.41_all.deb`.
+Das Skript erstellt `dist/lunapaket_0.1.42_all.deb`.
 Zum Bauen wird `dpkg-deb` benötigt.
 
 

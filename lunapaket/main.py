@@ -1,17 +1,19 @@
 #!/usr/bin/python3
-import os, sys, subprocess, re, pwd, json, shlex, shutil, html, gzip, hashlib, time, urllib.request, xml.etree.ElementTree as ET
+import os, sys, subprocess, re, pwd, json, shlex, shutil, html, gzip, hashlib, time, socket, sqlite3, http.client, urllib.request, urllib.parse, xml.etree.ElementTree as ET, pty, select, errno, codecs, platform
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.41"
+VERSION="0.1.42"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
 # dadurch in mehreren Bereichen erscheinen.
 TOPIC_CATEGORIES = [
-    ("amateurfunk", "Amateurfunk", "Amateur Radio", r"\b(hamradio|amateur.?radio|radio.?signal|gnuradio|gqrx|rtl.?sdr|soapysdr|direwolf|fldigi|chirp|qsstv|wsjtx|js8call|hamlib|ax25|aprs|cqrlog|xastir|qtel|sdrangel)\b"),
+    ("amateurfunk", "Amateurfunk", "Amateur Radio", r"\b(hamradio|amateur.?radio|radio.?signal|meshtastic|hamclock|morse|gnuradio|gqrx|sdr|rtl.?sdr|soapysdr|direwolf|fldigi|chirp|qsstv|wsjtx|js8call|hamlib|ax25|aprs|cqrlog|xastir|qtel|sdrangel|m17)\b"),
     ("network", "Internet & Netzwerk", "Internet & Network", r"\b(network|netzwerk|browser|firefox|chromium|curl|wget|ssh|openssh|ftp|sftp|wifi|wireless|wireshark|tcpdump|nmap| traceroute|dns|vpn)\b"),
     ("audio", "Audio & Musik", "Audio & Music", r"\b(audio|musik|music|sound|alsa|pulseaudio|pipewire|vlc|audacity|ardour|lmms|mpd|mplayer|rhythmbox|strawberry|lame|flac|vorbis)\b"),
     ("video", "Video & Multimedia", "Video & Multimedia", r"\b(video|multimedia|ffmpeg|ffplay|handbrake|makemkv|mkvtoolnix|kdenlive|shotcut|obs-studio|mpv|totem|dvd|bluray|gstreamer)\b"),
@@ -25,6 +27,143 @@ TOPIC_CATEGORIES = [
     ("science", "Wissenschaft & Navigation", "Science & Navigation", r"\b(science|wissenschaft|navigation|gps|gpsd|qgis|map|karte|kartographie|stellarium|celestia|gnuplot|octave|scipy|r-?base|geography|astronomy|astronomie)\b"),
 ]
 TOPIC_REGEX = {key: re.compile(pattern, re.IGNORECASE) for key, _de, _en, pattern in TOPIC_CATEGORIES}
+
+
+class _SnapUpdatesHTMLParser(HTMLParser):
+    """Liest nur öffentliche Kataloglinks aus den serverseitigen SnapUpdates-Seiten."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links=[]; self._anchor=None; self._pending_image=""; self.max_page=1
+    def handle_starttag(self, tag, attrs):
+        attrs=dict(attrs)
+        href=attrs.get("href", "")
+        if tag == "img":
+            src=attrs.get("src", "")
+            if src.startswith("https://"):
+                if self._anchor is not None:
+                    self._anchor["image"] = src
+                else:
+                    self._pending_image=src
+        if tag == "a":
+            is_snap_link = href.startswith("/snap/")
+            self._anchor={"href":href, "text":[] , "image":self._pending_image if is_snap_link else ""}
+            if is_snap_link:
+                self._pending_image=""
+        if href:
+            match=re.search(r"[?&]page=(\d+)", href)
+            if match:
+                self.max_page=max(self.max_page, int(match.group(1)))
+    def handle_data(self, data):
+        if self._anchor is not None:
+            self._anchor["text"].append(data)
+    def handle_endtag(self, tag):
+        if tag == "a" and self._anchor is not None:
+            item=self._anchor; self._anchor=None
+            item["text"]=" ".join(" ".join(item["text"]).split())
+            if item.get("image") and not item.get("href", "").startswith("/snap/"):
+                self._pending_image=item["image"]
+            self.links.append(item)
+
+
+def _native_debian_architecture():
+    """Return the Debian package architecture used by this running system."""
+    try:
+        result = subprocess.run(["dpkg", "--print-architecture"], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=5, check=False)
+        value = result.stdout.strip().lower()
+        if result.returncode == 0 and value:
+            return value
+    except Exception:
+        pass
+    machine = platform.machine().lower()
+    return {"aarch64": "arm64", "x86_64": "amd64"}.get(machine, machine)
+
+
+def _native_flatpak_architecture():
+    """Return Flatpak's architecture name (aarch64/x86_64) for this host."""
+    try:
+        result = subprocess.run(["flatpak", "--default-arch"], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=5, check=False)
+        value = result.stdout.strip().lower()
+        if result.returncode == 0 and value:
+            return value
+    except Exception:
+        pass
+    return {"arm64": "aarch64", "amd64": "x86_64"}.get(_native_debian_architecture(), platform.machine().lower())
+
+
+def _snap_catalog_id(channel, architecture=None):
+    """Eindeutiger Schlüssel je Track/Channel und CPU-Architektur."""
+    channel = str(channel or "latest/stable").strip().lower()
+    if not re.fullmatch(r"[a-z0-9-]+/[a-z0-9-]+", channel):
+        channel = "latest/stable"
+    architecture = str(architecture or _native_debian_architecture()).strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]+", architecture):
+        architecture = _native_debian_architecture()
+    return "store-" + channel.replace("/", "-") + "-" + architecture
+
+
+def _snap_cache_connection(catalog="snapupdates"):
+    """Öffnet einen persistenten Katalog. Jeder Snap-Channel erhält eine eigene SQLite-Datei."""
+    root = Path.home() / ".cache" / "LunaPaket"
+    root.mkdir(parents=True, exist_ok=True)
+    if str(catalog).startswith("store-"):
+        safe_catalog = re.sub(r"[^a-z0-9_-]", "-", str(catalog).lower())
+        db_path = root / ("snap_catalog_" + safe_catalog + ".sqlite3")
+    else:
+        db_path = root / "snap_catalog.sqlite3"
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("""CREATE TABLE IF NOT EXISTS catalog_rows (
+        catalog TEXT NOT NULL, name TEXT NOT NULL, payload TEXT NOT NULL,
+        updated_at INTEGER NOT NULL, PRIMARY KEY (catalog, name))""")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_catalog_name ON catalog_rows(catalog, name)")
+    connection.commit()
+    return connection
+
+
+def _snap_cache_read(catalog):
+    try:
+        with _snap_cache_connection(catalog) as db:
+            result = db.execute("SELECT payload FROM catalog_rows WHERE catalog=? ORDER BY name COLLATE NOCASE", (catalog,)).fetchall()
+        rows=[]
+        for (payload,) in result:
+            try:
+                rows.append(json.loads(payload))
+            except (TypeError, ValueError):
+                continue
+        return rows
+    except (OSError, sqlite3.Error):
+        return []
+
+
+def _snap_cache_write(catalog, rows):
+    """Ersetzt nur den angegebenen Katalog atomar; andere Channels bleiben unberührt."""
+    now=int(time.time())
+    try:
+        with _snap_cache_connection(catalog) as db:
+            db.execute("DELETE FROM catalog_rows WHERE catalog=?", (catalog,))
+            db.executemany(
+                "INSERT OR REPLACE INTO catalog_rows(catalog,name,payload,updated_at) VALUES(?,?,?,?)",
+                [(catalog, str(row[0]), json.dumps(row, ensure_ascii=False), now)
+                 for row in rows if isinstance(row, (list, tuple)) and len(row) >= 1 and row[0]]
+            )
+            db.commit()
+        return True
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+
+
+def _snap_cache_age_hours(catalog):
+    try:
+        with _snap_cache_connection(catalog) as db:
+            row=db.execute("SELECT MAX(updated_at) FROM catalog_rows WHERE catalog=?", (catalog,)).fetchone()
+        return (time.time()-row[0])/3600 if row and row[0] else None
+    except (OSError, sqlite3.Error):
+        return None
 
 
 class PackageTableModel(QAbstractTableModel):
@@ -54,6 +193,10 @@ class PackageTableModel(QAbstractTableModel):
         if role == Qt.DecorationRole and c == 1 and len(self.rows[source_row]) > 5:
             icon_path = self.rows[source_row][5]
             if icon_path and os.path.isfile(icon_path):
+                # APT-Icons explizit auf Flathub-ähnliche Größe rendern.
+                pixmap = QPixmap(icon_path)
+                if not pixmap.isNull():
+                    return QIcon(pixmap.scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 return QIcon(icon_path)
             return QIcon.fromTheme("application-x-executable")
         if role == Qt.DisplayRole:
@@ -91,6 +234,21 @@ class PackageTableModel(QAbstractTableModel):
             elif a in ("remove","purge"): v=False
             self.checked.append(v)
         self.endResetModel()
+    def set_icon_path(self, source_row, icon_path):
+        if not (0 <= source_row < len(self.rows)) or not icon_path:
+            return
+        row = list(self.rows[source_row])
+        if len(row) <= 5 or row[5]:
+            return
+        row[5] = icon_path
+        self.rows[source_row] = tuple(row)
+        try:
+            visible_row = self.visible_rows.index(source_row)
+        except ValueError:
+            return
+        index = self.index(visible_row, 1)
+        self.dataChanged.emit(index, index, [Qt.DecorationRole])
+
     def set_checked_for_name(self,name,checked):
         for source_row,x in enumerate(self.rows):
             if x and x[0]==name:
@@ -176,6 +334,76 @@ class PackageTableView(QTableView):
 def privileged(args):
     """Führt Systembefehle direkt aus, wenn LunaPaket als root läuft."""
     return list(args) if os.geteuid() == 0 else ["pkexec", *args]
+
+
+def run_snap_command_live(command, emit_output, timeout=1800):
+    """Run snap on a pseudo-terminal so snapd's interactive progress is flushed live."""
+    master_fd, slave_fd = pty.openpty()
+    process = None
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    started = time.monotonic()
+    try:
+        env = {**os.environ, "LC_ALL": "C", "LANG": "C", "TERM": "xterm"}
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=slave_fd, stderr=slave_fd,
+            close_fds=True, env=env, start_new_session=True
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+        while True:
+            if time.monotonic() - started > timeout:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait()
+                raise TimeoutError("Snap command timed out")
+            readable, _, _ = select.select([master_fd], [], [], 0.2)
+            if readable:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        data = b""
+                    else:
+                        raise
+                if data:
+                    pending += decoder.decode(data)
+                    # Snap refresh/install/remove updates terminal lines with CR as well
+                    # as ordinary LF. Emit each completed terminal update immediately.
+                    while "\n" in pending or "\r" in pending:
+                        positions = [pos for pos in (pending.find("\n"), pending.find("\r")) if pos >= 0]
+                        end = min(positions)
+                        line, pending = pending[:end], pending[end + 1:]
+                        if pending.startswith("\n") and end < len(pending):
+                            pending = pending[1:]
+                        if line.strip():
+                            emit_output(line.rstrip())
+                elif process.poll() is not None:
+                    break
+            elif process.poll() is not None:
+                # Drain any final bytes left in the PTY before exiting.
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        data = b""
+                    else:
+                        raise
+                if not data:
+                    break
+                pending += decoder.decode(data)
+        pending += decoder.decode(b"", final=True)
+        if pending.strip():
+            emit_output(pending.rstrip())
+        return process.wait()
+    finally:
+        if slave_fd >= 0:
+            os.close(slave_fd)
+        os.close(master_fd)
+        if process is not None and process.poll() is None:
+            process.kill(); process.wait()
 
 
 def is_apt_command(args):
@@ -494,6 +722,32 @@ class StreamJob(QThread):
                 log_apt_problem(self.args, 1, str(exc))
             self.finished_text.emit(1, str(exc))
 
+class CommandStreamJob(QThread):
+    """Führt einen einzelnen Befehl aus und liefert seine Ausgabe zeilenweise."""
+    output = Signal(str)
+    finished_text = Signal(int, str)
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = [str(value) for value in args]
+
+    def run(self):
+        chunks = []
+        try:
+            proc = subprocess.Popen(
+                self.args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, universal_newlines=True,
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+            for line in iter(proc.stdout.readline, ''):
+                chunks.append(line)
+                self.output.emit(line.rstrip())
+            proc.stdout.close()
+            rc = proc.wait()
+            self.finished_text.emit(rc, ''.join(chunks))
+        except Exception as exc:
+            self.finished_text.emit(1, str(exc))
+
+
 class FunctionJob(QThread):
     # A central strong-reference set prevents Python from collecting a QThread
     # when a view is switched quickly and its per-view job list is reset.
@@ -501,22 +755,35 @@ class FunctionJob(QThread):
     result=Signal(object)
     failed=Signal(str)
     progress=Signal(int, int)
-    def __init__(self, fn, with_progress=False):
+    progress_detail=Signal(int, int, str)
+    output=Signal(str)
+    def __init__(self, fn, with_progress=False, with_progress_detail=False, with_progress_detail_output=False):
         super().__init__()
         self.fn=fn
         self.with_progress=with_progress
+        self.with_progress_detail=with_progress_detail
+        self.with_progress_detail_output=with_progress_detail_output
         self._live_jobs.add(self)
         self.finished.connect(lambda job=self: self._live_jobs.discard(job))
+    def cancel(self):
+        """Bittet einen laufenden Hintergrundjob, kontrolliert abzubrechen."""
+        self.requestInterruption()
+
     def run(self):
         try:
-            result = self.fn(self.progress.emit) if self.with_progress else self.fn()
+            if self.with_progress_detail_output:
+                result = self.fn(self.progress_detail.emit, self.output.emit)
+            elif self.with_progress_detail:
+                result = self.fn(self.progress_detail.emit)
+            else:
+                result = self.fn(self.progress.emit) if self.with_progress else self.fn()
             self.result.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
 
 class ActionProgressDialog(QDialog):
     """Separates live action output from the normal protocol/details pane."""
-    def __init__(self, parent, title, description, english=False):
+    def __init__(self, parent, title, description, english=False, settings=None, setting_key=None):
         super().__init__(parent)
         self.english = english
         if english:
@@ -538,7 +805,39 @@ class ActionProgressDialog(QDialog):
         self.output.setReadOnly(True)
         layout.addWidget(self.output, 1)
         self.auto_close = QCheckBox("Close window after successful action" if english else "Fenster nach erfolgreicher Aktion schließen")
-        self.auto_close.setChecked(True)
+        self._settings = settings
+        self._setting_key = setting_key
+        remembered = True
+        if settings is not None and setting_key:
+            shared_key = "progress/auto_close_after_success"
+            if settings.contains(shared_key):
+                remembered = settings.value(shared_key, True, type=bool)
+            else:
+                # Migrate the earlier per-window preferences. If any prior
+                # dialog explicitly disabled auto-close, preserve that safer
+                # choice instead of silently closing the next window.
+                legacy_keys = (
+                    "snap/auto_close_updates", "snap/auto_close_queued_actions",
+                    "apt/auto_close_package_actions", "apt/auto_close_system_updates",
+                    "apt/auto_close_security_install", "apt/auto_close_repository_check",
+                )
+                legacy_values = [settings.value(key, type=bool) for key in legacy_keys if settings.contains(key)]
+                remembered = all(legacy_values) if legacy_values else True
+            settings.setValue(shared_key, bool(remembered))
+            settings.sync()
+        self.auto_close.setChecked(bool(remembered))
+        if settings is not None and setting_key:
+            def save_auto_close(checked):
+                # Keep one authoritative preference for every progress dialog
+                # and mirror it to the legacy/action-specific key.
+                settings.setValue("progress/auto_close_after_success", bool(checked))
+                settings.setValue(setting_key, bool(checked))
+                settings.sync()
+            self.auto_close.toggled.connect(save_auto_close)
+            # Persist the initial state too, so all dialogs read the same value.
+            settings.setValue("progress/auto_close_after_success", bool(remembered))
+            settings.setValue(setting_key, bool(remembered))
+            settings.sync()
         layout.addWidget(self.auto_close)
         self.close_button = QPushButton("Operation in progress …" if english else "Vorgang läuft …")
         self.close_button.setEnabled(False)
@@ -586,7 +885,11 @@ class ActionProgressDialog(QDialog):
         self.close_button.setEnabled(True)
         # Nur bei erfolgreichem Abschluss automatisch schließen. Bei Fehlern
         # bleibt das Protokoll sichtbar, damit die Ursache gelesen werden kann.
-        if code == 0 and self.auto_close.isChecked():
+        should_close = self.auto_close.isChecked()
+        if self._settings is not None and self._setting_key:
+            self._settings.sync()
+            should_close = self._settings.value(self._setting_key, should_close, type=bool)
+        if code == 0 and should_close:
             QTimer.singleShot(1200, self.accept)
 class Window(QMainWindow):
     def __init__(self):
@@ -650,14 +953,34 @@ class Window(QMainWindow):
         self.sidebar.setFixedHeight(5 * 40 + 12)
         self.topic_sidebar.setFixedHeight(len(TOPIC_CATEGORIES) * 40 + 12)
         content=QWidget(); main_splitter.addWidget(content); main_splitter.setStretchFactor(0, 0); main_splitter.setStretchFactor(1, 1); main_splitter.setSizes([280, 1320]); l=QVBoxLayout(content)
-        h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>" + ("Package management: Debian / Flathub" if self.language == "en" else "Paketverwaltung: Debian / Flathub")); self._main_subtitle_label = title; h.addWidget(title)
+        h=QHBoxLayout(); title=QLabel("<span style='font-size:22pt;color:#b99aff;font-weight:bold'>LunaPaket</span><br>" + ("Package management: Debian / Flathub / Snap" if self.language == "en" else "Paketverwaltung: Debian / Flathub / Snap")); self._main_subtitle_label = title; h.addWidget(title)
         h.addSpacing(14)
         self.apt_mode_btn = QPushButton("🐧  APT (Debian)")
         self.flatpak_mode_btn = QPushButton("🧊  Flathub (Flatpak)")
-        self.apt_mode_btn.setCheckable(True); self.flatpak_mode_btn.setCheckable(True)
+        self.snap_mode_btn = QPushButton("🟠  Snap")
+        self.apt_mode_btn.setCheckable(True); self.flatpak_mode_btn.setCheckable(True); self.snap_mode_btn.setCheckable(True)
         self.apt_mode_btn.clicked.connect(lambda: self.set_package_mode("apt"))
         self.flatpak_mode_btn.clicked.connect(lambda: self.set_package_mode("flatpak"))
-        h.addWidget(self.apt_mode_btn); h.addWidget(self.flatpak_mode_btn); h.addStretch()
+        self.snap_mode_btn.clicked.connect(lambda: self.set_package_mode("snap"))
+        h.addWidget(self.apt_mode_btn); h.addWidget(self.flatpak_mode_btn); h.addWidget(self.snap_mode_btn)
+        self.snap_channel_label = QLabel("Snap-Kanal:" if self.language == "de" else "Snap channel:")
+        self.snap_channel_combo = QComboBox()
+        for channel, label_de, label_en in (("latest/stable", "Stable", "Stable"),
+                                             ("latest/candidate", "Candidate", "Candidate"),
+                                             ("latest/beta", "Beta", "Beta"),
+                                             ("latest/edge", "Edge", "Edge")):
+            self.snap_channel_combo.addItem(label_de if self.language == "de" else label_en, channel)
+        saved_channel = str(self.settings.value("snap/channel", "latest/stable"))
+        channel_index = self.snap_channel_combo.findData(saved_channel)
+        self.snap_channel_combo.setCurrentIndex(channel_index if channel_index >= 0 else 0)
+        self.snap_channel_combo.currentIndexChanged.connect(self._snap_channel_changed)
+        # Die Kanalzähler werden erst nach dem Anzeigen des Hauptfensters
+        # im Hintergrund aus den vier Snap-Katalogen gelesen.
+        self._set_snap_channel_labels({})
+        QTimer.singleShot(0, self._update_snap_channel_labels)
+        h.addWidget(self.snap_channel_label); h.addWidget(self.snap_channel_combo)
+        self.snap_channel_label.setVisible(False); self.snap_channel_combo.setVisible(False)
+        h.addStretch()
         self.repo_btn=QPushButton("Paketquellen verwalten")
         self.repo_btn.setToolTip("APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren")
         self.repo_btn.clicked.connect(self.manage_sources)
@@ -667,6 +990,10 @@ class Window(QMainWindow):
         self.flatpak_update_btn.clicked.connect(self.check_flatpak_updates)
         self.flatpak_update_btn.setVisible(False)
         h.addWidget(self.flatpak_update_btn)
+        self.snap_update_btn = QPushButton("Snap-Updates suchen")
+        self.snap_update_btn.clicked.connect(self.check_snap_updates)
+        self.snap_update_btn.setVisible(False)
+        h.addWidget(self.snap_update_btn)
         self.upgrade_btn=QPushButton("System aktualisieren"); self.upgrade_btn.clicked.connect(self.upgrade); h.addWidget(self.upgrade_btn)
         self.security_updates_btn=QPushButton("Sicherheitsupdates verwalten"); self.security_updates_btn.clicked.connect(self.manage_security_updates); h.addWidget(self.security_updates_btn); l.addLayout(h)
         self.security_auto_timer = QTimer(self)
@@ -687,6 +1014,14 @@ class Window(QMainWindow):
         upper_panel = QWidget(); upper_layout = QVBoxLayout(upper_panel)
         upper_layout.setContentsMargins(0, 0, 0, 0)
         self.table=PackageTableView(self); self.table.setHorizontalHeaderLabels(["","Paket","Version","Status","Beschreibung"]); self.table.horizontalHeader().setSortIndicatorShown(True); self.table.horizontalHeader().setStretchLastSection(True); self.table.setColumnWidth(0,34); self.table.setColumnWidth(1,270); self.table.setColumnWidth(2,135); self.table.setColumnWidth(3,145); self.table.setIconSize(QSize(44,44)); self.table.verticalHeader().setDefaultSectionSize(54); self.table.selectionModel().selectionChanged.connect(self.details_for_selected); self.table.itemChanged.connect(self.checkbox_changed); self.table.setContextMenuPolicy(Qt.CustomContextMenu); self.table.customContextMenuRequested.connect(self.package_context_menu); upper_layout.addWidget(self.table, 1)
+        self.table.verticalScrollBar().valueChanged.connect(lambda _value: self._load_visible_apt_icons() if not self.flatpak_mode else None)
+        # Snap-Symbole werden bedarfsgesteuert für sichtbare Tabellenzeilen geladen.
+        self._snap_icon_job = None
+        self._snap_icon_pending = set()
+        self._snap_icon_timer = QTimer(self)
+        self._snap_icon_timer.setInterval(650)
+        self._snap_icon_timer.timeout.connect(self._load_visible_snap_icons)
+        self._snap_icon_timer.start()
         row=QHBoxLayout()
         clear_queue_btn=QPushButton("Vormerkung löschen")
         clear_queue_btn.clicked.connect(self.clear_queue)
@@ -821,9 +1156,12 @@ class Window(QMainWindow):
 
         help_menu.addAction("Über LunaPaket", show_about)
         self.flatpak_mode = False
+        self.snap_mode = False
         self.flatpak_queue = {}
         self.flatpak_catalog = []
         self.flatpak_loading = False
+        self.snap_catalog = []
+        self.snap_loading = False
         self.table.package_model.flatpak_mode = False
         self.set_package_mode("apt", initial=True)
         self.translate_main_window()
@@ -837,6 +1175,33 @@ class Window(QMainWindow):
         self._settings_dir = settings_dir
         self._settings_file = os.path.join(settings_dir, "LunaPaket.conf")
         self._sync_settings_permissions()
+        # Flathub-Katalog nach dem ersten Anzeigen der Oberfläche vorladen.
+        # Der Worker läuft unabhängig von der gerade sichtbaren APT-Ansicht.
+        QTimer.singleShot(1200, self._preload_flatpak_catalog)
+
+    def _preload_flatpak_catalog(self):
+        if self.flatpak_catalog or self.flatpak_loading or not shutil.which("flatpak"):
+            return
+        self.load_flatpak_catalog(preload=True)
+
+    def _bind_auto_close_preference(self, checkbox, setting_key=None, default=True):
+        """Persist the close-after-success choice across every action dialog."""
+        key = "progress/auto_close_after_success"
+        if not self.settings.contains(key):
+            legacy_keys = (
+                "snap/auto_close_updates", "snap/auto_close_queued_actions",
+                "apt/auto_close_package_actions", "apt/auto_close_system_updates",
+                "apt/auto_close_security_install", "apt/auto_close_repository_check",
+            )
+            legacy_values = [self.settings.value(old_key, type=bool) for old_key in legacy_keys
+                             if self.settings.contains(old_key)]
+            self.settings.setValue(key, all(legacy_values) if legacy_values else default)
+            self.settings.sync()
+        checkbox.setChecked(self.settings.value(key, default, type=bool))
+        checkbox.toggled.connect(
+            lambda checked: (self.settings.setValue(key, bool(checked)), self.settings.sync())
+        )
+        return checkbox
 
     def apply_theme(self):
         if self.theme == "light":
@@ -1033,7 +1398,9 @@ class Window(QMainWindow):
             self.update_btn.setVisible(apt_visible)
             self.upgrade_btn.setVisible(apt_visible)
             self.security_updates_btn.setVisible(apt_visible)
-            self.flatpak_update_btn.setVisible(self.flatpak_mode)
+            self.flatpak_update_btn.setVisible(self.flatpak_mode and not getattr(self, "snap_mode", False))
+            if hasattr(self, "snap_update_btn"):
+                self.snap_update_btn.setVisible(getattr(self, "snap_mode", False))
 
     def _sync_settings_permissions(self):
         # Settings belong to the logged-in desktop user even when the GUI
@@ -1167,6 +1534,23 @@ class Window(QMainWindow):
         flathub_catalog_row = QHBoxLayout()
         flathub_catalog_row.addWidget(flathub_catalog_label)
         flathub_catalog_row.addWidget(flathub_catalog_retention, 1)
+        snap_catalog_label = QLabel()
+        snap_catalog_retention = QComboBox()
+        for label, days in (
+            (("1 day" if self.language == "en" else "1 Tag"), 1),
+            (("3 days" if self.language == "en" else "3 Tage"), 3),
+            (("7 days" if self.language == "en" else "7 Tage"), 7),
+            (("14 days" if self.language == "en" else "14 Tage"), 14),
+            (("30 days" if self.language == "en" else "30 Tage"), 30),
+            (("Never expire" if self.language == "en" else "Nie automatisch löschen"), 0),
+        ):
+            snap_catalog_retention.addItem(label, days)
+        snap_days = int(self.settings.value("cache/snap_catalog_retention_days", 7))
+        snap_index = snap_catalog_retention.findData(snap_days)
+        snap_catalog_retention.setCurrentIndex(snap_index if snap_index >= 0 else 2)
+        snap_catalog_row = QHBoxLayout()
+        snap_catalog_row.addWidget(snap_catalog_label)
+        snap_catalog_row.addWidget(snap_catalog_retention, 1)
         delete_catalog = QPushButton()
         refresh_catalog = QPushButton()
         def update_settings_language():
@@ -1179,12 +1563,15 @@ class Window(QMainWindow):
             flathub_catalog_label.setText(
                 "Keep Flathub application list:" if english else "Flathub-Anwendungsliste speichern für:"
             )
+            snap_catalog_label.setText("Keep Snap application catalog:" if english else "Snap-Anwendungskatalog speichern für:")
             retention_labels = (
                 ["1 day", "3 days", "7 days", "14 days", "30 days", "Never expire"]
                 if english else ["1 Tag", "3 Tage", "7 Tage", "14 Tage", "30 Tage", "Nie automatisch löschen"]
             )
             for item_index, item_label in enumerate(retention_labels):
                 catalog_retention.setItemText(item_index, item_label)
+                flathub_catalog_retention.setItemText(item_index, item_label)
+                snap_catalog_retention.setItemText(item_index, item_label)
             delete_catalog.setText("Delete saved APT catalog" if english else "Gespeicherten APT-Katalog löschen")
             refresh_catalog.setText("Refresh APT AppStream catalog now" if english else "APT-AppStream-Katalog jetzt aktualisieren")
             buttons.button(QDialogButtonBox.Close).setText("Close" if english else "Schließen")
@@ -1194,6 +1581,7 @@ class Window(QMainWindow):
         layout.addWidget(cache)
         layout.addLayout(catalog_row)
         layout.addLayout(flathub_catalog_row)
+        layout.addLayout(snap_catalog_row)
         layout.addWidget(refresh_catalog)
         layout.addWidget(delete_catalog)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -1209,10 +1597,15 @@ class Window(QMainWindow):
             # Modeabhängige Schaltflächen und Beschriftungen sofort neu setzen.
             # Dadurch hängt die Sichtbarkeit nicht davon ab, ob die Anwendung
             # nach einem Sprachwechsel neu gestartet wurde.
-            self.set_package_mode("flatpak" if self.flatpak_mode else "apt")
+            self.set_package_mode("snap" if self.snap_mode else ("flatpak" if self.flatpak_mode else "apt"))
             self.translate_main_window()
             self._populate_topic_sidebar()
-            if self.flatpak_mode and self.flatpak_catalog:
+            if self.snap_mode and self.snap_catalog:
+                selected_app = self.selected_flatpak_id()
+                self.apply_table_filters()
+                if selected_app:
+                    self.show_snap_details(selected_app)
+            elif self.flatpak_mode and self.flatpak_catalog:
                 selected_app = self.selected_flatpak_id()
                 self.apply_table_filters()
                 if selected_app:
@@ -1241,6 +1634,10 @@ class Window(QMainWindow):
             value = int(flathub_catalog_retention.currentData())
             self.settings.setValue("cache/flathub_catalog_retention_days", value)
         flathub_catalog_retention.currentIndexChanged.connect(flathub_retention_changed)
+        def snap_retention_changed(index):
+            value = int(snap_catalog_retention.currentData())
+            self.settings.setValue("cache/snap_catalog_retention_days", value)
+        snap_catalog_retention.currentIndexChanged.connect(snap_retention_changed)
         def delete_saved_catalog():
             english = self.language == "en"
             title = "Delete APT image catalog" if english else "APT-Bilderkatalog löschen"
@@ -1260,7 +1657,7 @@ class Window(QMainWindow):
             cache_root = Path.home() / ".cache" / "LunaPaket"
             removed = 0
             try:
-                for pattern in ("apt-appstream-index-*.json", "flathub_catalog.json"):
+                for pattern in ("apt-appstream-index-*.json", "flathub_catalog.json", "snap_catalog.json", "snapupdates_catalog.json", "snap_catalog.sqlite3", "snap_catalog.sqlite3-wal", "snap_catalog.sqlite3-shm"):
                     for item in cache_root.glob(pattern):
                         try:
                             item.unlink()
@@ -1343,11 +1740,16 @@ class Window(QMainWindow):
         dlg.exec()
 
     def closeEvent(self, event):
-        # QThreads müssen vor dem Zerstören des Fensters fertig sein.
-        # Netzwerk-Bildabrufe haben ein begrenztes Timeout.
-        for job in list(FunctionJob._live_jobs):
-            if job.isRunning():
-                job.wait(15000)
+        # Lange Snap-Katalogimporte laufen unabhängig vom GUI-Thread. Beim
+        # Schließen werden sie kooperativ gestoppt; der bis dahin importierte
+        # Stand ist nach jeder Seite bereits atomar gespeichert.
+        running_jobs = [job for job in list(FunctionJob._live_jobs) if job.isRunning()]
+        for job in running_jobs:
+            job.requestInterruption()
+        # Netzwerkzugriffe besitzen kurze Timeouts. Nicht endlos auf einen
+        # kompletten Katalogimport warten, sondern nur den aktuellen Request.
+        for job in running_jobs:
+            job.wait(14000)
         if self.remember_window_enabled:
             self.settings.setValue("window/geometry", self.saveGeometry())
         if hasattr(self, "work_splitter"):
@@ -1365,20 +1767,69 @@ class Window(QMainWindow):
         self.topic_sidebar.setCurrentRow(-1)
         self.topic_sidebar.blockSignals(False)
 
+    def _set_snap_channel_labels(self, counts):
+        """Aktualisiert die vier Kanalbeschriftungen ausschließlich im GUI-Thread."""
+        labels = {"latest/stable": "Stable", "latest/candidate": "Candidate",
+                  "latest/beta": "Beta", "latest/edge": "Edge"}
+        for index in range(self.snap_channel_combo.count()):
+            channel = str(self.snap_channel_combo.itemData(index) or "latest/stable")
+            count = counts.get(channel)
+            count_text = str(count) if count else "—"
+            self.snap_channel_combo.setItemText(index, f"{labels.get(channel, channel)} ({count_text})")
+
+    def _update_snap_channel_labels(self):
+        """Liest die vier Snap-Kataloge asynchron, ohne den Programmstart auszubremsen."""
+        if not hasattr(self, "snap_channel_combo"):
+            return
+        job = getattr(self, "_snap_channel_labels_job", None)
+        if job is not None and job.isRunning():
+            return
+        channels = ("latest/stable", "latest/candidate", "latest/beta", "latest/edge")
+        architecture = _native_debian_architecture()
+
+        def read_counts():
+            return {
+                channel: len(_snap_cache_read(_snap_catalog_id(channel, architecture)))
+                for channel in channels
+            }
+
+        job = FunctionJob(read_counts)
+        self._snap_channel_labels_job = job
+        job.result.connect(self._set_snap_channel_labels)
+        job.start()
+
+    def _snap_channel_changed(self, _index):
+        """Speichert den Snap-Kanal und lädt den sichtbaren Snap-Katalog neu."""
+        channel = str(self.snap_channel_combo.currentData() or "latest/stable")
+        self.settings.setValue("snap/channel", channel)
+        if getattr(self, "snap_mode", False):
+            self.load_snap_catalog()
+
     def set_package_mode(self, mode, initial=False):
-        """Schaltet zwischen dem unveränderten APT-Katalog und Flathub um."""
-        flatpak = mode == "flatpak"
+        """Schaltet zwischen APT, Flathub und Snap um."""
+        flatpak = mode in ("flatpak", "snap")
+        snap = mode == "snap"
         self.flatpak_mode = flatpak
+        self.snap_mode = snap
         self.table.package_model.flatpak_mode = flatpak
-        self.table.setIconSize(QSize(44, 44) if flatpak else QSize(16, 16))
-        self.table.verticalHeader().setDefaultSectionSize(54 if flatpak else 30)
+        # Einheitliche große Programmsymbole für APT, Flathub und Snap.
+        self.table.setIconSize(QSize(44,44))
+        self.table.verticalHeader().setDefaultSectionSize(54)
         self.apt_mode_btn.setChecked(not flatpak)
-        self.flatpak_mode_btn.setChecked(flatpak)
+        self.flatpak_mode_btn.setChecked(mode == "flatpak")
+        self.snap_mode_btn.setChecked(snap)
         for widget in [self.repo_btn, self.update_btn]:
             widget.setVisible(not flatpak)
-        self.flatpak_update_btn.setVisible(flatpak)
+        self.flatpak_update_btn.setVisible(mode == "flatpak")
+        self.snap_update_btn.setVisible(snap)
+        self.snap_channel_label.setVisible(snap)
+        self.snap_channel_combo.setVisible(snap)
         self.flatpak_update_btn.setText("Check for Flathub updates" if self.language == "en" else "Flathub-Updates suchen")
-        # System- und Sicherheitsupdates bleiben ausschließlich APT-Funktionen.
+        self.snap_update_btn.setText("Check for Snap updates" if self.language == "en" else "Snap-Updates suchen")
+        self._main_subtitle_label.setText(
+            "Package management: Debian / Flathub / Snap" if self.language == "en"
+            else "Paketverwaltung: Debian / Flathub / Snap"
+        )
         self.upgrade_btn.setVisible(not flatpak)
         self.security_updates_btn.setVisible(not flatpak)
         for widget in self.apt_queue_widgets:
@@ -1396,74 +1847,79 @@ class Window(QMainWindow):
         if flatpak:
             self.sidebar.blockSignals(True)
             self.sidebar.clear()
-            self.sidebar.addItems(
-                ["All applications", "Installed", "Not installed", "Cleanup"] if self.language == "en"
-                else ["Alle Anwendungen", "Installiert", "Nicht installiert", "Aufräumen"])
+            if snap:
+                self.sidebar.addItems(
+                    ["All applications", "Installed", "Not installed", "Clean up Snap"] if self.language == "en"
+                    else ["Alle Anwendungen", "Installiert", "Nicht installiert", "Snap aufräumen"]
+                )
+            else:
+                self.sidebar.addItems(["All applications", "Installed", "Not installed", "Cleanup"] if self.language == "en"
+                                      else ["Alle Anwendungen", "Installiert", "Nicht installiert", "Aufräumen"])
             self.sidebar.setCurrentRow(0)
             self.sidebar.blockSignals(False)
-            self.search.setPlaceholderText(
-                "Search Flathub applications …" if self.language == "en"
-                else "Flathub-Anwendungen suchen …")
-            self.filter.setVisible(False)
-            self.details_title.setText("Application details" if self.language == "en" else "Anwendungsdetails")
-            self.details.setPlainText(
-                "Select an application from the list. App information will appear here."
-                if self.language == "en" else
-                "Wähle eine Anwendung aus der Liste aus. Die App-Informationen erscheinen hier.")
-            self.clear_flatpak_gallery()
-            self.flatpak_gallery_layout.addWidget(QLabel(
-                "App images appear here when Flathub provides screenshots."
-                if self.language == "en" else
-                "App-Bilder erscheinen hier, sofern Flathub Screenshots bereitstellt."))
-            if self.flatpak_catalog:
-                self.apply_table_filters()
+            if snap:
+                self.search.setPlaceholderText("Search Snap applications …" if self.language == "en" else "Snap-Anwendungen suchen …")
+                self.details_title.setText("Snap application details" if self.language == "en" else "Snap-Anwendungsdetails")
+                self.details.setPlainText("Select a Snap to view its details." if self.language == "en" else "Wähle einen Snap aus, um seine Details anzuzeigen.")
+                self.clear_flatpak_gallery()
+                self.flatpak_gallery_layout.addWidget(QLabel(
+                    "Snap command-line metadata does not provide screenshots." if self.language == "en"
+                    else "Die Snap-Kommandozeile stellt keine Anwendungs-Screenshots bereit."))
+                if not initial:
+                    self.load_snap_catalog()
+                elif self.snap_catalog:
+                    self.apply_table_filters()
             else:
-                self.load_flatpak_catalog()
+                self.search.setPlaceholderText("Search Flathub applications …" if self.language == "en" else "Flathub-Anwendungen suchen …")
+                self.filter.setVisible(False)
+                self.details_title.setText("Application details" if self.language == "en" else "Anwendungsdetails")
+                self.details.setPlainText("Select an application from the list. App information will appear here." if self.language == "en" else "Wähle eine Anwendung aus der Liste aus. Die App-Informationen erscheinen hier.")
+                self.clear_flatpak_gallery()
+                self.flatpak_gallery_layout.addWidget(QLabel("App images appear here when Flathub provides screenshots." if self.language == "en" else "App-Bilder erscheinen hier, sofern Flathub Screenshots bereitstellt."))
+                if self.flatpak_catalog:
+                    self.apply_table_filters()
+                else:
+                    self.load_flatpak_catalog()
+            self.filter.setVisible(False)
         else:
             self.clear_flatpak_gallery()
-            self.flatpak_gallery_layout.addWidget(QLabel(
-                "Select an APT package to view available screenshots."
-                if self.language == "en" else
-                "Wähle ein APT-Paket aus, um verfügbare Screenshots anzuzeigen."))
+            self.flatpak_gallery_layout.addWidget(QLabel("Select an APT package to view available screenshots." if self.language == "en" else "Wähle ein APT-Paket aus, um verfügbare Screenshots anzuzeigen."))
             self.details_title.setText("Package details" if self.language == "en" else "Paketdetails")
-            self.topic_sidebar.blockSignals(True)
-            self.topic_sidebar.setCurrentRow(-1)
-            self.topic_sidebar.blockSignals(False)
-            self.sidebar.blockSignals(True)
-            self.sidebar.clear()
-            self.sidebar.addItems(
-                ["All packages", "Installed", "Not installed", "Cleanup", "Queued"] if self.language == "en"
-                else ["Alle Pakete", "Installiert", "Nicht installiert", "Aufräumen", "Vorgemerkt"])
-            self.sidebar.setCurrentRow(0)
-            self.sidebar.blockSignals(False)
+            self.topic_sidebar.blockSignals(True); self.topic_sidebar.setCurrentRow(-1); self.topic_sidebar.blockSignals(False)
+            self.sidebar.blockSignals(True); self.sidebar.clear()
+            self.sidebar.addItems(["All packages", "Installed", "Not installed", "Cleanup", "Queued"] if self.language == "en" else ["Alle Pakete", "Installiert", "Nicht installiert", "Aufräumen", "Vorgemerkt"])
+            self.sidebar.setCurrentRow(0); self.sidebar.blockSignals(False)
             self.filter.setVisible(True)
-            self.search.setPlaceholderText(
-                "Search packages …" if self.language == "en" else "Pakete suchen …")
-            if (self.catalog_cache is not None and self._table_catalog_ready
-                    and self._table_mode == "apt"):
+            self.search.setPlaceholderText("Search packages …" if self.language == "en" else "Pakete suchen …")
+            if self.catalog_cache is not None and self._table_catalog_ready and self._table_mode == "apt":
                 self.apply_table_filters()
             elif self.catalog_cache is not None:
-                # Der APT-Katalog kann fertig geworden sein, während Flathub
-                # aktiv war. Beim Zurückwechseln die gespeicherten Daten anzeigen.
                 self.rows(self.catalog_cache["rows"])
             elif not initial:
                 self.search_pkgs()
         self.update_queue_label()
-        if flatpak:
-            # Beim erneuten Wechsel zu Flathub ist der Katalog häufig bereits
-            # vollständig geladen. Dann darf der Status nicht wieder auf
-            # „Loading“ zurückgesetzt werden.
-            if self.flatpak_catalog:
-                count = len(self.flatpak_catalog)
-                self.status.setText(
-                    f"{count} Flatpak applications found · Flathub" if self.language == "en"
-                    else f"{count} Flatpak-Anwendungen gefunden · Flathub")
+        if snap:
+            if not shutil.which("snap"):
+                self.status.setText("snapd ist nicht installiert. Bitte zuerst snapd installieren." if self.language == "de" else "snapd is not installed. Install snapd first.")
+            elif self.snap_catalog:
+                self.status.setText((f"{len(self.snap_catalog)} Snap applications loaded" if self.language == "en" else f"{len(self.snap_catalog)} Snap-Anwendungen geladen"))
             else:
-                self.status.setText(
-                    "Loading Flathub catalog …" if self.language == "en"
-                    else "Flathub wird geladen …")
+                self.status.setText("Loading Snap catalog …" if self.language == "en" else "Snap-Katalog wird geladen …")
+        elif mode == "flatpak":
+            if self.flatpak_catalog:
+                count=len(self.flatpak_catalog)
+                self.status.setText(f"{count} Flatpak applications found · Flathub" if self.language == "en" else f"{count} Flatpak-Anwendungen gefunden · Flathub")
+            else:
+                self.status.setText("Loading Flathub catalog …" if self.language == "en" else "Flathub wird geladen …")
         else:
-            self.status.setText("APT mode active" if self.language == "en" else "APT-Modus aktiv")
+            if self.catalog_cache is not None:
+                apt_count = len(self.catalog_cache.get("rows", []))
+                self.status.setText(
+                    f"{apt_count:,} packages loaded" if self.language == "en"
+                    else f"{apt_count:,} APT-Pakete vollständig geladen"
+                )
+            else:
+                self.status.setText("APT mode active" if self.language == "en" else "APT-Modus aktiv")
 
     @staticmethod
     def _flatpak_icon_path(app_id):
@@ -1625,6 +2081,1212 @@ class Window(QMainWindow):
         return index
 
     @staticmethod
+    def _snap_icon_path(snap_name):
+        roots = [Path("/snap") / snap_name / "current" / "meta" / "gui",
+                 Path("/var/lib/snapd/snap") / snap_name]
+        for root in roots:
+            try:
+                patterns = ("icon.png", "*.png", "*.svg", "*/meta/gui/icon.png", "*/meta/gui/*.png", "*/meta/gui/*.svg")
+                for pattern in patterns:
+                    found = next(root.glob(pattern), None)
+                    if found and found.is_file():
+                        return str(found)
+            except OSError:
+                pass
+        return ""
+
+    @staticmethod
+    def _snapd_store_find(search_term="", section=""):
+        """Liest Store-Ergebnisse über die lokale, öffentliche snapd-REST-Schnittstelle.
+
+        snapd liefert bei /v2/find neben den Suchtreffern auch die offiziellen
+        Store-Mediendaten (Icon und Screenshots). Dafür ist kein Store-Login nötig.
+        """
+        socket_path = "/run/snapd.socket"
+        if not os.path.exists(socket_path):
+            return []
+
+        class _SnapdUnixConnection(http.client.HTTPConnection):
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(8)
+                self.sock.connect(socket_path)
+
+        params = {}
+        if search_term:
+            params["q"] = search_term
+        if section:
+            params["section"] = section
+        if not params:
+            return []
+        path = "/v2/find?" + urllib.parse.urlencode(params)
+        connection = _SnapdUnixConnection("localhost", timeout=8)
+        try:
+            connection.request("GET", path, headers={"Accept": "application/json"})
+            response = connection.getresponse()
+            raw = response.read(16 * 1024 * 1024)
+            if response.status != 200:
+                return []
+            payload = json.loads(raw.decode("utf-8"))
+            records = payload.get("result", []) if isinstance(payload, dict) else []
+            return records if isinstance(records, list) else []
+        except Exception:
+            return []
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _snapd_store_sections():
+        """Liefert die vom lokalen snapd gemeldeten Store-Sections."""
+        socket_path = "/run/snapd.socket"
+        if not os.path.exists(socket_path):
+            return []
+        class _SnapdUnixConnection(http.client.HTTPConnection):
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.settimeout(15)
+                self.sock.connect(socket_path)
+        connection = _SnapdUnixConnection("localhost", timeout=15)
+        try:
+            connection.request("GET", "/v2/sections", headers={"Accept": "application/json"})
+            response = connection.getresponse()
+            if response.status != 200:
+                return []
+            payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+            result = payload.get("result", []) if isinstance(payload, dict) else []
+            values = []
+            for entry in result if isinstance(result, list) else []:
+                value = entry.get("name") if isinstance(entry, dict) else entry
+                value = str(value or "").strip()
+                if value and re.fullmatch(r"[a-z0-9-]+", value):
+                    values.append(value)
+            return list(dict.fromkeys(values))
+        except Exception:
+            return []
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _snap_media_fields(item):
+        """Normalisiert Icon- und Screenshot-Medien aus snapd/Store-Antworten."""
+        icon_url = item.get("icon") or item.get("icon_url") or item.get("iconUrl") or ""
+        if isinstance(icon_url, dict):
+            icon_url = icon_url.get("url") or icon_url.get("src") or ""
+        screenshots = []
+        media = item.get("media") or item.get("screenshots") or []
+        if isinstance(media, dict):
+            media = media.get("items") or media.get("media") or media.get("screenshots") or []
+        if isinstance(media, list):
+            for entry in media:
+                if not isinstance(entry, dict):
+                    continue
+                kind = str(entry.get("type") or entry.get("kind") or "").lower()
+                media_url = str(entry.get("url") or entry.get("src") or entry.get("uri") or "")
+                if not media_url:
+                    continue
+                if kind in ("icon", "package-icon", "app-icon") and not icon_url:
+                    icon_url = media_url
+                elif kind in ("screenshot", "screenshot-small", "screenshot-large"):
+                    screenshots.append((media_url, str(entry.get("caption") or entry.get("description") or "")))
+        return str(icon_url or ""), screenshots
+
+    @staticmethod
+    def _snap_import_cancelled():
+        try:
+            thread = QThread.currentThread()
+            return bool(thread and thread.isInterruptionRequested())
+        except Exception:
+            return False
+
+    @staticmethod
+    def collect_snapupdates_catalog(retention_days=1):
+        """Importiert den öffentlichen, paginierten SnapUpdates-Katalog.
+
+        SnapUpdates ist ein unabhängiges Community-Projekt. Es wird nur dessen
+        öffentlich sichtbarer, serverseitig gerenderter Katalog gelesen; Aktionen
+        und Installationsstatus bleiben ausschließlich bei snapd.
+        """
+        cached = _snap_cache_read("snapupdates")
+        # Auch ein teilweise importierter Katalog wird für sechs Stunden genutzt.
+        cache_age = _snap_cache_age_hours("snapupdates")
+        if cached and cache_age is not None and cache_age < min(6, max(1, retention_days)):
+            return cached
+
+        base="https://snapupdates.popey.com"
+        headers={"User-Agent":"LunaPaket/0.1.42 (Snap catalogue; read-only)",
+                 "Accept":"text/html,application/xhtml+xml"}
+        def fetch(url):
+            request=urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=8) as response:
+                if response.status != 200:
+                    raise RuntimeError("HTTP " + str(response.status))
+                data=response.read(3*1024*1024)
+            return data.decode("utf-8", "replace")
+
+        existing={}
+        for row in cached:
+            if isinstance(row, list) and len(row)>=8 and row[0]:
+                existing[str(row[0])]=row
+        categories=[]
+        try:
+            parser=_SnapUpdatesHTMLParser(); parser.feed(fetch(base+"/categories"))
+            for link in parser.links:
+                href=link.get("href", "")
+                match=re.fullmatch(r"/categories/([a-z0-9-]+)", href)
+                if match:
+                    slug=match.group(1)
+                    if slug not in {"categories"}:
+                        categories.append(slug)
+        except Exception:
+            categories=[]
+        if not categories:
+            categories=["utilities","games","productivity","development","server","education",
+                        "photo-video","security","devices","music-audio","social","entertainment",
+                        "science","finance","art-design","books-reference","personalisation",
+                        "health-fitness","news-weather","featured"]
+        categories=list(dict.fromkeys(categories))
+        pages_done=0
+        # Jede Kategorie ist paginiert. Die Seiten werden bewusst sequenziell
+        # abgerufen, damit der Raspberry Pi und der Community-Dienst nicht überlastet werden.
+        for category in categories:
+            if Window._snap_import_cancelled():
+                break
+            first_url=base+"/categories/"+category
+            try:
+                first_html=fetch(first_url)
+            except Exception:
+                continue
+            first_parser=_SnapUpdatesHTMLParser(); first_parser.feed(first_html)
+            page_count=min(max(1, first_parser.max_page), 80)
+            page_htmls=[(1, first_parser)]
+            for page_no in range(2, page_count+1):
+                if Window._snap_import_cancelled():
+                    break
+                try:
+                    parser=_SnapUpdatesHTMLParser()
+                    parser.feed(fetch(first_url+"?page="+str(page_no)))
+                    if not any(re.fullmatch(r"/snap/[a-z0-9][a-z0-9-]{0,39}", x.get("href", "")) for x in parser.links):
+                        break
+                    page_htmls.append((page_no, parser)); pages_done+=1
+                    time.sleep(0.15)
+                except Exception:
+                    break
+            for page_no, parser in page_htmls:
+                if Window._snap_import_cancelled():
+                    break
+                for link in parser.links:
+                    match=re.fullmatch(r"/snap/([a-z0-9][a-z0-9-]{0,39})", link.get("href", ""))
+                    if not match:
+                        continue
+                    name=match.group(1)
+                    title=link.get("text") or name
+                    prior=existing.get(name)
+                    if prior:
+                        row=list(prior)
+                        meta=row[7] if isinstance(row[7], dict) else {}
+                    else:
+                        row=[name, "", "Nicht installiert", title, "snap", "", title, {}]
+                        meta={}
+                    meta=dict(meta)
+                    cats=list(meta.get("snapupdates_categories", []))
+                    if category not in cats: cats.append(category)
+                    meta["snapupdates_categories"]=cats
+                    meta["snapupdates_title"]=title
+                    if link.get("image") and not meta.get("icon_url"):
+                        meta["icon_url"]=link["image"]
+                    if not row[3] or row[3] == name:
+                        row[3]=title
+                    row[7]=meta
+                    existing[name]=row
+                # Jede Seite sofort atomar sichern. Ein Abbruch durch Schließen
+                # verliert damit höchstens den gerade laufenden HTTP-Aufruf.
+                _snap_cache_write("snapupdates", list(existing.values()))
+            # Nach jeder Kategorie ebenfalls den Importstand sichern.
+            _snap_cache_write("snapupdates", list(existing.values()))
+        rows=list(existing.values())
+        if rows:
+            _snap_cache_write("snapupdates", rows)
+        return rows
+
+    @staticmethod
+    def _snap_channel_release(name, channel, architecture):
+        """Lädt die channel-map eines Snaps genau einmal; alle Channels sind enthalten."""
+        try:
+            url = "https://api.snapcraft.io/v2/snaps/info/" + urllib.parse.quote(str(name), safe="")
+            request = urllib.request.Request(url, headers={
+                "Accept": "application/json", "Snap-Device-Series": "16",
+                "Snap-Device-Architecture": str(architecture),
+                "User-Agent": "LunaPaket/0.1.42"
+            })
+            with urllib.request.urlopen(request, timeout=12) as response:
+                payload = json.loads(response.read(8 * 1024 * 1024).decode("utf-8"))
+            channel_map = payload.get("channel-map", []) if isinstance(payload, dict) else []
+            return True, channel_map if isinstance(channel_map, list) else []
+        except Exception:
+            return False, []
+
+    @staticmethod
+    def _snap_release_from_map(channel_map, channel, architecture):
+        wanted_track, wanted_risk = str(channel or "latest/stable").split("/", 1)
+        for entry in channel_map if isinstance(channel_map, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            channel_data = entry.get("channel") or {}
+            if not isinstance(channel_data, dict):
+                continue
+            track = str(channel_data.get("track") or "latest").lower()
+            risk = str(channel_data.get("risk") or channel_data.get("name") or "").lower()
+            entry_arch = str(channel_data.get("architecture") or "").lower()
+            if track == wanted_track and risk == wanted_risk and entry_arch == str(architecture).lower():
+                version = str(entry.get("version") or entry.get("revision") or "")
+                revision = str(entry.get("revision") or "")
+                return version, revision
+        return "", ""
+
+    @staticmethod
+    def _snap_rows_for_channel(rows, channel, architecture, allow_network=True):
+        """Leitet einen Channel aus dem Master-Katalog ab; Netzwerk nur beim echten Neuaufbau."""
+        unique = {}
+        for row in rows:
+            if isinstance(row, (list, tuple)) and len(row) >= 8 and row[0]:
+                unique[str(row[0])] = list(row)
+        if not unique:
+            return [], 0, 0
+        verified = {}
+        failures = 0
+        pending = {}
+        for name, row in unique.items():
+            meta = dict(row[7]) if isinstance(row[7], dict) else {}
+            channel_map = meta.get("snap_channel_map")
+            if isinstance(channel_map, list):
+                version, revision = Window._snap_release_from_map(channel_map, channel, architecture)
+                if version:
+                    meta.update({"selected_channel": channel, "channel_version_verified": True,
+                                 "channel_architecture": architecture, "channel_revision": revision})
+                    row[1] = version; row[7] = meta; verified[name] = row
+            elif allow_network:
+                # Fehlgeschlagene Channel-Abfragen werden sechs Stunden lang
+                # nicht erneut gestartet. Der Zeitstempel liegt im Master-Cache.
+                retry_after = meta.get("snap_channel_retry_after", {})
+                retry_at = float(retry_after.get(channel, 0) or 0) if isinstance(retry_after, dict) else 0
+                if retry_at <= time.time():
+                    pending[name] = row
+        if pending and allow_network:
+            # Snapcraft wird bewusst stark begrenzt: höchstens zwei Requests
+            # gleichzeitig statt zwölf.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {pool.submit(Window._snap_channel_release, name, channel, architecture): name
+                           for name in pending}
+                for future in as_completed(futures):
+                    if Window._snap_import_cancelled():
+                        break
+                    name = futures[future]
+                    try:
+                        ok, channel_map = future.result()
+                    except Exception:
+                        ok, channel_map = False, []
+                    row = pending[name]
+                    meta = dict(row[7]) if isinstance(row[7], dict) else {}
+                    if not ok:
+                        failures += 1
+                        retry_after = dict(meta.get("snap_channel_retry_after", {}))
+                        retry_after[channel] = int(time.time()) + 6 * 3600
+                        meta["snap_channel_retry_after"] = retry_after
+                        row[7] = meta
+                        continue
+                    # Vollständige channel-map speichern: Stable/Candidate/Beta/Edge
+                    # können danach ohne erneuten Store-Download gefiltert werden.
+                    meta["snap_channel_map"] = channel_map
+                    retry_after = dict(meta.get("snap_channel_retry_after", {}))
+                    retry_after.pop(channel, None)
+                    meta["snap_channel_retry_after"] = retry_after
+                    version, revision = Window._snap_release_from_map(channel_map, channel, architecture)
+                    if version:
+                        row[1] = version
+                        meta.update({"selected_channel": channel, "channel_version_verified": True,
+                                     "channel_architecture": architecture, "channel_revision": revision})
+                        row[7] = meta; verified[name] = row
+                    else:
+                        row[7] = meta
+        return sorted(verified.values(), key=lambda row: str(row[0]).casefold()), len(unique), failures, sorted(unique.values(), key=lambda row: str(row[0]).casefold())
+
+    @staticmethod
+    def collect_snap_catalog(search_term="", section="featured", retention_days=7, channel="latest/stable"):
+        """Lädt Snap-Store-Metadaten, verwendet einen dauerhaften Offline-Cache
+        und ergänzt ihn mit dem lokalen snapd-Bestand. Store-Suche bleibt read-only;
+        Installationen laufen weiterhin ausschließlich über snapd.
+        """
+        if not shutil.which("snap"):
+            raise RuntimeError("snapd ist nicht installiert. Installiere zuerst das Debian-Paket snapd.")
+
+        def query(args, timeout=20):
+            if Window._snap_import_cancelled():
+                return 130, "Snap-Katalogimport wurde beim Beenden angehalten."
+            try:
+                proc = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL, timeout=min(timeout, 20))
+                return proc.returncode, proc.stdout
+            except subprocess.TimeoutExpired:
+                return 124, "Snap-Abfrage hat zu lange gedauert."
+            except Exception as exc:
+                return 1, str(exc)
+
+        if Window._snap_import_cancelled():
+            return []
+        rc, installed_output = query(["snap", "list"], 12)
+        if rc != 0:
+            raise RuntimeError("snapd ist nicht erreichbar: " + installed_output.strip())
+        installed = {}
+        excluded = {"snapd", "core", "core16", "core18", "core20", "core22", "core24", "bare", "gtk-common-themes"}
+        table_started = False
+        for line in installed_output.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            # snapd kann vor der eigentlichen Tabelle Warnungen ausgeben
+            # (z.B. "WARNING: There is ..."). Diese Zeilen sind keine Snaps.
+            if fields[0].lower() == "name" and len(fields) >= 3 and fields[1].lower() == "version":
+                table_started = True
+                continue
+            if not table_started or len(fields) < 2:
+                continue
+            name = fields[0]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+                continue
+            if name not in excluded and not name.startswith(("gnome-", "mesa-")):
+                installed[name] = fields[1]
+
+        term = search_term.strip()
+        selected_channel = str(channel or "latest/stable")
+        native_arch = _native_debian_architecture()
+        catalog_id = _snap_catalog_id(selected_channel, native_arch)
+        cache_rows = [tuple(x) for x in _snap_cache_read(catalog_id) if isinstance(x, (list, tuple)) and len(x) >= 8]
+        master_id = "store-master-" + native_arch
+        # Der gemeinsame Master-Katalog wird auch im Suchpfad benötigt, um
+        # bereits bekannte Channel-Metadaten zu ergänzen. Deshalb vor jeder
+        # Verzweigung initialisieren (nicht erst im Katalogpfad ohne Suchbegriff).
+        master_rows = [list(x) for x in _snap_cache_read(master_id) if isinstance(x, (list, tuple)) and len(x) >= 8]
+
+        # Schneller Suchpfad: Suchtreffer separat je Begriff/Channel/Architektur
+        # cachen. Die Suche verwendet genau eine native snapd-Abfrage; Store-API,
+        # doppelte Abfrage, Channel-Info-Downloads und Icon-Downloads blockieren
+        # die Ergebnisanzeige nicht.
+        if term:
+            search_key = hashlib.sha256((term.casefold() + "\0" + selected_channel + "\0" + native_arch).encode("utf-8")).hexdigest()[:24]
+            search_catalog_id = "store-search-" + search_key
+            search_cache_age = _snap_cache_age_hours(search_catalog_id)
+            search_cache_rows = _snap_cache_read(search_catalog_id)
+            if search_cache_rows and search_cache_age is not None and search_cache_age < 6:
+                refreshed = []
+                for cached_row in search_cache_rows:
+                    row = list(cached_row)
+                    if len(row) >= 8:
+                        row[2] = "Installiert" if row[0] in installed else "Nicht installiert"
+                        if row[5] and not Path(str(row[5])).is_file():
+                            row[5] = ""
+                        refreshed.append(tuple(row))
+                return refreshed
+
+            # /v2/find wird von snapd bereits auf die Gerätearchitektur begrenzt
+            # und liefert Icon-URLs. Bilder werden erst nach Anzeige der Treffer
+            # über den vorhandenen sichtbaren Icon-Lader nachgeladen.
+            native_records = Window._snapd_store_find(search_term=term)
+            search_rows = {}
+            for item in native_records:
+                if Window._snap_import_cancelled() or not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+                    continue
+                icon_url, screenshots = Window._snap_media_fields(item)
+                publisher_obj = item.get("publisher") or {}
+                publisher = (publisher_obj.get("display-name") or publisher_obj.get("username") or "") if isinstance(publisher_obj, dict) else str(publisher_obj)
+                summary = str(item.get("summary") or item.get("description") or name)
+                prior = next((r for r in master_rows if str(r[0]) == name), None)
+                meta = dict(prior[7]) if prior and isinstance(prior[7], dict) else {}
+                meta.update({"publisher": publisher or meta.get("publisher", ""),
+                             "description": str(item.get("description") or summary),
+                             "icon_url": icon_url or meta.get("icon_url", ""),
+                             "screenshots": screenshots or meta.get("screenshots", []),
+                             "categories": item.get("categories") or meta.get("categories", [])})
+                # Bereits bekannte channel-map nutzen, aber keine Einzelabfragen
+                # für jeden Suchtreffer starten.
+                channel_map = meta.get("snap_channel_map")
+                if isinstance(channel_map, list):
+                    channel_version, channel_revision = Window._snap_release_from_map(channel_map, selected_channel, native_arch)
+                    if not channel_version:
+                        continue
+                    version = channel_version
+                    meta.update({"selected_channel": selected_channel, "channel_version_verified": True,
+                                 "channel_architecture": native_arch, "channel_revision": channel_revision})
+                else:
+                    version = str(item.get("version") or "")
+                    meta["channel_verification_pending"] = True
+                icon_path = Window._snap_icon_path(name)
+                search_rows[name] = [name, version,
+                    "Installiert" if name in installed else "Nicht installiert", summary,
+                    "snap", icon_path, name, meta]
+            if not search_rows and not native_records:
+                # Nur wenn snapd-Suche nicht verfügbar ist, einmalig auf CLI
+                # zurückfallen. Kein zusätzlicher paralleler Store-API-Aufruf.
+                rc, output = query(["snap", "find", term], 10)
+                if rc == 0:
+                    for line in output.splitlines():
+                        fields = line.strip().split(None, 4)
+                        if len(fields) < 4 or fields[0].lower() == "name":
+                            continue
+                        name = fields[0]
+                        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+                            continue
+                        search_rows[name] = [name, fields[1],
+                            "Installiert" if name in installed else "Nicht installiert",
+                            fields[4] if len(fields) > 4 else name, "snap",
+                            Window._snap_icon_path(name), name, {"publisher": fields[2], "channel_verification_pending": True}]
+            result_rows = sorted((tuple(row) for row in search_rows.values()), key=lambda row: str(row[0]).casefold())
+            if result_rows:
+                _snap_cache_write(search_catalog_id, result_rows)
+            return result_rows
+
+        # Ein frischer Channel-Cache hat immer Vorrang. Beim Umschalten wird
+        # ausschließlich lokal gelesen; dadurch startet kein neuer Store-Job.
+        cache_age = _snap_cache_age_hours(catalog_id)
+        channel_cache_fresh = (
+            cache_age is not None
+            and (retention_days == 0 or cache_age < retention_days * 24)
+        )
+        if channel_cache_fresh and cache_rows and not term:
+            refreshed_cache_rows = []
+            for cached_row in cache_rows:
+                cached_row = list(cached_row)
+                cached_row[2] = "Installiert" if cached_row[0] in installed else "Nicht installiert"
+                if len(cached_row) > 5 and cached_row[5] and not Path(str(cached_row[5])).is_file():
+                    cached_row[5] = ""
+                refreshed_cache_rows.append(tuple(cached_row))
+            return sorted(refreshed_cache_rows, key=lambda row: str(row[0]).casefold())
+
+        # Sobald der gemeinsame Master-Katalog existiert, werden alle vier
+        # Channel-Kataloge ausschließlich lokal daraus aufgebaut. Kein erneuter
+        # SnapUpdates-/Store-Download und keine erneuten Einzelabfragen beim Wechsel.
+        if master_rows and not term:
+            for master_row in master_rows:
+                master_row[2] = "Installiert" if master_row[0] in installed else "Nicht installiert"
+            channel_rows, checked_count, failed_count, enriched_master = Window._snap_rows_for_channel(
+                master_rows, selected_channel, native_arch, allow_network=False)
+            if enriched_master:
+                _snap_cache_write(master_id, enriched_master)
+            _snap_cache_write(catalog_id, channel_rows)
+            return [tuple(row) for row in channel_rows]
+
+        # Ein frischer lokaler Katalog ist die primäre Startquelle. Bei einem
+        # normalen Start werden KEINE Store-/SnapUpdates-Netzwerkabfragen und
+        # KEINE massenhaften Icon-Downloads ausgelöst. Aktualisiert wird erst,
+        # wenn die konfigurierte Cache-Laufzeit abgelaufen ist oder der Nutzer
+        # ausdrücklich sucht.
+        cache_age = _snap_cache_age_hours(catalog_id)
+        fresh = cache_age is not None and (retention_days == 0 or cache_age < retention_days * 24)
+        store_rows = {} if term else {r[0]: list(r) for r in cache_rows}
+        if fresh and not term:
+            for cached_name, cached_row in store_rows.items():
+                cached_row[2] = "Installiert" if cached_name in installed else "Nicht installiert"
+                # Veraltete lokale Icon-Pfade nicht als gültige Bilder ausgeben.
+                if len(cached_row) > 5 and cached_row[5] and not Path(str(cached_row[5])).is_file():
+                    cached_row[5] = ""
+            return sorted((tuple(row) for row in store_rows.values()),
+                          key=lambda row: str(row[0]).casefold())
+        # Fehlende Icons werden NICHT beim Katalogstart für tausende Einträge
+        # synchron geladen. Das erfolgt später gezielt in der Detailansicht.
+        for cached_name, cached_row in store_rows.items():
+            if len(cached_row) > 5 and cached_row[5] and not Path(str(cached_row[5])).is_file():
+                cached_row[5] = ""
+
+        # Public Snap Store search API. The developer metadata endpoints are
+        # deliberately not used: Canonical documents those as requiring a macaroon.
+        # Store-Sektionen sind nicht identisch mit unseren zwölf LunaPaket-Themen.
+        # Ein Thema kann deshalb mehrere echte Snap-Store-Sektionen abfragen.
+        section_values = [v.strip() for v in str(section or "").split("|") if v.strip()]
+        if not term and not section_values:
+            # Keine vollständige Store-Export-API: möglichst breit über alle
+            # vom snapd gemeldeten offiziellen Sections sammeln.
+            section_values = Window._snapd_store_sections()
+            if not section_values:
+                section_values = [""]  # allgemeine Store-Suche / Featured
+        api_ok = False
+        queried_any = False
+        # Category browsing deliberately uses the same supported interface as
+        # Discover/GNOME's Snap backend: `snap find --section=<official-id>`.
+        # The legacy public search endpoint does not reliably honor the newer
+        # Store section IDs and could silently return an unrelated empty set.
+        category_browse = bool(section_values and not term)
+        for current_section in ([] if category_browse or term else section_values):
+            if Window._snap_import_cancelled():
+                break
+            params = {}
+            if term:
+                params["query"] = term
+            elif current_section:
+                params["section"] = current_section
+            url = "https://api.snapcraft.io/api/v1/snaps/search"
+            if params:
+                url += "?" + urllib.parse.urlencode(params)
+            request = urllib.request.Request(url, headers={
+                "Accept": "application/json", "X-Ubuntu-Series": "16",
+                "User-Agent": "LunaPaket/0.1.42"
+            })
+            try:
+                # Store liefert paginierte Ergebnisse; Folgeseiten ebenfalls lesen.
+                next_url = url
+                pages = 0
+                while next_url and pages < 8 and not Window._snap_import_cancelled():
+                    req = urllib.request.Request(next_url, headers={
+                        "Accept": "application/json", "X-Ubuntu-Series": "16",
+                        "User-Agent": "LunaPaket/0.1.42"
+                    })
+                    with urllib.request.urlopen(req, timeout=8) as response:
+                        payload = json.loads(response.read(16 * 1024 * 1024).decode("utf-8"))
+                    if isinstance(payload, list):
+                        records = payload
+                        next_url = ""
+                    else:
+                        embedded = payload.get("_embedded", {}) if isinstance(payload, dict) else {}
+                        records = embedded.get("clickindex:package", payload.get("results", [])) if isinstance(embedded, dict) else []
+                        links = payload.get("_links", {}) if isinstance(payload, dict) else {}
+                        nxt = links.get("next", {}) if isinstance(links, dict) else {}
+                        next_url = nxt.get("href", "") if isinstance(nxt, dict) else ""
+                        if next_url and next_url.startswith("/"):
+                            next_url = "https://api.snapcraft.io" + next_url
+                    if not isinstance(records, list):
+                        records = []
+                    queried_any = queried_any or bool(records)
+                    for item in records:
+                        if not isinstance(item, dict):
+                            continue
+                        name = str(item.get("name") or item.get("snap_name") or "").strip()
+                        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+                            continue
+                        version = str(item.get("version") or item.get("revision") or "")
+                        publisher_obj = item.get("publisher") or {}
+                        publisher = (publisher_obj.get("display-name") or publisher_obj.get("username") or
+                                     publisher_obj.get("name") or "") if isinstance(publisher_obj, dict) else str(publisher_obj)
+                        summary = str(item.get("summary") or item.get("description") or name)
+                        description = str(item.get("description") or summary)
+                        icon_url, screenshots = Window._snap_media_fields(item)
+                        categories = item.get("categories") or []
+                        existing = store_rows.get(name)
+                        prior_meta = existing[7] if existing and len(existing) > 7 and isinstance(existing[7], dict) else {}
+                        merged_sections = list(prior_meta.get("snap_sections", []))
+                        if current_section and current_section not in merged_sections:
+                            merged_sections.append(current_section)
+                        merged_categories = list(prior_meta.get("categories", []))
+                        for category in categories if isinstance(categories, list) else []:
+                            if category not in merged_categories:
+                                merged_categories.append(category)
+                        meta = {"publisher": publisher or prior_meta.get("publisher", ""),
+                                "description": description, "snap_section": current_section,
+                                "snap_sections": merged_sections, "screenshots": screenshots or prior_meta.get("screenshots", []),
+                                "icon_url": icon_url or prior_meta.get("icon_url", ""),
+                                "categories": merged_categories,
+                                "license": item.get("license", prior_meta.get("license", "")),
+                                "website": item.get("website", prior_meta.get("website", ""))}
+                        icon_path = Window._snap_icon_path(name)
+                        if not icon_path and meta["icon_url"]:
+                            icon_path = Window._snap_cached_media(name, meta["icon_url"], "icon")
+                        store_rows[name] = [name, version or (existing[1] if existing else ""),
+                            "Installiert" if name in installed else "Nicht installiert",
+                            summary, "snap", icon_path or (existing[5] if existing else ""), name, meta]
+                    pages += 1
+            except Exception:
+                continue
+        # Public Store search may return packages for foreign CPU architectures.
+        # Restrict those results to the names returned by this machine's snapd.
+        if term:
+            native_names = {
+                str(item.get("name") or "").strip()
+                for item in Window._snapd_store_find(search_term=term)
+                if isinstance(item, dict) and item.get("name")
+            }
+            store_rows = {name: row for name, row in store_rows.items()
+                          if name in native_names or name in installed}
+            queried_any = bool(native_names) or queried_any
+        api_ok = queried_any
+
+        # Prefer snapd's own /v2/find response for category browsing. Unlike
+        # `snap find` text output it includes the Store media array (icons/screenshots)
+        # and returns only snaps supported by this host architecture.
+        if category_browse:
+            for current_section in section_values:
+                if Window._snap_import_cancelled():
+                    break
+                for item in Window._snapd_store_find(section=current_section):
+                    if Window._snap_import_cancelled():
+                        break
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+                        continue
+                    icon_url, screenshots = Window._snap_media_fields(item)
+                    prior = store_rows.get(name)
+                    prior_meta = prior[7] if prior and len(prior) > 7 and isinstance(prior[7], dict) else {}
+                    sections = list(prior_meta.get("snap_sections", []))
+                    if current_section not in sections:
+                        sections.append(current_section)
+                    publisher_obj = item.get("publisher") or {}
+                    publisher = (publisher_obj.get("display-name") or publisher_obj.get("username") or "") if isinstance(publisher_obj, dict) else str(publisher_obj)
+                    summary = str(item.get("summary") or item.get("description") or name)
+                    meta = dict(prior_meta)
+                    meta.update({"publisher": publisher or prior_meta.get("publisher", ""),
+                                 "description": str(item.get("description") or summary),
+                                 "snap_section": current_section, "snap_sections": sections,
+                                 "icon_url": icon_url or prior_meta.get("icon_url", ""),
+                                 "screenshots": screenshots or prior_meta.get("screenshots", []),
+                                 "categories": item.get("categories") or prior_meta.get("categories", [])})
+                    icon_path = Window._snap_icon_path(name)
+                    if not icon_path and meta.get("icon_url"):
+                        icon_path = Window._snap_cached_media(name, meta["icon_url"], "icon")
+                    store_rows[name] = [name, str(item.get("version") or (prior[1] if prior else "")),
+                        "Installiert" if name in installed else "Nicht installiert", summary,
+                        "snap", icon_path or (prior[5] if prior else ""), name, meta]
+            api_ok = api_ok or any(row[4] == "snap" for row in store_rows.values())
+
+        # Search through the local snapd Store endpoint as well. Unlike the
+        # public global Store search API, /v2/find is evaluated for this host
+        # and therefore excludes snaps that have no build for its architecture.
+        elif term:
+            for item in Window._snapd_store_find(search_term=term):
+                if Window._snap_import_cancelled():
+                    break
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+                    continue
+                icon_url, screenshots = Window._snap_media_fields(item)
+                prior = store_rows.get(name)
+                prior_meta = prior[7] if prior and len(prior) > 7 and isinstance(prior[7], dict) else {}
+                publisher_obj = item.get("publisher") or {}
+                publisher = (publisher_obj.get("display-name") or publisher_obj.get("username") or "") if isinstance(publisher_obj, dict) else str(publisher_obj)
+                summary = str(item.get("summary") or item.get("description") or name)
+                meta = dict(prior_meta)
+                meta.update({"publisher": publisher or prior_meta.get("publisher", ""),
+                             "description": str(item.get("description") or summary),
+                             "icon_url": icon_url or prior_meta.get("icon_url", ""),
+                             "screenshots": screenshots or prior_meta.get("screenshots", []),
+                             "categories": item.get("categories") or prior_meta.get("categories", [])})
+                icon_path = Window._snap_icon_path(name)
+                if not icon_path and meta.get("icon_url"):
+                    icon_path = Window._snap_cached_media(name, meta["icon_url"], "icon")
+                store_rows[name] = [name, str(item.get("version") or (prior[1] if prior else "")),
+                    "Installiert" if name in installed else "Nicht installiert", summary,
+                    "snap", icon_path or (prior[5] if prior else ""), name, meta]
+            api_ok = bool(store_rows)
+
+        # CLI is the established fallback and keeps the existing behavior on
+        # systems where the public Store API/local snapd socket is unavailable.
+        if not api_ok or category_browse:
+            fallback_sections = section_values if not term else [""]
+            if not fallback_sections:
+                fallback_sections = [""]
+            last_error = ""
+            for current_section in fallback_sections:
+                args = ["snap", "find"]
+                if current_section:
+                    args.append("--section=" + current_section)
+                if term:
+                    args.append(term)
+                if Window._snap_import_cancelled():
+                    break
+                rc, output = query(args, 20)
+                if rc != 0:
+                    last_error = output.strip()
+                    continue
+                for line in output.splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.lower().startswith(("name ", "no snaps")):
+                        continue
+                    fields = stripped.split(None, 4)
+                    if len(fields) < 4:
+                        continue
+                    name = fields[0]
+                    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+                        continue
+                    version = fields[1] if len(fields) > 1 else ""
+                    publisher = fields[2] if len(fields) > 2 else ""
+                    summary = fields[4] if len(fields) > 4 else name
+                    prior = store_rows.get(name)
+                    meta = prior[7] if prior and len(prior) > 7 and isinstance(prior[7], dict) else {}
+                    sections = list(meta.get("snap_sections", []))
+                    if current_section and current_section not in sections:
+                        sections.append(current_section)
+                    meta.update({"publisher": publisher or meta.get("publisher", ""),
+                                 "description": summary, "snap_section": current_section,
+                                 "snap_sections": sections, "screenshots": meta.get("screenshots", [])})
+                    store_rows[name] = [name, version,
+                        "Installiert" if name in installed else "Nicht installiert",
+                        summary, "snap", Window._snap_icon_path(name), name, meta]
+            if not store_rows and not installed:
+                raise RuntimeError("Snap-Store-Suche fehlgeschlagen: " + (last_error or "keine Store-Ergebnisse"))
+
+        # Vollständigerer Community-Katalog als zusätzliche Quelle: SnapUpdates
+        # führt den Store-Katalog über paginierte Kategorieansichten. Die Daten
+        # werden nur im Hintergrund geladen und lokal zwischengespeichert.
+        if not term and not Window._snap_import_cancelled():
+            try:
+                community_rows = Window.collect_snapupdates_catalog(retention_days)
+                for community_row in community_rows:
+                    if not isinstance(community_row, list) or len(community_row) < 8:
+                        continue
+                    community_name = str(community_row[0])
+                    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", community_name):
+                        continue
+                    prior = store_rows.get(community_name)
+                    if prior:
+                        merged = list(prior)
+                        merged_meta = dict(merged[7]) if len(merged) > 7 and isinstance(merged[7], dict) else {}
+                        incoming_meta = community_row[7] if isinstance(community_row[7], dict) else {}
+                        for key, value in incoming_meta.items():
+                            if value and not merged_meta.get(key):
+                                merged_meta[key] = value
+                        merged[7] = merged_meta
+                        if not merged[3] or merged[3] == community_name:
+                            merged[3] = community_row[3]
+                        if not merged[5] and merged_meta.get("icon_url"):
+                            # Icons nicht massenhaft herunterladen; die URL wird
+                            # gespeichert und erst bei Bedarf in der Detailansicht geladen.
+                            merged[5] = ""
+                        store_rows[community_name] = merged
+                    else:
+                        store_rows[community_name] = list(community_row)
+            except Exception:
+                pass
+
+        for name, version in installed.items():
+            if name in store_rows:
+                store_rows[name][2] = "Installiert"
+        # Alle gefundenen Kandidaten (Store-Suche und Community-Katalog) werden
+        # anhand der offiziellen Snapcraft-v2-channel-map für Track, Channel und
+        # native Architektur geprüft. Stable wird niemals als Ersatz verwendet.
+        candidate_rows = list(store_rows.values())
+        if candidate_rows:
+            channel_rows, checked_count, failed_count, enriched_master = Window._snap_rows_for_channel(
+                candidate_rows, selected_channel, native_arch)
+            # Der gemeinsame Master speichert jeden Kandidaten samt kompletter
+            # channel-map. Auch bei einzelnen Netzwerkfehlern bleiben die
+            # erfolgreich geladenen Metadaten erhalten und werden nachgeladen.
+            if enriched_master:
+                _snap_cache_write(master_id, enriched_master)
+            store_rows = {str(row[0]): list(row) for row in channel_rows}
+
+        # Persist accumulated results, not only the last search. This makes
+        # discovered applications available offline until the configured expiry.
+        rows = sorted((tuple(row) for row in store_rows.values()), key=lambda row: str(row[0]).casefold())
+        if not term:
+            _snap_cache_write(catalog_id, rows)
+        if term:
+            rows = [r for r in rows if term.casefold() in (str(r[0]) + " " + str(r[3]) + " " + str(r[6])).casefold()]
+        return rows
+
+    @staticmethod
+    def _snap_cached_media(snap_name, url, kind="screenshot"):
+        """Lädt Store-Bilder einmalig in den LunaPaket-Cache."""
+        try:
+            suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+            if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".svg"):
+                suffix = ".img"
+            digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+            folder = Path.home() / ".cache" / "LunaPaket" / "snap-media" / re.sub(r"[^a-z0-9-]", "", snap_name.lower())
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / (kind + "-" + digest + suffix)
+            if target.is_file() and target.stat().st_size:
+                return str(target)
+            req = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.42"})
+            with urllib.request.urlopen(req, timeout=18) as response:
+                data = response.read(12 * 1024 * 1024)
+                content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].lower()
+            if suffix == ".img":
+                suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+                          "image/svg+xml": ".svg"}.get(content_type, ".img")
+                target = folder / (kind + "-" + digest + suffix)
+            if not data:
+                return ""
+            # Keine HTML-Fehlerseiten als vermeintliche Icons speichern.
+            if kind == "icon":
+                probe = data.lstrip()[:512].lower()
+                valid_image = (data.startswith(b"\x89PNG\r\n\x1a\n") or
+                               data.startswith(b"\xff\xd8\xff") or
+                               data.startswith(b"RIFF") and data[8:12] == b"WEBP" or
+                               b"<svg" in probe)
+                if not valid_image:
+                    return ""
+            target.write_bytes(data)
+            return str(target)
+        except Exception:
+            return ""
+
+    def load_snap_catalog(self):
+        if self.snap_loading:
+            # Ein Kanalwechsel während eines laufenden Imports benötigt
+            # anschließend einen neuen Abruf mit dem dann ausgewählten Kanal.
+            self.snap_reload_pending = True
+            return
+        if not shutil.which("snap"):
+            self.snap_catalog=[]
+            self.table.package_model.replace_rows([], self.flatpak_queue)
+            self.status.setText("snapd ist nicht installiert. Bitte zuerst snapd installieren." if self.language == "de" else "snapd is not installed. Install snapd first.")
+            return
+        self.snap_loading=True
+        self.snap_reload_pending = False
+        # Den vorhandenen Katalog sofort anzeigen, während eine Aktualisierung
+        # im Hintergrund läuft. Der Cache wird hier nur lokal gelesen.
+        if not self.snap_catalog:
+            try:
+                selected_channel = str(self.snap_channel_combo.currentData() or "latest/stable")
+                cached = _snap_cache_read(_snap_catalog_id(selected_channel, _native_debian_architecture()))
+                self.snap_catalog = [tuple(row) for row in cached if isinstance(row, (list, tuple)) and len(row) >= 8]
+                if self.snap_catalog:
+                    self.apply_table_filters()
+                self._update_snap_channel_labels()
+            except (OSError, ValueError, TypeError):
+                pass
+        self.status.setText("Snap-Katalog wird im Hintergrund aktualisiert …" if self.language == "de" else "Updating Snap catalog in the background …")
+        term=self.search.text().strip()
+        topic_row=self.topic_sidebar.currentRow()
+        section=""
+        if topic_row >= 0:
+            topic_key=TOPIC_CATEGORIES[topic_row][0]
+            # Offizielle Snap-Store-Sections (snap find --section).
+            # Die LunaPaket-Themen werden wie bei GNOME Software auf diese
+            # Sections abgebildet; es werden ausschließlich gültige IDs benutzt.
+            section_map={
+                "amateurfunk":"devices-and-iot|science",
+                "network":"social|news-and-weather|utilities",
+                "audio":"music-and-audio",
+                "video":"photo-and-video|entertainment",
+                "graphics":"art-and-design|photo-and-video",
+                "programming":"development",
+                "system":"utilities|server-and-cloud",
+                "security":"security",
+                "electronics":"devices-and-iot",
+                "office":"productivity|books-and-reference|education",
+                "games":"games",
+                "science":"science|education"
+            }
+            section=section_map.get(topic_key, "")
+        retention=int(self.settings.value("cache/snap_catalog_retention_days", 7))
+        self.snap_job=FunctionJob(lambda: self.collect_snap_catalog(term, section, retention, str(self.snap_channel_combo.currentData() or "latest/stable")))
+        def loaded(rows):
+            self.snap_loading=False
+            if self.snap_reload_pending and self.snap_mode:
+                self.snap_reload_pending = False
+                self.load_snap_catalog()
+                return
+            self.snap_catalog=rows
+            self._update_snap_channel_labels()
+            if not self.snap_mode: return
+            self.apply_table_filters()
+            post_action_message = getattr(self, "snap_post_action_message", "")
+            if post_action_message:
+                self.snap_post_action_message = ""
+                self.status.setText(
+                    (f"{post_action_message} Snap catalog refreshed: {len(rows)} applications loaded." if self.language == "en"
+                     else f"{post_action_message} Snap-Katalog aktualisiert: {len(rows)} Anwendungen geladen.")
+                )
+            else:
+                self.status.setText((f"{len(rows)} Snap applications loaded" if self.language == "en" else f"{len(rows)} Snap-Anwendungen geladen"))
+        def failed(error):
+            self.snap_loading=False
+            if self.snap_reload_pending and self.snap_mode:
+                self.snap_reload_pending = False
+                self.load_snap_catalog()
+                return
+            if not self.snap_mode: return
+            self.snap_catalog=[]
+            self.table.package_model.replace_rows([], self.flatpak_queue)
+            post_action_message = getattr(self, "snap_post_action_message", "")
+            self.snap_post_action_message = ""
+            prefix = (post_action_message + " Snap catalog refresh failed: ") if post_action_message and self.language == "en" else ((post_action_message + " Snap-Katalog-Aktualisierung fehlgeschlagen: ") if post_action_message else "Snap: ")
+            self.status.setText(prefix + str(error))
+        self.snap_job.result.connect(loaded)
+        self.snap_job.failed.connect(failed)
+        self.snap_job.start()
+
+    def _load_visible_snap_icons(self):
+        """Lädt fehlende Snap-Icons nur für aktuell sichtbare Zeilen, höchstens zwei parallel."""
+        if not getattr(self, "snap_mode", False):
+            return
+        job = getattr(self, "_snap_icon_job", None)
+        if job is not None and job.isRunning():
+            return
+        model = self.table.package_model
+        if not model.visible_rows:
+            return
+        viewport = self.table.viewport().rect()
+        top_index = self.table.indexAt(viewport.topLeft())
+        bottom_index = self.table.indexAt(viewport.bottomLeft())
+        if not top_index.isValid():
+            return
+        first = top_index.row()
+        last = bottom_index.row() if bottom_index.isValid() else min(model.rowCount() - 1, first + 18)
+        candidates = []
+        for visible_row in range(max(0, first), min(model.rowCount() - 1, last) + 1):
+            source_row = model.visible_rows[visible_row]
+            if source_row in self._snap_icon_pending:
+                continue
+            row = model.rows[source_row]
+            if len(row) <= 7 or (len(row) > 5 and row[5]):
+                continue
+            meta = row[7] if isinstance(row[7], dict) else {}
+            url = str(meta.get("icon_url") or "")
+            if not url.startswith(("https://", "http://")):
+                continue
+            candidates.append((source_row, str(row[0]), url))
+        if not candidates:
+            return
+        # Nur aktuell sichtbare Symbole; maximal zwei Downloads parallel.
+        candidates = candidates[:24]
+        self._snap_icon_pending.update(item[0] for item in candidates)
+
+        def fetch_icons():
+            results = []
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {
+                    pool.submit(Window._snap_cached_media, name, url, "icon"): source_row
+                    for source_row, name, url in candidates
+                }
+                for future in as_completed(futures):
+                    try:
+                        path = future.result()
+                    except Exception:
+                        path = ""
+                    if path:
+                        results.append((futures[future], path))
+            return results
+
+        job = FunctionJob(fetch_icons)
+        self._snap_icon_job = job
+
+        def icons_loaded(results):
+            for source_row, icon_path in results or []:
+                self.table.package_model.set_icon_path(source_row, icon_path)
+            self._snap_icon_pending.difference_update(item[0] for item in candidates)
+
+        def icons_failed(_error):
+            self._snap_icon_pending.difference_update(item[0] for item in candidates)
+
+        job.result.connect(icons_loaded)
+        job.failed.connect(icons_failed)
+        job.start()
+
+    def show_snap_details(self, snap_name):
+        row = next((item for item in self.snap_catalog if item and item[0] == snap_name), None)
+        self.details_title.setText("Snap application details" if self.language == "en" else "Snap-Anwendungsdetails")
+        self.clear_flatpak_gallery()
+        self.flatpak_gallery_scroll.setVisible(True)
+        if not row:
+            self.details.setPlainText("Keine Snap-Details für " + snap_name)
+            return
+        meta = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
+        summary = row[3] or meta.get("description", "")
+        fields = [("Snap", snap_name), ("Version", row[1] or "—"),
+                  ("Status", row[2]), ("Quelle", "Snap Store / snapd"),
+                  ("Herausgeber", meta.get("publisher") or "Keine Angabe im Store-Katalog"),
+                  ("Lizenz", meta.get("license") or "Keine Angabe im Store-Katalog"),
+                  ("Website", meta.get("website") or "Keine Angabe im Store-Katalog")]
+        if self.language == "en":
+            fields = [("Snap", snap_name), ("Version", row[1] or "—"),
+                      ("Status", "Installed" if row[2] == "Installiert" else "Not installed"),
+                      ("Source", "Snap Store / snapd"),
+                      ("Publisher", meta.get("publisher") or "Not provided in store catalog"),
+                      ("License", meta.get("license") or "Not provided in store catalog"),
+                      ("Website", meta.get("website") or "Not provided in store catalog")]
+        safe = lambda value: html.escape(str(value or ""))
+        fields_html = "".join(f"<tr><td><b>{safe(k)}</b></td><td>{safe(v)}</td></tr>" for k, v in fields)
+        description = meta.get("description") or summary
+        self.details.setHtml("<html><body style='font-family:sans-serif;color:#e8e8ee;'>"
+            f"<h2 style='color:#b99aff;'>{safe(snap_name)}</h2><table cellpadding='5'>{fields_html}</table>"
+            f"<hr><h3 style='color:#b99aff;'>{'Description' if self.language == 'en' else 'Beschreibung'}</h3>"
+            f"<p>{safe(description)}</p></body></html>")
+        shots = meta.get("screenshots", [])
+        if not shots:
+            label = ("The Snap Store did not return screenshots for this application."
+                     if self.language == "en" else
+                     "Für diese Anwendung wurden vom Snap Store keine Screenshots geliefert.")
+            self.flatpak_gallery_layout.addWidget(QLabel(label))
+            return
+        if not hasattr(self, "snap_image_jobs"):
+            self.snap_image_jobs = []
+        for image_url, caption in shots[:6]:
+            tile = QWidget()
+            tile_layout = QVBoxLayout(tile)
+            tile_layout.setContentsMargins(4, 4, 4, 4)
+            preview = QLabel("Bild wird geladen …" if self.language == "de" else "Loading image …")
+            preview.setAlignment(Qt.AlignCenter)
+            preview.setMinimumSize(220, 145)
+            preview.setMaximumSize(360, 190)
+            preview.setStyleSheet("background:#20212a;border:1px solid #484858;border-radius:5px;padding:4px;")
+            tile_layout.addWidget(preview)
+            self.flatpak_gallery_layout.addWidget(tile)
+            job = FunctionJob(lambda u=image_url, n=snap_name: Window._snap_cached_media(n, u, "screenshot"))
+            def image_loaded(path, target=preview, selected=snap_name):
+                if not path or not isValid(target) or not self.snap_mode or self.selected_flatpak_id() != selected:
+                    if isValid(target): target.setText("Bild nicht verfügbar" if self.language == "de" else "Image unavailable")
+                    return
+                pixmap = QPixmap(path)
+                if not pixmap.isNull():
+                    target.setPixmap(pixmap.scaled(340, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                else:
+                    target.setText("Bildformat nicht unterstützt" if self.language == "de" else "Unsupported image format")
+            job.result.connect(image_loaded)
+            job.failed.connect(lambda _e, target=preview: target.setText("Bild nicht verfügbar" if self.language == "de" else "Image unavailable") if isValid(target) else None)
+            self.snap_image_jobs.append(job)
+            job.start()
+
+    def check_snap_updates(self):
+        english=self.language=="en"
+        if not shutil.which("snap"):
+            QMessageBox.warning(self, "Snap", "snapd is not installed." if english else "snapd ist nicht installiert.")
+            return
+        self.snap_update_btn.setEnabled(False)
+        self.status.setText("Checking Snap updates …" if english else "Snap-Updates werden gesucht …")
+        def scan():
+            proc=subprocess.run(["snap", "refresh", "--list"], text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=90, stdin=subprocess.DEVNULL)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stdout.strip())
+            updates=[]
+            table_started=False
+            for line in proc.stdout.splitlines():
+                fields=line.split()
+                if not fields:
+                    continue
+                # snapd kann vor/nach der Tabelle Warnungen ausgeben. Nur
+                # Zeilen hinter dem echten Tabellenkopf auswerten.
+                if len(fields)>=3 and fields[0].lower()=="name" and fields[1].lower()=="version" and fields[2].lower()=="rev":
+                    table_started=True
+                    continue
+                if not table_started or len(fields)<3:
+                    continue
+                name, version, revision = fields[0], fields[1], fields[2]
+                # Snap-Namen bestehen aus Kleinbuchstaben, Ziffern und Bindestrichen.
+                # Warntexte wie "WARNING: There ..." dürfen nie als Paket gelten.
+                if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name):
+                    continue
+                if not revision.isdigit():
+                    continue
+                updates.append((name, version))
+            return sorted(set(updates))
+        self.snap_update_scan_job=FunctionJob(scan)
+        def ready(updates):
+            self.snap_update_btn.setEnabled(True)
+            if not updates:
+                self.status.setText("Keine Snap-Updates verfügbar." if not english else "No Snap updates available.")
+                QMessageBox.information(self, "Snap", "Alle installierten Snaps sind aktuell." if not english else "All installed Snaps are up to date.")
+                return
+            dlg=QDialog(self); dlg.setWindowTitle("Verfügbare Snap-Updates" if not english else "Available Snap updates"); dlg.resize(560,440)
+            layout=QVBoxLayout(dlg); layout.addWidget(QLabel(f"{len(updates)} Snap-Updates verfügbar." if not english else f"{len(updates)} Snap updates available."))
+            select_all=QCheckBox("Alle auswählen" if not english else "Select all"); select_all.setChecked(True); layout.addWidget(select_all)
+            scroll=QScrollArea(); scroll.setWidgetResizable(True); content=QWidget(); box=QVBoxLayout(content); checks=[]
+            for name,version in updates:
+                check=QCheckBox(f"{name}  ·  {version}"); check.setChecked(True); check.setProperty("snap_name",name); checks.append(check); box.addWidget(check)
+            box.addStretch(1); scroll.setWidget(content); layout.addWidget(scroll,1)
+            select_all.toggled.connect(lambda checked:[item.setChecked(checked) for item in checks])
+            buttons=QDialogButtonBox(); selected_btn=buttons.addButton("Ausgewählte aktualisieren" if not english else "Update selected", QDialogButtonBox.AcceptRole); all_btn=buttons.addButton("Alle aktualisieren" if not english else "Update all", QDialogButtonBox.ActionRole); close_btn=buttons.addButton(QDialogButtonBox.Close); close_btn.setText("Schließen" if not english else "Close"); close_btn.clicked.connect(dlg.reject); layout.addWidget(buttons)
+            def run_updates(all_items=False):
+                names=[name for name,_version in updates] if all_items else [str(item.property("snap_name")) for item in checks if item.isChecked()]
+                if not names:
+                    QMessageBox.information(dlg,"Snap","Bitte mindestens ein Update auswählen." if not english else "Select at least one update."); return
+                confirm = QMessageBox(dlg)
+                confirm.setIcon(QMessageBox.Question)
+                confirm.setWindowTitle("Snap")
+                confirm.setText(f"{len(names)} Snap(s) aktualisieren?" if not english else f"Update {len(names)} Snap(s)?")
+                yes_button = confirm.addButton("Ja" if not english else "Yes", QMessageBox.YesRole)
+                no_button = confirm.addButton("Nein" if not english else "No", QMessageBox.NoRole)
+                confirm.setDefaultButton(no_button)
+                confirm.exec()
+                if confirm.clickedButton() is not yes_button:
+                    return
+                dlg.accept(); self.set_busy(True); self.snap_update_btn.setEnabled(False)
+                def update(report, emit_output):
+                    results=[]
+                    total = len(names)
+                    for index, name in enumerate(names, 1):
+                        report(index - 1, total, name)
+                        chunks=[]
+                        try:
+                            def capture(line):
+                                chunks.append(line)
+                                emit_output(line)
+                            channel = str(self.snap_channel_combo.currentData() or "latest/stable")
+                            rc=run_snap_command_live(["snap", "refresh", name, "--channel=" + channel], capture, timeout=1800)
+                        except Exception as error:
+                            rc=1
+                            chunks.append(str(error))
+                            emit_output(str(error))
+                        results.append((name, rc, "\n".join(chunks)))
+                        report(index, total, name)
+                    return results
+                progress = ActionProgressDialog(self, "Snap-Updates installieren" if not english else "Install Snap updates",
+                                                "Snap-Updates werden installiert. Bitte warten …" if not english else "Snap updates are being installed. Please wait …",
+                                                english=english, settings=self.settings, setting_key="progress/auto_close_after_success")
+                # Snap liefert keine verlässlichen Prozentwerte für einen einzelnen
+                # Installationslauf. Deshalb beginnt der Balken bei 0 und zeigt
+                # anhand eintreffender PTY-Statuszeilen laufende Aktivität (max. 95 %).
+                # 100 % werden ausschließlich nach erfolgreichem Abschluss gesetzt.
+                progress.progress.setRange(0, 100)
+                progress.progress.setValue(0)
+                progress._snap_activity_value = 0
+                progress.close_button.setText("Installation läuft …" if not english else "Installation in progress …")
+                self.snap_update_job=FunctionJob(update, with_progress_detail_output=True)
+                def append_snap_update_output(line):
+                    progress.append_output(line)
+                    progress._snap_activity_value = min(95, progress._snap_activity_value + 1)
+                    progress.progress.setValue(progress._snap_activity_value)
+                self.snap_update_job.output.connect(append_snap_update_output)
+                def update_progress(done, total, message):
+                    if done >= total and total > 0:
+                        progress.progress.setValue(min(95, int(done * 100 / total)))
+                    progress.current.setText(("Aktuell: " if not english else "Current: ") + message)
+                self.snap_update_job.progress_detail.connect(update_progress)
+                def updated(results):
+                    self.set_busy(False); self.snap_update_btn.setEnabled(True)
+                    output = "\n\n".join(out.strip() or f"{name}: exit {rc}" for name,rc,out in results)
+                    self.details.setPlainText(output)
+                    failures=[name for name,rc,out in results if rc]
+                    progress.progress.setRange(0, 100)
+                    progress.finish(1 if failures else 0)
+                    self.status.setText(("Fehler bei: " if not english else "Failed: ")+", ".join(failures) if failures else ("Snap-Updates abgeschlossen." if not english else "Snap updates completed."))
+                    self.load_snap_catalog()
+                def update_failed(error):
+                    self.set_busy(False); self.snap_update_btn.setEnabled(True)
+                    progress.progress.setRange(0, 100); progress.append_output(str(error)); progress.finish(1)
+                self.snap_update_job.result.connect(updated)
+                self.snap_update_job.failed.connect(update_failed)
+                # Erst den Dialog-Ereigniskreislauf öffnen, dann den Worker
+                # starten. So ist das Fenster sichtbar, bevor Snap-Ausgaben
+                # oder Fortschrittssignale eintreffen.
+                QTimer.singleShot(0, lambda job=self.snap_update_job: job.start())
+                progress.exec()
+            selected_btn.clicked.connect(lambda:run_updates(False)); all_btn.clicked.connect(lambda:run_updates(True)); dlg.exec()
+            # Der Update-Dialog darf nach dem Schließen nicht die Paketanzahl
+            # mit der Anzahl der zuvor gefundenen Updates überschreiben.
+            # Nach einer Installation aktualisiert load_snap_catalog() die
+            # Anzeige nochmals mit dem frisch geladenen Katalog.
+            if self.snap_catalog:
+                self.status.setText(
+                    f"{len(self.snap_catalog)} Snap-Anwendungen geladen"
+                    if not english else
+                    f"{len(self.snap_catalog)} Snap applications loaded"
+                )
+        self.snap_update_scan_job.result.connect(ready)
+        self.snap_update_scan_job.failed.connect(lambda error:(self.snap_update_btn.setEnabled(True),self.status.setText("Snap-Updateprüfung fehlgeschlagen: "+str(error))))
+        self.snap_update_scan_job.start()
+
+    @staticmethod
     def collect_flatpak_catalog(retention_days=7):
         """Load Flathub from a fresh local cache, otherwise refresh it in the background."""
         if not shutil.which("flatpak"):
@@ -1642,9 +3304,10 @@ class Window(QMainWindow):
             except Exception as exc:
                 return 1, str(exc)
 
-        # The default Flatpak queries worked before the previous scope rewrite.
-        # Avoid four sequential remote calls, each previously allowed 30 minutes.
-        rc, out = flatpak_query(["flatpak", "list", "--app",
+        # Query only refs built for the host architecture. Flatpak uses
+        # aarch64/x86_64 (not Debian's arm64/amd64 spelling).
+        flatpak_arch = _native_flatpak_architecture()
+        rc, out = flatpak_query(["flatpak", "list", "--app", f"--arch={flatpak_arch}",
                                  "--columns=application,version"], 15)
         installed = {}
         if rc == 0:
@@ -1653,7 +3316,7 @@ class Window(QMainWindow):
                 if parts and parts[0].strip():
                     installed[parts[0].strip()] = parts[1].strip() if len(parts) > 1 else ""
 
-        cache_file = Path.home() / ".cache" / "LunaPaket" / "flathub_catalog.json"
+        cache_file = Path.home() / ".cache" / "LunaPaket" / f"flathub_catalog_{flatpak_arch}.json"
         try:
             cache_fresh = (
                 cache_file.is_file()
@@ -1695,7 +3358,7 @@ class Window(QMainWindow):
         except (OSError, ValueError, TypeError):
             pass
 
-        rc, out = flatpak_query(["flatpak", "remote-ls", "--app",
+        rc, out = flatpak_query(["flatpak", "remote-ls", "--app", f"--arch={flatpak_arch}",
                                  "--columns=application,version", "flathub"], 40)
         remote_rows = {}
         if rc == 0:
@@ -1741,11 +3404,15 @@ class Window(QMainWindow):
             pass
         return rows
 
-    def load_flatpak_catalog(self):
-        if self.flatpak_loading:
+    def load_flatpak_catalog(self, preload=False):
+        if self.flatpak_loading or self.flatpak_catalog:
             return
         self.flatpak_loading = True
-        self.status.setText("Flathub-Katalog wird im Hintergrund geladen …")
+        if self.flatpak_mode and not self.snap_mode:
+            self.status.setText(
+                "Flathub-Katalog wird im Hintergrund geladen …" if self.language == "de"
+                else "Flathub catalog is loading in the background …"
+            )
         retention_days = int(self.settings.value("cache/flathub_catalog_retention_days", 7))
         self.flatpak_job = FunctionJob(lambda: self.collect_flatpak_catalog(retention_days))
         self.flatpak_job.result.connect(self.flatpak_catalog_loaded)
@@ -1757,7 +3424,7 @@ class Window(QMainWindow):
         self.flatpak_catalog = rows
         # Ergebnisse dürfen im Hintergrund gespeichert werden, aber nur die
         # aktive Flathub-Ansicht darf das gemeinsame Tabellenmodell aktualisieren.
-        if not self.flatpak_mode:
+        if not self.flatpak_mode or self.snap_mode:
             return
         self.apply_table_filters()
         if not self.table.currentIndex().isValid():
@@ -1767,17 +3434,30 @@ class Window(QMainWindow):
                 if self.language == "en" else
                 "Wähle eine Anwendung aus der Liste aus. Die App-Informationen erscheinen hier."
             )
-        self.status.setText(
-            f"{len(rows)} Flatpak applications found · Flathub" if self.language == "en"
-            else f"{len(rows)} Flatpak-Anwendungen gefunden · Flathub")
+        post_action = getattr(self, "flatpak_post_action_message", None)
+        if post_action:
+            self.status.setText(
+                post_action + (f" Flathub catalog updated ({len(rows)} applications)." if self.language == "en"
+                               else f" Flathub-Katalog aktualisiert ({len(rows)} Anwendungen).")
+            )
+            self.flatpak_post_action_message = None
+        else:
+            self.status.setText(
+                f"{len(rows)} Flatpak applications found · Flathub" if self.language == "en"
+                else f"{len(rows)} Flatpak-Anwendungen gefunden · Flathub")
 
     def flatpak_catalog_failed(self, error):
         self.flatpak_loading = False
-        if not self.flatpak_mode:
+        if not self.flatpak_mode or self.snap_mode:
             return
         self.table.package_model.replace_rows([], {})
         self._table_mode = "flatpak"
-        self.status.setText("Flathub: " + str(error))
+        post_action = getattr(self, "flatpak_post_action_message", None)
+        if post_action:
+            self.status.setText(post_action + (" Flathub catalog refresh failed: " if self.language == "en" else " Flathub-Katalog konnte nicht aktualisiert werden: ") + str(error))
+            self.flatpak_post_action_message = None
+        else:
+            self.status.setText("Flathub: " + str(error))
 
     def queue_flatpak_action(self, app_id, action):
         if action is None:
@@ -1860,6 +3540,8 @@ class Window(QMainWindow):
         # Qt erzeugt keine individuellen Items für jede sichtbare Tabellenzelle.
         self._table_mode = "apt"
         self._rows_generation = getattr(self, "_rows_generation", 0) + 1
+        if not hasattr(self, "_apt_icon_index"):
+            self._apt_icon_index = None
         self.table.setUpdatesEnabled(False)
         self.table.package_model.replace_rows(data, self.queue)
         self.table.setUpdatesEnabled(True)
@@ -1924,17 +3606,30 @@ class Window(QMainWindow):
         self._sidebar_sync = True
         self.sidebar.setCurrentRow(-1)
         self._sidebar_sync = False
-        self.sidebar_changed(6 + row)
+        if self.snap_mode:
+            # Snap-Kategorien filtern immer den vollständigen lokalen Katalog.
+            # Ein erneuter Store-Aufruf pro Kategorie würde nur eine Teilmenge
+            # laden und anschließend die Zählung auf dieser Teilmenge basieren.
+            self.apply_table_filters()
+        else:
+            self.sidebar_changed(6 + row)
 
     def sidebar_changed(self, _row):
         if self.flatpak_mode:
-            if _row == 3:
-                # Cleanup is an action, not an application-list filter.
-                self.show_flatpak_cleanup_dialog()
-                self.sidebar.blockSignals(True)
-                self.sidebar.setCurrentRow(2)
-                self.sidebar.blockSignals(False)
-            self.apply_table_filters()
+            if self.snap_mode:
+                if _row == 3:
+                    self.show_snap_cleanup_dialog()
+                    self.sidebar.blockSignals(True); self.sidebar.setCurrentRow(2); self.sidebar.blockSignals(False)
+                    return
+                if self.search.text().strip() or self.topic_sidebar.currentRow() >= 0 or _row == 0:
+                    self.load_snap_catalog()
+                else:
+                    self.apply_table_filters()
+            else:
+                if _row == 3:
+                    self.show_flatpak_cleanup_dialog()
+                    self.sidebar.blockSignals(True); self.sidebar.setCurrentRow(2); self.sidebar.blockSignals(False)
+                self.apply_table_filters()
             return
         # Das Sammelkästchen ist ausschließlich im Bereich „Aufräumen“ sichtbar.
         self.cleanup_select_all.blockSignals(True)
@@ -1991,7 +3686,9 @@ class Window(QMainWindow):
             self.status.setText((f"Font size set to {size} pt" if self.language == "en" else f"Schriftgröße auf {size} pt gesetzt"))
     def search_pkgs(self):
         if getattr(self, "flatpak_mode", False):
-            if self.flatpak_catalog:
+            if self.snap_mode:
+                self.load_snap_catalog()
+            elif self.flatpak_catalog:
                 self.apply_table_filters()
             else:
                 self.load_flatpak_catalog()
@@ -2064,7 +3761,16 @@ class Window(QMainWindow):
             row_filter = self.sidebar.currentRow()
             topic_row = self.topic_sidebar.currentRow()
             rows = []
-            for original_row in self.flatpak_catalog:
+            active_catalog = self.snap_catalog if self.snap_mode else self.flatpak_catalog
+            snap_sections = {
+                "amateurfunk": {"devices-and-iot", "science"}, "network": {"social", "utilities", "news-and-weather"},
+                "audio": {"music-and-audio"}, "video": {"photo-and-video", "entertainment"},
+                "graphics": {"art-and-design", "photo-and-video"}, "programming": {"development"},
+                "system": {"utilities", "server-and-cloud"}, "security": {"security"},
+                "electronics": {"devices-and-iot"}, "office": {"productivity", "education", "books-and-reference"},
+                "games": {"games"}, "science": {"science", "education"},
+            }
+            for original_row in active_catalog:
                 row = list(original_row)
                 meta = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
                 if len(row) > 6:
@@ -2092,13 +3798,33 @@ class Window(QMainWindow):
                     # AppStream-Kategorien werden als vollständige IDs verglichen.
                     # Allgemeine Oberbegriffe wie "Science" oder "Engineering"
                     # dürfen nicht hunderte fachfremde Anwendungen einsortieren.
-                    category_match = bool(
-                        appstream_categories & self._flatpak_appstream_category_ids(topic_key)
-                    )
-                    # Fehlen passende AppStream-Kategorien, dienen gezielte
-                    # Begriffe aus Anwendungsname, ID und Beschreibung als Fallback.
+                    if self.snap_mode:
+                        stored_sections = meta.get("snap_sections", [])
+                        if not isinstance(stored_sections, list):
+                            stored_sections = [str(meta.get("snap_section", ""))]
+                        category_match = bool(set(str(v) for v in stored_sections) & snap_sections.get(topic_key, set()))
+                        # Amateurfunk ist deutlich enger als die Snap-Sections
+                        # devices-and-iot/science. Diese Oberbereiche dürfen nicht
+                        # sämtliche IoT- oder Wissenschaftsprogramme einsortieren.
+                        if topic_key == "amateurfunk":
+                            category_match = False
+                        if not category_match:
+                            store_categories = {str(v.get("name") or v.get("id") or v.get("slug") or "").casefold()
+                                                if isinstance(v, dict) else str(v).casefold()
+                                                for v in meta.get("categories", [])}
+                            category_match = bool(store_categories & self._flatpak_appstream_category_ids(topic_key))
+                    else:
+                        category_match = bool(appstream_categories & self._flatpak_appstream_category_ids(topic_key))
+                    # Kategoriezuordnung ist bewusst strikt: Suchbegriffe dürfen
+                    # nur bei fehlenden Store-Kategorien als Fallback dienen.
                     text_match = bool(re.search(pattern, searchable_folded, re.IGNORECASE))
-                    if not category_match and not text_match:
+                    if self.snap_mode and topic_key == "amateurfunk":
+                        ham_categories = {str(v.get("name") or v.get("id") or v.get("slug") or "").casefold()
+                                          if isinstance(v, dict) else str(v).casefold()
+                                          for v in meta.get("categories", [])}
+                        if not text_match and "hamradio" not in ham_categories:
+                            continue
+                    elif not category_match and not text_match:
                         continue
                 rows.append(row)
             rows.sort(key=lambda row: str(row[6] if len(row) > 6 else row[0]).casefold())
@@ -2107,9 +3833,10 @@ class Window(QMainWindow):
             self._table_mode = "flatpak"
             # Dieses Flag gehört ausschließlich zum APT-Katalog. Ein geladener
             # Flathub-Katalog darf den APT-Ladezustand nicht vortäuschen.
-            self.status.setText(
-                f"{len(rows)} Flatpak applications shown · Flathub" if self.language == "en"
-                else f"{len(rows)} Flatpak-Anwendungen angezeigt · Flathub")
+            if self.snap_mode:
+                self.status.setText(f"{len(rows)} Snap applications shown" if self.language == "en" else f"{len(rows)} Snap-Anwendungen angezeigt")
+            else:
+                self.status.setText(f"{len(rows)} Flatpak applications shown · Flathub" if self.language == "en" else f"{len(rows)} Flatpak-Anwendungen angezeigt · Flathub")
             return
         if self.catalog_cache is None or not getattr(self, "_table_catalog_ready", False):
             return
@@ -2118,6 +3845,7 @@ class Window(QMainWindow):
         visible = self.table.package_model.apply_filter(
             category, self.search.text().strip(), autoremove, self.queue)
         self.status.setText((f"{visible} packages shown · Full list remains in memory" if self.language == "en" else f"{visible} Pakete angezeigt · Gesamtliste bleibt im Speicher"))
+        self._load_visible_apt_icons()
 
     @staticmethod
     def collect_catalog(progress=None):
@@ -2150,7 +3878,11 @@ class Window(QMainWindow):
             selected = installed if installed is not None else candidate
             arch = getattr(selected, "architecture", "") if selected else ""
             base_name = package.name.split(":", 1)[0]
-            rank = 0 if arch == native_arch else (1 if arch == "all" else 2)
+            # Only native packages and architecture-independent packages belong
+            # in the normal catalog. Foreign multiarch variants are not offered.
+            if arch and arch not in (native_arch, "all"):
+                continue
+            rank = 0 if arch == native_arch else 1
             current = candidates.get(base_name)
             if current is None or rank < current[0]:
                 candidates[base_name] = (rank, package)
@@ -2164,7 +3896,7 @@ class Window(QMainWindow):
         for position, name in enumerate(names, 1):
             entry = candidates.get(name.split(":", 1)[0])
             if entry is None:
-                rows.append((name, "", "Nicht installiert", ""))
+                rows.append((name, "", "Nicht installiert", "", "", ""))
                 if progress and (position % 250 == 0 or position == total_names):
                     progress(position, total_names)
                 continue
@@ -2180,7 +3912,7 @@ class Window(QMainWindow):
             section = (getattr(selected, "section", "") or "") if selected is not None else ""
             rows.append((name, version,
                          "Installiert" if is_installed else "Nicht installiert",
-                         summary, section))
+                         summary, section, ""))
             if package.is_upgradable:
                 upgradable.add(name.split(":", 1)[0])
             if package.is_auto_removable:
@@ -2381,7 +4113,7 @@ class Window(QMainWindow):
                 self.flatpak_gallery_layout.addWidget(tile)
                 def fetch_image(url=image_url):
                     request = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.41"})
-                    with urllib.request.urlopen(request, timeout=12) as response:
+                    with urllib.request.urlopen(request, timeout=8) as response:
                         return response.read(8 * 1024 * 1024)
                 job = FunctionJob(fetch_image)
                 def image_loaded(data, target=preview, selected_app=app_id):
@@ -2569,6 +4301,170 @@ class Window(QMainWindow):
         return result
 
     @staticmethod
+    def _read_apt_icon_index_local():
+        """Ordnet APT-Paketnamen lokalen Debian-AppStream-Icons zu (ohne Netz-Downloads)."""
+        import lzma
+        cache_file = Path.home() / ".cache" / "LunaPaket" / "apt-icon-index-v1.json"
+        try:
+            if cache_file.is_file() and time.time() - cache_file.stat().st_mtime < 7 * 86400:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                if isinstance(cached, dict) and any(Path(v).is_file() for v in cached.values()):
+                    return cached
+        except Exception:
+            pass
+
+        icon_roots = (Path("/var/lib/swcatalog/icons"), Path("/var/cache/swcatalog/icons"),
+                      Path("/usr/share/swcatalog/icons"), Path("/var/cache/app-info/icons"))
+        icon_files = {}
+        for root in icon_roots:
+            if not root.is_dir():
+                continue
+            try:
+                for origin in root.iterdir():
+                    if not origin.is_dir():
+                        continue
+                    for size in ("64x64", "128x128", "48x48", "scalable"):
+                        folder = origin / size
+                        if not folder.is_dir():
+                            continue
+                        try:
+                            for item in folder.iterdir():
+                                if item.is_file() and item.suffix.lower() in (".png", ".svg", ".webp"):
+                                    icon_files.setdefault(item.name, str(item))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        if not icon_files:
+            return {}
+
+        metadata_files = []
+        for folder in (Path("/var/lib/apt/lists"), Path("/var/cache/app-info/xmls")):
+            if folder.is_dir():
+                for pattern in ("*dep11*Components*.yml*", "*Components*.yml*", "*.xml.gz", "*.xml"):
+                    try:
+                        metadata_files.extend(folder.glob(pattern))
+                    except OSError:
+                        pass
+        try:
+            import yaml
+        except Exception:
+            yaml = None
+
+        result = {}
+        for metadata_path in sorted(set(metadata_files)):
+            try:
+                if metadata_path.name.endswith(".xz"):
+                    opener = lzma.open
+                elif metadata_path.name.endswith(".gz"):
+                    opener = gzip.open
+                else:
+                    opener = open
+                if metadata_path.suffix == ".xml" or metadata_path.name.endswith(".xml.gz"):
+                    with opener(metadata_path, "rb") as stream:
+                        for _event, element in ET.iterparse(stream, events=("end",)):
+                            if element.tag.rsplit("}", 1)[-1] != "component":
+                                continue
+                            package_names, icon_names = [], []
+                            for node in element.iter():
+                                tag = node.tag.rsplit("}", 1)[-1].lower()
+                                if tag in ("pkgname", "package") and (node.text or "").strip():
+                                    package_names.append((node.text or "").strip())
+                                elif tag == "icon" and (node.text or "").strip():
+                                    icon_names.append(Path((node.text or "").strip()).name)
+                            found = next((icon_files[n] for n in icon_names if n in icon_files), "")
+                            if found:
+                                for package_name in package_names:
+                                    result.setdefault(package_name.split(":", 1)[0], found)
+                            element.clear()
+                    continue
+                if yaml is None:
+                    continue
+                with opener(metadata_path, "rt", encoding="utf-8", errors="replace") as stream:
+                    for document in yaml.safe_load_all(stream):
+                        if not isinstance(document, dict):
+                            continue
+                        components = document.get("Components") or document.get("components")
+                        component_list = components if isinstance(components, list) else [document]
+                        for component in component_list:
+                            if not isinstance(component, dict):
+                                continue
+                            packages = component.get("Package") or component.get("Pkgname") or component.get("package") or []
+                            if isinstance(packages, str):
+                                packages = [packages]
+                            icon = component.get("Icon") or component.get("icon") or {}
+                            icon_names = []
+                            if isinstance(icon, str):
+                                icon_names.append(Path(icon).name)
+                            elif isinstance(icon, dict):
+                                for key in ("cached", "Cached", "stock", "Stock"):
+                                    value = icon.get(key)
+                                    values = value if isinstance(value, list) else [value]
+                                    for entry in values:
+                                        if isinstance(entry, dict):
+                                            name = entry.get("name") or entry.get("Name") or entry.get("filename") or ""
+                                        else:
+                                            name = entry or ""
+                                        if name:
+                                            icon_names.append(Path(str(name)).name)
+                            found = next((icon_files[n] for n in icon_names if n in icon_files), "")
+                            if found:
+                                for package_name in packages:
+                                    result.setdefault(str(package_name).split(":", 1)[0], found)
+            except Exception:
+                continue
+
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            temp = cache_file.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            temp.replace(cache_file)
+        except Exception:
+            pass
+        return result
+
+    def _load_visible_apt_icons(self):
+        """Lädt lokale APT-Symbole asynchron nur für aktuell sichtbare Zeilen."""
+        if getattr(self, "_table_mode", "") != "apt" or self.flatpak_mode:
+            return
+        if getattr(self, "_apt_icon_index", None) is None:
+            if getattr(self, "_apt_icon_index_loading", False):
+                return
+            self._apt_icon_index_loading = True
+            job = FunctionJob(Window._read_apt_icon_index_local)
+            self._apt_icon_index_job = job
+            def ready(index):
+                self._apt_icon_index = index or {}
+                self._apt_icon_index_loading = False
+                self._load_visible_apt_icons()
+            def failed(_error):
+                self._apt_icon_index = {}
+                self._apt_icon_index_loading = False
+            job.result.connect(ready)
+            job.failed.connect(failed)
+            job.start()
+            return
+
+        model = self.table.package_model
+        if not model.visible_rows:
+            return
+        viewport = self.table.viewport().rect()
+        top = self.table.indexAt(viewport.topLeft())
+        bottom = self.table.indexAt(viewport.bottomLeft())
+        if not top.isValid():
+            return
+        first = top.row()
+        last = bottom.row() if bottom.isValid() else min(model.rowCount() - 1, first + 20)
+        for visible_row in range(max(0, first), min(model.rowCount() - 1, last) + 1):
+            source_row = model.visible_rows[visible_row]
+            row = model.rows[source_row]
+            if len(row) <= 5 or row[5]:
+                continue
+            icon_path = self._apt_icon_index.get(str(row[0]).split(":", 1)[0], "")
+            if icon_path and Path(icon_path).is_file():
+                model.set_icon_path(source_row, icon_path)
+
+    @staticmethod
     def _fetch_apt_screenshot(image_url):
         """Liest ein APT-Bild zuerst aus dem lokalen Cache, sonst aus dem Netz."""
         cache_dir = Path.home() / ".cache" / "LunaPaket" / "apt-screenshots"
@@ -2678,7 +4574,7 @@ class Window(QMainWindow):
         if self.flatpak_mode:
             app_id = self.selected_flatpak_id()
             if app_id:
-                self.show_flatpak_details(app_id)
+                self.show_snap_details(app_id) if self.snap_mode else self.show_flatpak_details(app_id)
             return
         self.details_title.setText("Paketdetails")
         n=self.selected()
@@ -2712,7 +4608,8 @@ class Window(QMainWindow):
             app_id = self.selected_flatpak_id()
             if not app_id:
                 return
-            row = next((item for item in self.flatpak_catalog if item[0] == app_id), None)
+            active_catalog = self.snap_catalog if self.snap_mode else self.flatpak_catalog
+            row = next((item for item in active_catalog if item[0] == app_id), None)
             if not row:
                 return
             queued = self.flatpak_queue.get(app_id)
@@ -2723,15 +4620,32 @@ class Window(QMainWindow):
                 QMenu::item { padding: 8px 30px 8px 12px; min-height: 22px; margin: 1px 0px; }
                 QMenu::separator { height: 1px; margin: 5px 8px; }
             """)
-            if queued:
-                menu.addAction("Vormerkung aufheben", lambda: self.queue_flatpak_action(app_id, None))
-            elif installed:
-                menu.addAction("Entfernen vormerken", lambda: self.queue_flatpak_action(app_id, "remove"))
+            if installed:
+                menu.addAction("Start application" if self.language == "en" else "Anwendung starten",
+                               lambda checked=False, app=app_id, is_snap=self.snap_mode: self.launch_package_application(app, "snap" if is_snap else "flatpak"))
+                menu.addSeparator()
+            if self.snap_mode:
+                english = self.language == "en"
+                if queued:
+                    menu.addAction("Cancel queued action" if english else "Vormerkung aufheben", lambda: self.queue_flatpak_action(app_id, None))
+                elif installed:
+                    menu.addAction("Queue for removal" if english else "Entfernen vormerken", lambda: self.queue_flatpak_action(app_id, "remove"))
+                else:
+                    menu.addAction("Queue for installation" if english else "Installieren vormerken", lambda: self.queue_flatpak_action(app_id, "install"))
+                menu.addSeparator()
+                menu.addAction("Show Snap details" if english else "Snap-Details anzeigen", lambda checked=False, app=app_id: self.show_snap_details(app))
+                menu.addAction("Copy Snap name" if english else "Snap-Name kopieren", lambda: QApplication.clipboard().setText(app_id))
             else:
-                menu.addAction("Installieren vormerken", lambda: self.queue_flatpak_action(app_id, "install"))
-            menu.addSeparator()
-            menu.addAction("Anwendungsdetails anzeigen", lambda checked=False, app=app_id: self.show_flatpak_details(app))
-            menu.addAction("App-ID kopieren", lambda: QApplication.clipboard().setText(app_id))
+                english = self.language == "en"
+                if queued:
+                    menu.addAction("Cancel queued action" if english else "Vormerkung aufheben", lambda: self.queue_flatpak_action(app_id, None))
+                elif installed:
+                    menu.addAction("Queue for removal" if english else "Entfernen vormerken", lambda: self.queue_flatpak_action(app_id, "remove"))
+                else:
+                    menu.addAction("Queue for installation" if english else "Installieren vormerken", lambda: self.queue_flatpak_action(app_id, "install"))
+                menu.addSeparator()
+                menu.addAction("Show application details" if english else "Anwendungsdetails anzeigen", lambda checked=False, app=app_id: self.show_flatpak_details(app))
+                menu.addAction("Copy application ID" if english else "App-ID kopieren", lambda: QApplication.clipboard().setText(app_id))
             menu.exec(self.table.viewport().mapToGlobal(pos))
             return
         name = self.selected()
@@ -2754,6 +4668,13 @@ class Window(QMainWindow):
                 margin: 5px 8px;
             }
         """)
+        status_text = self.table.item(index.row(), 3).text() if self.table.item(index.row(), 3) else ""
+        apt_installed = status_text in ("Installiert", "Installed")
+        desktop_id = self._apt_desktop_id(name) if apt_installed else ""
+        if desktop_id:
+            menu.addAction("Anwendung starten" if self.language != "en" else "Start application",
+                           lambda checked=False, app=name: self.launch_package_application(app, "apt", desktop_id))
+            menu.addSeparator()
         menu.addAction("Queue for installation" if self.language == "en" else "Installieren vormerken", lambda: self.mark("install"))
         menu.addAction("Queue for reinstallation" if self.language == "en" else "Neu installieren vormerken", lambda: self.mark("reinstall"))
         menu.addAction("Queue for removal" if self.language == "en" else "Entfernen vormerken", lambda: self.mark("remove"))
@@ -2768,6 +4689,78 @@ class Window(QMainWindow):
         menu.addAction("Properties …" if self.language == "en" else "Eigenschaften …", self.show_properties)
         menu.addAction("Show installed files …" if self.language == "en" else "Installierte Dateien anzeigen …", self.show_package_files)
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    @staticmethod
+    def _apt_desktop_id(package_name):
+        """Find a visible desktop launcher shipped by an installed APT package."""
+        try:
+            result = subprocess.run(
+                ["dpkg-query", "-L", package_name], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=5, check=False
+            )
+            if result.returncode != 0:
+                return ""
+            for raw_path in sorted(result.stdout.splitlines()):
+                path = raw_path.strip()
+                if not path.endswith(".desktop") or not os.path.isfile(path):
+                    continue
+                try:
+                    content = Path(path).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if re.search(r"(?im)^\s*(Hidden|NoDisplay)\s*=\s*true\s*$", content):
+                    continue
+                if not re.search(r"(?im)^\s*Exec\s*=\s*\S+", content):
+                    continue
+                return Path(path).name[:-8]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return ""
+
+    def launch_package_application(self, app_id, source, desktop_id=""):
+        """Start applications as the logged-in desktop user, never as root."""
+        if source == "flatpak":
+            command = ["flatpak", "run", str(app_id)]
+        elif source == "snap":
+            command = ["snap", "run", str(app_id)]
+        elif source == "apt" and desktop_id:
+            command = ["gtk-launch", str(desktop_id)]
+        else:
+            return
+        try:
+            env = os.environ.copy()
+            if os.geteuid() == 0:
+                # The package manager GUI may have been relaunched via pkexec.
+                # Drop privileges for *all* application launchers, regardless
+                # of package source, and restore the desktop user's session env.
+                uid_text = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+                if not uid_text or not uid_text.isdigit():
+                    raise RuntimeError("Angemeldeter Desktop-Benutzer konnte nicht ermittelt werden.")
+                account = pwd.getpwuid(int(uid_text))
+                if account.pw_uid == 0:
+                    raise RuntimeError("Start als root ist aus Sicherheitsgründen gesperrt.")
+                setpriv = shutil.which("setpriv")
+                if not setpriv:
+                    raise RuntimeError("setpriv aus util-linux fehlt; sicherer Benutzerwechsel nicht möglich.")
+                env.update({"HOME": account.pw_dir, "USER": account.pw_name,
+                            "LOGNAME": account.pw_name})
+                runtime_dir = f"/run/user/{account.pw_uid}"
+                if os.path.isdir(runtime_dir):
+                    env["XDG_RUNTIME_DIR"] = runtime_dir
+                command = [setpriv, f"--reuid={account.pw_uid}",
+                           f"--regid={account.pw_gid}", "--init-groups", "--", *command]
+            if not shutil.which(command[0]) and not os.path.isabs(command[0]):
+                raise FileNotFoundError(command[0])
+            subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+                env=env
+            )
+        except (OSError, subprocess.SubprocessError, RuntimeError, KeyError) as exc:
+            title = "Application could not be started" if self.language == "en" else "Anwendung konnte nicht gestartet werden"
+            message = f"{app_id}: {exc}"
+            QMessageBox.warning(self, title, message)
 
     def package_is_held(self, name):
         r, out = cmd(["apt-mark", "showhold"])
@@ -2858,6 +4851,11 @@ class Window(QMainWindow):
         self.update_queue_label()
 
     def _flatpak_command_for_action(self, app_id, action):
+        if self.snap_mode:
+            if action == "install":
+                channel = str(self.snap_channel_combo.currentData() or "latest/stable")
+                return ["snap", "install", "--channel=" + channel, app_id]
+            return ["snap", "remove", app_id]
         row = next((item for item in self.flatpak_catalog if item and item[0] == app_id), None)
         meta = row[7] if row and len(row) > 7 and isinstance(row[7], dict) else {}
         if action == "install":
@@ -2870,6 +4868,81 @@ class Window(QMainWindow):
 
     def apply_queued_changes(self):
         """Führt ausschließlich die ausdrücklich vorgemerkten Paketaktionen aus."""
+        if self.snap_mode:
+            if not self.flatpak_queue:
+                QMessageBox.information(self, "Vorgemerkte Änderungen", "Es sind keine Snap-Änderungen vorgemerkt." if self.language == "de" else "There are no queued Snap changes.")
+                return
+            actions = dict(self.flatpak_queue)
+            self.set_busy(True)
+            self.status.setText("Snap-Änderungen werden angewendet …" if self.language == "de" else "Applying queued Snap changes …")
+            def run_snap_queue(report, emit_output):
+                results=[]
+                total = len(actions)
+                for index, (snap_name, action) in enumerate(actions.items(), 1):
+                    report(index - 1, total, f"{snap_name} ({action})")
+                    chunks=[]
+                    try:
+                        command=self._flatpak_command_for_action(snap_name, action)
+                        def capture(line):
+                            chunks.append(line)
+                            emit_output(line)
+                        rc=run_snap_command_live(command, capture, timeout=1800)
+                    except Exception as error:
+                        rc=1
+                        chunks.append(str(error))
+                        emit_output(str(error))
+                    results.append((snap_name, action, rc, "\n".join(chunks)))
+                    report(index, total, f"{snap_name} ({action})")
+                return results
+            english = self.language == "en"
+            progress = ActionProgressDialog(self, "Snap-Änderungen ausführen" if not english else "Apply Snap changes",
+                                            "Vorgemerkte Snap-Aktionen werden ausgeführt. Bitte warten …" if not english else "Queued Snap actions are running. Please wait …",
+                                            english=english, settings=self.settings, setting_key="progress/auto_close_after_success")
+            # Snap stellt für einen einzelnen Vorgang keinen Prozentwert bereit.
+            # Der Balken startet deshalb sichtbar bei 0 und bewegt sich mit jeder
+            # live empfangenen PTY-Statuszeile bis höchstens 95 %.
+            progress.progress.setRange(0, 100)
+            progress.progress.setValue(0)
+            progress._snap_activity_value = 0
+            self.snap_queue_job = FunctionJob(run_snap_queue, with_progress_detail_output=True)
+            def append_snap_queue_output(line):
+                progress.append_output(line)
+                progress._snap_activity_value = min(95, progress._snap_activity_value + 1)
+                progress.progress.setValue(progress._snap_activity_value)
+            self.snap_queue_job.output.connect(append_snap_queue_output)
+            def update_snap_queue_progress(done, total, message):
+                if total > 1 and done > 0:
+                    progress.progress.setValue(min(95, int(done * 100 / total)))
+                progress.current.setText(("Aktuell: " if not english else "Current: ") + message)
+            self.snap_queue_job.progress_detail.connect(update_snap_queue_progress)
+            progress.close_button.setText("Installation läuft …" if not english else "Installation in progress …")
+            def snap_queue_finished(results):
+                self.set_busy(False)
+                failures=[name for name, action, rc, output in results if rc != 0]
+                output_text = "\n\n".join(output.strip() or f"{name}: exit {rc}" for name, action, rc, output in results)
+                self.details.setPlainText(output_text)
+                for name, action, rc, output in results:
+                    if rc == 0: self.flatpak_queue.pop(name, None)
+                self.update_queue_label()
+                if failures:
+                    action_message = (("Snap-Aktionen teilweise fehlgeschlagen (" if self.language == "de" else "Some Snap actions failed (") + ", ".join(failures) + ").")
+                else:
+                    action_message = ("Installation/Deinstallation abgeschlossen." if self.language == "de" else "Installation/removal completed.")
+                self.snap_post_action_message = action_message
+                progress.progress.setRange(0, 100); progress.finish(1 if failures else 0)
+                # Der Status bleibt während des anschließenden Katalogimports sichtbar.
+                self.status.setText(action_message + (" Snap-Katalog wird im Hintergrund aktualisiert …" if self.language == "de" else " Snap catalog is refreshing in the background …"))
+                self.load_snap_catalog()
+            def snap_queue_failed(error):
+                self.set_busy(False); progress.progress.setRange(0, 100); progress.append_output(str(error)); progress.finish(1)
+                self.status.setText("Snap-Fehler: " + str(error))
+            self.snap_queue_job.result.connect(snap_queue_finished)
+            self.snap_queue_job.failed.connect(snap_queue_failed)
+            # Den Snap-Worker erst starten, nachdem exec() den Dialog
+            # angezeigt und seine Ereignisschleife geöffnet hat.
+            QTimer.singleShot(0, lambda job=self.snap_queue_job: job.start())
+            progress.exec()
+            return
         if self.flatpak_mode:
             if not self.flatpak_queue:
                 QMessageBox.information(
@@ -2879,57 +4952,89 @@ class Window(QMainWindow):
                     else "Es sind keine Flatpak-Änderungen vorgemerkt."
                 )
                 return
-            actions = dict(self.flatpak_queue)
-            app_ids = list(actions)
+            actions = list(self.flatpak_queue.items())
+            english = self.language == "en"
             self.status.setText(
-                "Applying queued Flatpak changes …" if self.language == "en"
+                "Applying queued Flatpak changes …" if english
                 else "Vorgemerkte Flatpak-Änderungen werden angewendet …"
             )
             self.set_busy(True)
-            def run_flatpak_queue():
-                outputs = []
-                failures = []
-                for app_id, action in actions.items():
-                    args = self._flatpak_command_for_action(app_id, action)
-                    try:
-                        rc, output = cmd(args)
-                    except Exception as error:
-                        rc, output = 1, str(error)
-                    outputs.append(output or f"{app_id}: exit {rc}")
-                    if rc != 0:
-                        failures.append(app_id)
-                return failures, "\n\n".join(outputs)
-            self.flatpak_queue_job = FunctionJob(run_flatpak_queue)
-            def finished(result):
-                failures, output = result
-                self.set_busy(False)
-                self.details.setPlainText(output)
-                for app_id in app_ids:
-                    if app_id not in failures:
-                        self.flatpak_queue.pop(app_id, None)
-                self.update_queue_label()
-                self.load_flatpak_catalog()
-                if failures:
-                    self.status.setText(
-                        ("Flatpak: Some queued actions failed: " if self.language == "en"
-                         else "Flatpak: Einige vorgemerkte Aktionen sind fehlgeschlagen: ")
-                        + ", ".join(failures)
-                    )
-                else:
-                    self.status.setText(
-                        "All queued Flatpak changes have been applied." if self.language == "en"
-                        else "Alle vorgemerkten Flatpak-Änderungen wurden ausgeführt."
-                    )
-            self.flatpak_queue_job.result.connect(finished)
-            self.flatpak_queue_job.failed.connect(
-                lambda error: (
-                    self.set_busy(False),
-                    self.status.setText(
-                        ("Flatpak error: " if self.language == "en" else "Flatpak-Fehler: ") + str(error)
-                    )
-                )
+            progress = ActionProgressDialog(
+                self,
+                "Apply Flatpak changes" if english else "Flatpak-Änderungen ausführen",
+                (f"Applying {len(actions)} queued Flatpak action(s). Please wait …" if english
+                 else f"{len(actions)} vorgemerkte Flatpak-Aktionen werden ausgeführt. Bitte warten …"),
+                english=english, settings=self.settings,
+                setting_key="progress/auto_close_after_success"
             )
-            self.flatpak_queue_job.start()
+            progress.set_progress(0, "Preparing Flatpak changes" if english else "Flatpak-Änderungen werden vorbereitet")
+            results = []
+            details = []
+            current_index = {"value": 0}
+            active_job = {"job": None}
+
+            def start_next_flatpak_action():
+                index = current_index["value"]
+                if index >= len(actions):
+                    failures = [app_id for app_id, _action, rc, _output in results if rc != 0]
+                    self.set_busy(False)
+                    self.details.setPlainText("\n\n".join(details))
+                    for app_id, _action, rc, _output in results:
+                        if rc == 0:
+                            self.flatpak_queue.pop(app_id, None)
+                    self.update_queue_label()
+                    if failures:
+                        post_action = (("Flatpak actions partly failed: " if english else "Flatpak-Aktionen teilweise fehlgeschlagen: ")
+                                       + ", ".join(failures) + ".")
+                    else:
+                        post_action = ("Installation/removal completed." if english else "Installation/Deinstallation abgeschlossen.")
+                    self.flatpak_post_action_message = post_action
+                    self.status.setText(post_action + (" Flathub catalog is refreshing in the background …" if english else " Flathub-Katalog wird im Hintergrund aktualisiert …"))
+                    self.load_flatpak_catalog()
+                    progress.finish(1 if failures else 0)
+                    if failures:
+                        QMessageBox.warning(
+                            self, "Flatpak",
+                            ("Some Flatpak actions failed:" if english else "Einige Flatpak-Aktionen sind fehlgeschlagen:")
+                            + "\n\n" + "\n".join(failures)
+                        )
+                    return
+
+                app_id, action = actions[index]
+                action_label = "Install" if action == "install" else "Uninstall"
+                progress.set_progress(int(index * 100 / len(actions)), f"{action_label}: {app_id}")
+                progress.append_output(("Installing " if action == "install" and english else
+                                        "Removing " if english else
+                                        "Installiere " if action == "install" else "Entferne ") + app_id)
+                try:
+                    args = self._flatpak_command_for_action(app_id, action)
+                    job = CommandStreamJob(args)
+                except Exception as error:
+                    results.append((app_id, action, 1, str(error)))
+                    details.append(f"{app_id}: {error}")
+                    progress.append_output(str(error))
+                    current_index["value"] += 1
+                    start_next_flatpak_action()
+                    return
+
+                active_job["job"] = job
+                job.output.connect(progress.append_output)
+
+                def action_finished(rc, output, app_id=app_id, action=action, index=index):
+                    results.append((app_id, action, rc, output))
+                    details.append(output.strip() or f"{app_id}: exit {rc}")
+                    if rc != 0:
+                        progress.append_output(f"{app_id}: exit {rc}")
+                    current_index["value"] = index + 1
+                    progress.set_progress(int(current_index["value"] * 100 / len(actions)), app_id)
+                    start_next_flatpak_action()
+
+                job.finished_text.connect(action_finished)
+                job.start()
+
+            progress.close_button.setText("Installation in progress …" if english else "Installation läuft …")
+            QTimer.singleShot(0, start_next_flatpak_action)
+            progress.exec()
             return
         self.sync_queue_from_checkboxes()
         if not self.queue:
@@ -3078,29 +5183,67 @@ class Window(QMainWindow):
                 self.flatpak_update_btn.setEnabled(False)
                 self.set_busy(True)
                 self.status.setText("Installing Flatpak updates …" if english else "Flatpak-Updates werden installiert …")
-                def install():
-                    results = []
-                    for scope, ref in selected:
-                        args = ["flatpak", "update", "-y", "--noninteractive", scope_flag(scope), ref]
-                        rc, output = cmd(privileged(args)) if scope == "system" else flatpak_user_cmd(args)
+                progress = ActionProgressDialog(
+                    self,
+                    "Installing Flatpak updates" if english else "Flathub-Updates installieren",
+                    (f"Installing {len(selected)} selected Flatpak update(s)." if english
+                     else f"{len(selected)} ausgewählte Flatpak-Updates werden installiert."),
+                    english=english, settings=self.settings,
+                    setting_key="progress/auto_close_after_success")
+                progress.set_progress(0, "Preparing Flatpak updates" if english else "Flatpak-Updates werden vorbereitet")
+                results = []
+                details = []
+                current_index = {"value": 0}
+
+                def user_command(args):
+                    uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+                    account = pwd.getpwuid(uid)
+                    if os.geteuid() != 0 or uid == os.getuid():
+                        return args
+                    runuser = shutil.which("runuser")
+                    if not runuser:
+                        raise RuntimeError("runuser is required to access the desktop user's Flatpak installation.")
+                    user_env = [f"HOME={account.pw_dir}", f"USER={account.pw_name}",
+                                f"LOGNAME={account.pw_name}",
+                                f"XDG_CONFIG_HOME={Path(account.pw_dir) / '.config'}",
+                                f"XDG_DATA_HOME={Path(account.pw_dir) / '.local' / 'share'}"]
+                    return [runuser, "-u", account.pw_name, "--", "env", *user_env, *args]
+
+                def start_next_flatpak_update():
+                    index = current_index["value"]
+                    if index >= len(selected):
+                        progress.finish(1 if any(item[2] != 0 for item in results) else 0)
+                        self.set_busy(False)
+                        self.flatpak_update_btn.setEnabled(True)
+                        self.details.setPlainText("\n\n".join(details))
+                        failures = [(scope, ref, output) for scope, ref, rc, output in results if rc != 0]
+                        if failures:
+                            self.status.setText("Some Flatpak updates failed." if english else "Einige Flatpak-Updates sind fehlgeschlagen.")
+                            QMessageBox.warning(self, "Flatpak", ("Some updates could not be installed:" if english else "Einige Updates konnten nicht installiert werden:") + "\n\n" + "\n".join(ref for _scope, ref, _output in failures))
+                        else:
+                            self.status.setText("Flatpak updates completed." if english else "Flatpak-Updates abgeschlossen.")
+                            QMessageBox.information(self, "Flatpak", "All selected Flatpak updates were installed." if english else "Alle ausgewählten Flatpak-Updates wurden installiert.")
+                        self.load_flatpak_catalog()
+                        return
+                    scope, ref = selected[index]
+                    progress.set_progress(int(index * 100 / len(selected)), ref)
+                    progress.append_output(("Updating " if english else "Aktualisiere ") + ref)
+                    args = ["flatpak", "update", "-y", "--noninteractive", scope_flag(scope), ref]
+                    command = privileged(args) if scope == "system" else user_command(args)
+                    job = CommandStreamJob(command)
+                    self.flatpak_update_stream = job
+                    job.output.connect(progress.append_output)
+                    def one_finished(rc, output, scope=scope, ref=ref, index=index):
                         results.append((scope, ref, rc, output))
-                    return results
-                self.flatpak_update_job = FunctionJob(install)
-                def installed(results):
-                    self.set_busy(False); self.flatpak_update_btn.setEnabled(True)
-                    failures = [(scope, ref, output) for scope, ref, rc, output in results if rc != 0]
-                    details = "\n\n".join(output.strip() or f"{ref}: exit {rc}" for scope, ref, rc, output in results)
-                    self.details.setPlainText(details)
-                    if failures:
-                        self.status.setText("Some Flatpak updates failed." if english else "Einige Flatpak-Updates sind fehlgeschlagen.")
-                        QMessageBox.warning(self, "Flatpak", ("Some updates could not be installed:" if english else "Einige Updates konnten nicht installiert werden:") + "\n\n" + "\n".join(ref for _scope, ref, _output in failures))
-                    else:
-                        self.status.setText("Flatpak updates completed." if english else "Flatpak-Updates abgeschlossen.")
-                        QMessageBox.information(self, "Flatpak", "All selected Flatpak updates were installed." if english else "Alle ausgewählten Flatpak-Updates wurden installiert.")
-                    self.load_flatpak_catalog()
-                self.flatpak_update_job.result.connect(installed)
-                self.flatpak_update_job.failed.connect(lambda error: (self.set_busy(False), self.flatpak_update_btn.setEnabled(True), QMessageBox.critical(self, "Flatpak", str(error))))
-                self.flatpak_update_job.start()
+                        details.append(output.strip() or f"{ref}: exit {rc}")
+                        current_index["value"] = index + 1
+                        progress.set_progress(int(current_index["value"] * 100 / len(selected)), ref)
+                        start_next_flatpak_update()
+                    job.finished_text.connect(one_finished)
+                    job.start()
+
+                start_next_flatpak_update()
+                progress.exec()
 
             def scope_flag(scope):
                 return "--user" if scope == "user" else "--system"
@@ -3113,6 +5256,189 @@ class Window(QMainWindow):
         self.flatpak_update_scan_job.result.connect(ready)
         self.flatpak_update_scan_job.failed.connect(lambda error: (self.flatpak_update_btn.setEnabled(True), self.status.setText("Flatpak update check failed" if english else "Flatpak-Updateprüfung fehlgeschlagen"), QMessageBox.warning(self, "Flatpak", str(error))))
         self.flatpak_update_scan_job.start()
+
+    def show_snap_cleanup_dialog(self):
+        """Zeigt deaktivierte Snap-Revisionen und gespeicherte Snapshots zur gezielten Bereinigung."""
+        english = self.language == "en"
+        if not shutil.which("snap"):
+            QMessageBox.warning(self, "Snap", "Snap is not installed." if english else "Snap ist nicht installiert.")
+            return
+        self.status.setText("Checking old Snap revisions and saved snapshots …" if english
+                            else "Prüfe alte Snap-Revisionen und Sicherungen …")
+        self.set_busy(True)
+
+        def inspect_snap():
+            revisions, snapshots = [], []
+            result = subprocess.run(["snap", "list", "--all"], text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+            if result.returncode != 0:
+                raise RuntimeError(result.stdout.strip() or "snap list --all failed")
+            for line in result.stdout.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 6 and parts[-1].lower() == "disabled":
+                    revisions.append((parts[0], parts[2], parts[1]))
+            saved = subprocess.run(["snap", "saved"], text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, timeout=120)
+            if saved.returncode == 0:
+                for line in saved.stdout.splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0].isdigit():
+                        snapshots.append((parts[0], parts[1]))
+            return revisions, sorted(set(snapshots), key=lambda item: (int(item[0]), item[1]))
+
+        self.snap_cleanup_scan_job = FunctionJob(inspect_snap)
+
+        def scan_ready(result):
+            self.set_busy(False)
+            revisions, snapshots = result
+            if not revisions and not snapshots:
+                QMessageBox.information(self, "Snap",
+                    "No disabled revisions or saved snapshots were found." if english
+                    else "Es wurden keine alten Snap-Revisionen oder Snap-Sicherungen gefunden.")
+                self.status.setText("Snap is already clean." if english else "Snap ist bereits aufgeräumt.")
+                return
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Clean up Snap" if english else "Snap aufräumen")
+            dlg.resize(680, 480)
+            layout = QVBoxLayout(dlg)
+            intro = QLabel(
+                "Select old revisions and backup sets to remove. Active revisions are protected."
+                if english else
+                "Wähle alte Revisionen und Sicherungen zum Entfernen aus. Aktive Revisionen bleiben geschützt."
+            )
+            intro.setWordWrap(True)
+            layout.addWidget(intro)
+            listing = QListWidget()
+            listing.setSelectionMode(QAbstractItemView.NoSelection)
+            entries = []
+            for name, revision, version in revisions:
+                label = (f"Old revision: {name} · revision {revision} · {version}" if english
+                         else f"Alte Revision: {name} · Revision {revision} · {version}")
+                item = QListWidgetItem(label)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                listing.addItem(item)
+                entries.append(("revision", name, revision))
+            for set_id, snap_name in snapshots:
+                label = (f"Saved backup: set {set_id} · {snap_name}" if english
+                         else f"Snap-Sicherung: Satz {set_id} · {snap_name}")
+                item = QListWidgetItem(label)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                listing.addItem(item)
+                entries.append(("snapshot", set_id, snap_name))
+            layout.addWidget(listing, 1)
+            buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+            buttons.button(QDialogButtonBox.Ok).setText("Remove selected" if english else "Ausgewählte entfernen")
+            buttons.button(QDialogButtonBox.Cancel).setText("Cancel" if english else "Abbrechen")
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
+            layout.addWidget(buttons)
+            if dlg.exec() != QDialog.Accepted:
+                self.status.setText("Snap cleanup cancelled." if english else "Snap-Aufräumen abgebrochen.")
+                return
+            selected = [entry for index, entry in enumerate(entries)
+                        if listing.item(index).checkState() == Qt.Checked]
+            if not selected:
+                self.status.setText("Nothing selected." if english else "Nichts ausgewählt.")
+                return
+            self.status.setText("Removing selected Snap data …" if english else "Ausgewählte Snap-Daten werden entfernt …")
+            self.set_busy(True)
+
+            def remove_selected(report, emit_output):
+                outputs, failures = [], []
+                total = len(selected)
+                for index, entry in enumerate(selected, 1):
+                    if entry[0] == "revision":
+                        label = f"{entry[1]} · revision {entry[2]}"
+                        command = privileged(["snap", "remove", entry[1], "--revision", entry[2]])
+                    else:
+                        label = f"snapshot set {entry[1]}"
+                        command = privileged(["snap", "forget", entry[1]])
+                    report(index - 1, total, label)
+                    chunks = []
+                    def capture(line):
+                        chunks.append(line)
+                        emit_output(line)
+                    try:
+                        rc = run_snap_command_live(command, capture, timeout=600)
+                    except Exception as error:
+                        rc = 1
+                        chunks.append(str(error))
+                        emit_output(str(error))
+                    output_text = "\\n".join(chunks)
+                    if output_text.strip():
+                        outputs.append(output_text)
+                    if rc != 0:
+                        failures.append(" ".join(command[1:]) + ": " + output_text)
+                    report(index, total, label)
+                return outputs, failures
+
+            progress = ActionProgressDialog(
+                self,
+                "Clean up Snap" if english else "Snap aufräumen",
+                ("Selected old revisions and backups are being removed. Please wait."
+                 if english else
+                 "Die ausgewählten alten Revisionen und Sicherungen werden entfernt. Bitte warten."),
+                english=english, settings=self.settings,
+                setting_key="progress/auto_close_after_success"
+            )
+            progress.progress.setRange(0, 100)
+            progress.progress.setValue(0)
+            progress._snap_activity_value = 0
+            self.snap_cleanup_job = FunctionJob(remove_selected, with_progress_detail_output=True)
+
+            def append_cleanup_output(line):
+                progress.append_output(line)
+                progress._snap_activity_value = min(95, progress._snap_activity_value + 1)
+                progress.progress.setValue(progress._snap_activity_value)
+
+            def update_cleanup_progress(done, total, message):
+                if total > 1 and done > 0:
+                    progress.progress.setValue(min(95, int(done * 100 / total)))
+                progress.current.setText(("Current: " if english else "Aktuell: ") + message)
+
+            self.snap_cleanup_job.output.connect(append_cleanup_output)
+            self.snap_cleanup_job.progress_detail.connect(update_cleanup_progress)
+            progress.close_button.setText("Removal in progress …" if english else "Löschung läuft …")
+
+            def cleanup_ready(result):
+                self.set_busy(False)
+                outputs, failures = result
+                if outputs:
+                    self.details.setPlainText("\\n\\n".join(outputs))
+                progress.progress.setRange(0, 100)
+                progress.finish(1 if failures else 0)
+                if failures:
+                    self.status.setText("Snap cleanup completed with errors." if english
+                                         else "Snap-Aufräumen mit Fehlern beendet.")
+                else:
+                    self.status.setText("Snap cleanup completed." if english
+                                         else "Snap-Aufräumen abgeschlossen.")
+                if failures:
+                    progress.append_output(("\\nSome items could not be removed:\\n" if english
+                                            else "\\nEinige Einträge konnten nicht entfernt werden:\\n")
+                                           + "\\n".join(failures))
+
+            def cleanup_failed(error):
+                self.set_busy(False)
+                progress.append_output(str(error))
+                progress.progress.setRange(0, 100)
+                progress.finish(1)
+                self.status.setText(("Snap cleanup failed: " if english else "Snap-Aufräumen fehlgeschlagen: ") + str(error))
+
+            self.snap_cleanup_job.result.connect(cleanup_ready)
+            self.snap_cleanup_job.failed.connect(cleanup_failed)
+            QTimer.singleShot(0, lambda job=self.snap_cleanup_job: job.start())
+            progress.exec()
+
+        self.snap_cleanup_scan_job.result.connect(scan_ready)
+        self.snap_cleanup_scan_job.failed.connect(lambda error: (
+            self.set_busy(False),
+            QMessageBox.warning(self, "Snap",
+                ("Could not inspect Snap data: " if english else "Snap-Daten konnten nicht geprüft werden: ") + str(error))
+        ))
+        self.snap_cleanup_scan_job.start()
 
     def show_flatpak_cleanup_dialog(self):
         """Findet ungenutzte Flatpak-Runtimes getrennt in Benutzer- und Systeminstallation."""
@@ -3403,7 +5729,7 @@ class Window(QMainWindow):
         details.setPlainText(preview)
         layout.addWidget(details, 1)
         auto_close = QCheckBox("Close window after successful action" if en else "Fenster nach erfolgreicher Aktion schließen")
-        auto_close.setChecked(True)
+        self._bind_auto_close_preference(auto_close, "progress/auto_close_after_success")
         layout.addWidget(auto_close)
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
         buttons.button(QDialogButtonBox.Ok).setText("Run now" if en else "Jetzt ausführen")
@@ -3448,7 +5774,7 @@ class Window(QMainWindow):
         )
         self.run_action_job(privileged(["/bin/sh", "-c", shell]), action_title,
                             action_description, expected,
-                            auto_close=auto_close.isChecked())
+                            auto_close=auto_close.isChecked(), auto_close_key="progress/auto_close_after_success")
 
     def show_package_history(self):
         dialog = QDialog(self)
@@ -3506,11 +5832,13 @@ class Window(QMainWindow):
             return max(0, min(99, round(percent))), label
         return None, None
 
-    def run_action_job(self, args, title, description, expected=0, auto_close=True):
+    def run_action_job(self, args, title, description, expected=0, auto_close=True, auto_close_key="progress/auto_close_after_success"):
         self.status.setText("Package operation in progress …" if self.language == "en" else "Paketaktion läuft …")
         self.set_busy(True)
-        dialog = ActionProgressDialog(self, title, description, english=self.language == "en")
-        dialog.auto_close.setChecked(bool(auto_close))
+        dialog = ActionProgressDialog(self, title, description, english=self.language == "en",
+                                      settings=self.settings, setting_key=auto_close_key)
+        # ActionProgressDialog already loaded the persisted preference.
+        # Do not overwrite it with the method's legacy default argument.
         self.action_stream = StreamJob(args)
         completed = set()
         def output_line(line):
@@ -3653,7 +5981,7 @@ class Window(QMainWindow):
         log.setPlainText(("Package lists updated successfully.\n" if en else "Paketlisten erfolgreich aktualisiert.\n") + "\n".join(packages))
         lay.addWidget(log, 1)
         auto_close = QCheckBox("Close window after successful action" if en else "Fenster nach erfolgreicher Aktion schließen")
-        auto_close.setChecked(True)
+        self._bind_auto_close_preference(auto_close, "progress/auto_close_after_success")
         lay.addWidget(auto_close)
         buttons = QDialogButtonBox()
         cancel = buttons.addButton("Cancel" if en else "Abbrechen", QDialogButtonBox.RejectRole)
@@ -3671,9 +5999,10 @@ class Window(QMainWindow):
             self.status.setText("Update cancelled – nothing installed" if en else "Aktualisierung abgebrochen – nichts installiert")
             return
         selected = security_packages if choice["mode"] == "security" else packages
-        self.start_upgrade_install(selected, security_only=(choice["mode"] == "security"), auto_close=auto_close.isChecked())
+        self.start_upgrade_install(selected, security_only=(choice["mode"] == "security"), auto_close=auto_close.isChecked(),
+                                   auto_close_key="progress/auto_close_after_success")
 
-    def start_upgrade_install(self, packages, security_only=False, auto_close=True):
+    def start_upgrade_install(self, packages, security_only=False, auto_close=True, auto_close_key="progress/auto_close_after_success"):
         en = self.language == "en"
         if en:
             title = "Installing security updates" if security_only else "Updating system"
@@ -3681,8 +6010,9 @@ class Window(QMainWindow):
         else:
             title = "Sicherheitsaktualisierungen installieren" if security_only else "System wird aktualisiert"
             description = f"{len(packages)} Paketaktualisierung(en) werden installiert."
-        progress = ActionProgressDialog(self, title, description, english=en)
-        progress.auto_close.setChecked(bool(auto_close))
+        progress = ActionProgressDialog(self, title, description, english=en,
+                                        settings=self.settings, setting_key=auto_close_key)
+        # Keep the persisted checkbox state loaded by ActionProgressDialog.
         self.set_busy(True)
         if security_only:
             names = [line.split()[0].split("/", 1)[0] for line in packages]
@@ -3807,25 +6137,37 @@ class Window(QMainWindow):
             rc, policy = cmd(["apt-cache", "policy", package])
             if rc:
                 continue
-            # Nur Versionen aus eindeutig erkennbaren Debian-Sicherheitsquellen zählen.
+            # APT kennzeichnet die installierte Version ggf. mit "***".
+            # Verfügbare Kandidatenversionen stehen dagegen als normale
+            # eingerückte Zeile "<Version> <Priorität>" in der Versionstabelle.
+            # Beide Formen müssen ausgewertet werden, sonst werden gerade
+            # noch nicht installierte Sicherheitsupdates übersehen.
             security_origins = []
-            policy_lines = policy.splitlines()
             candidate_block = False
-            for row in policy_lines:
+            for row in policy.splitlines():
                 stripped = row.strip()
                 if stripped.startswith("*** "):
-                    version_token = stripped[4:].split()[0] if len(stripped[4:].split()) else ""
+                    parts = stripped[4:].split()
+                    version_token = parts[0] if parts else ""
                     candidate_block = (version_token == candidate)
                     continue
+
+                version_match = re.match(r"^\s+(\S+)\s+\d+\s*$", row)
+                if version_match:
+                    candidate_block = (version_match.group(1) == candidate)
+                    continue
+
                 if candidate_block:
-                    # Stop at the next version stanza, but retain repository rows.
-                    if re.match(r"^\s{2,}\S+\s+\d+\s*$", row) and not row.lstrip().startswith(("500 ", "100 ", "990 ", "700 ", "600 ", "400 ", "300 ", "200 ", "100 ")):
-                        candidate_block = False
-                        continue
-                    low = row.lower()
+                    low = stripped.lower()
+                    # Debian-Sicherheitsarchive können über Codenamen oder
+                    # bewegliche Suites sowie über den offiziellen Hostnamen
+                    # identifiziert werden.
+                    suite_security = bool(re.search(
+                        r"(?:^|[\s/])(?:old)?stable-security(?:[/\s]|$)", low
+                    ))
                     if ("security.debian.org" in low or "debian-security" in low or
                         "trixie-security" in low or "bookworm-security" in low or
-                        "bullseye-security" in low):
+                        "bullseye-security" in low or suite_security):
                         security_origins.append(stripped)
             if security_origins:
                 rc, installed = cmd(["dpkg-query", "-W", "-f=${Version}", package])
@@ -3841,12 +6183,21 @@ class Window(QMainWindow):
         self.security_manage_job.result.connect(self.security_updates_dialog)
         def failed(error):
             self.set_busy(False)
+            self.status.setText(
+                ("Security update check failed: " if self.language == "en" else
+                 "Sicherheitsupdate-Prüfung fehlgeschlagen: ") + str(error)
+            )
             QMessageBox.critical(self, "Sicherheitsupdates", str(error))
         self.security_manage_job.failed.connect(failed)
         self.security_manage_job.start()
 
     def security_updates_dialog(self, items):
         self.set_busy(False)
+        count = len(items)
+        self.status.setText(
+            (f"Security update check complete: {count} found" if self.language == "en" else
+             f"Sicherheitsupdate-Prüfung abgeschlossen: {count} gefunden")
+        )
         deferred = self._security_deferred()
         for item in items:
             item["deferred"] = deferred.get(item["package"]) == item["candidate"]
@@ -3919,8 +6270,46 @@ class Window(QMainWindow):
             preview_rc, preview = cmd(["apt", "-s", "--only-upgrade", "install", *names])
             if preview_rc:
                 QMessageBox.critical(dlg, "APT-Vorschau fehlgeschlagen", preview); return
-            question = "Folgende Sicherheitsupdates werden installiert:\n\n" + "\n".join(names) + "\n\n" + preview[-7000:] + "\n\nFortfahren?"
-            if QMessageBox.question(dlg, "Sicherheitsupdates installieren", question) != QMessageBox.Yes: return
+            # Begrenzter Bestätigungsdialog: lange Paket-/APT-Ausgaben laufen
+            # in einem Scrollfeld, die Aktionsknöpfe bleiben immer sichtbar.
+            english = self.language == "en"
+            confirm = QDialog(dlg)
+            confirm.setWindowTitle(
+                "Install security updates" if english else "Sicherheitsupdates installieren"
+            )
+            confirm_layout = QVBoxLayout(confirm)
+            heading = QLabel(
+                "The following security updates will be installed:" if english
+                else "Folgende Sicherheitsupdates werden installiert:"
+            )
+            confirm_layout.addWidget(heading)
+            preview_view = QPlainTextEdit()
+            preview_view.setReadOnly(True)
+            preview_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+            preview_view.setPlainText("\\n".join(names) + "\\n\\n" + preview[-12000:])
+            confirm_layout.addWidget(preview_view, 1)
+            buttons = QDialogButtonBox(
+                (QDialogButtonBox.Yes | QDialogButtonBox.No)
+            )
+            buttons.button(QDialogButtonBox.Yes).setText(
+                "Install updates" if english else "Updates installieren"
+            )
+            buttons.button(QDialogButtonBox.No).setText(
+                "Cancel" if english else "Abbrechen"
+            )
+            buttons.button(QDialogButtonBox.No).setDefault(True)
+            buttons.accepted.connect(confirm.accept)
+            buttons.rejected.connect(confirm.reject)
+            confirm_layout.addWidget(buttons)
+            screen = self.screen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                confirm.resize(min(760, max(520, available.width() - 100)),
+                               min(560, max(360, available.height() - 100)))
+            else:
+                confirm.resize(720, 520)
+            if confirm.exec() != QDialog.Accepted:
+                return
             dlg.accept()
             self.run_security_install(chosen)
         def show_history():
@@ -3944,7 +6333,9 @@ class Window(QMainWindow):
     def run_security_install(self, chosen):
         names = [x["package"] for x in chosen]
         progress = ActionProgressDialog(self, "Install security updates" if self.language == "en" else "Sicherheitsupdates installieren",
-                                        (f"Installing {len(names)} selected security updates." if self.language == "en" else f"{len(names)} ausgewählte Sicherheitsupdates werden installiert."), english=self.language == "en")
+                                        (f"Installing {len(names)} selected security updates." if self.language == "en" else f"{len(names)} ausgewählte Sicherheitsupdates werden installiert."),
+                                        english=self.language == "en", settings=self.settings,
+                                        setting_key="progress/auto_close_after_success")
         self.set_busy(True)
         args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "--only-upgrade", "install", *names])
         self.security_install_stream = StreamJob(args)
@@ -4106,7 +6497,9 @@ class Window(QMainWindow):
         d.exec()
 
     def check_sources(self):
-        progress=ActionProgressDialog(self, "Check repositories" if self.language == "en" else "Paketquellen prüfen", "APT checks all configured repositories and reports invalid or unreachable sources." if self.language == "en" else "APT prüft alle konfigurierten Paketquellen und meldet fehlerhafte oder nicht erreichbare Repositories.", english=self.language == "en")
+        progress=ActionProgressDialog(self, "Check repositories" if self.language == "en" else "Paketquellen prüfen", "APT checks all configured repositories and reports invalid or unreachable sources." if self.language == "en" else "APT prüft alle konfigurierten Paketquellen und meldet fehlerhafte oder nicht erreichbare Repositories.",
+                                      english=self.language == "en", settings=self.settings,
+                                      setting_key="progress/auto_close_after_success")
         job=StreamJob(privileged(["apt","update"]))
         job.output.connect(progress.append_output)
         result={"code":1}

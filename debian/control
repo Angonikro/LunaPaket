@@ -1,9 +1,9 @@
 Package: lunapaket
-Version: 0.1.41
+Version: 0.1.42
 Section: admin
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.11), python3-apt, python3-yaml, python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, libxcb-cursor0, libxkbcommon-x11-0, libxcb-xinerama0, apt, dpkg, flatpak, pkexec, polkitd, desktop-file-utils, shared-mime-info
+Depends: python3 (>= 3.11), python3-apt, python3-yaml, python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, libxcb-cursor0, libxkbcommon-x11-0, libxcb-xinerama0, apt, dpkg, flatpak, pkexec, polkitd, desktop-file-utils, shared-mime-info, libgtk-3-bin
 Maintainer: LunaPaket
-Description: Grafische Paketverwaltung für Debian und Flathub
- Grafische Paketverwaltung mit APT- und Flathub-Ansicht, Suche, Paketdetails sowie Installations- und Entfernungsfunktionen.
+Description: Grafische Paketverwaltung für Debian, Flathub und Snap
+ Grafische Paketverwaltung mit APT-, Flathub- und Snap-Ansicht, Suche, Paketdetails sowie Installations- und Entfernungsfunktionen.

@@ -1,4 +1,25 @@
-# Changelog
+## 0.1.42
+- Snap-Verwaltung als dritten Paketmodus neben APT und Flathub ergänzt.
+- Snap-Store-Suche und Store-Bereiche über `snap find`; installierte Anwendungen über `snap list`.
+- Installationsstatus, Vormerkungen, gemeinsames Anwenden, Installieren und Entfernen integriert.
+- Snap-Details über `snap info` sowie Updateprüfung über `snap refresh --list`; ausgewählte oder alle Updates können installiert werden.
+- Snap-Empfehlungsliste wird lokal zwischengespeichert; Cache-Aufbewahrung ist separat in den Einstellungen konfigurierbar. Such- und Kategorieabfragen nutzen `snap find`.
+- `snapd` bleibt optionale Laufzeitvoraussetzung und wird bei fehlender Installation verständlich gemeldet.
+- APT- und Flathub-Abläufe unverändert gelassen.
+- Hinweis: Die Snap-Kommandozeile liefert keine Screenshot-Galerie wie AppStream bei Flathub.
+- Flathub-Katalog wird nach dem Programmstart zeitversetzt im Hintergrund vorgeladen, ohne den Aufbau der Oberfläche oder die aktive APT-Ansicht zu blockieren; ein Klick während des Ladens verwendet denselben laufenden Ladevorgang.
+- Snap-Aufräumen verwendet jetzt ebenfalls das gemeinsame Fortschrittsfenster mit Live-Konsolenausgabe, aktuellem Eintrag und Fortschrittsanzeige (Deutsch/Englisch).
+- Neuer Bereich „Snap aufräumen“ direkt unter „Nicht installiert“: deaktivierte alte Revisionen und gespeicherte Snap-Sicherungen prüfen und einzeln auswählen/entfernen; Oberfläche vollständig deutsch/englisch.
+- APT-Symbole werden beim Anzeigen explizit auf 44 × 44 px skaliert, damit sie in der Paketliste ähnlich groß wie Flathub-Symbole erscheinen.
+- APT-Paketzeilen reservieren jetzt wie Flathub und Snap einen Symbolpfad.
+- Debian-AppStream-Metadaten werden lokal ausgewertet und den APT-Paketnamen zugeordnet.
+- Vorhandene Symbole aus `/var/lib/swcatalog/icons` und den üblichen AppStream-Cache-Verzeichnissen werden verwendet.
+- Symbole werden nur für sichtbare APT-Zeilen nachgeladen; die Index-Erstellung läuft im Hintergrund und verwendet einen lokalen 7-Tage-Cache.
+- Es werden für diese Symbolzuordnung keine zusätzlichen Metadaten aus dem Internet geladen.
+- Die lange APT-Installationsvorschau wird in einem scrollbaren Textfeld angezeigt.
+- Der Bestätigungsdialog passt seine Größe an den verfügbaren Bildschirm an; Installieren und Abbrechen bleiben sichtbar.
+- APT-Versionstabellen werden mit korrekten regulären Ausdrücken ausgewertet; Kandidatenversionen und ihre Sicherheitsquellen werden erkannt.
+- Nach erfolgreicher oder fehlgeschlagener Prüfung wird die Statusleiste nicht mehr dauerhaft auf „Suche läuft“ stehen gelassen.
 
 ## 0.1.41 – Flathub-Testversion
 - Umschalter in der Oberfläche zwischen APT (Debian) und Flathub (Flatpak).
@@ -188,3 +209,24 @@
 - Installation nutzt die passende Flatpak-Installation; Systemupdates fragen bei Bedarf Root-Rechte über pkexec an.
 - Oberfläche, Rückmeldungen und Bestätigungen sind auf Deutsch und Englisch verfügbar.
 - APT-Updatefunktionen und Versionsnummer 0.1.41 bleiben unverändert.
+
+## 0.1.42 – Snap-Hintergrundimport und sauberes Beenden
+- Snap-Katalog wird beim Öffnen sofort aus dem lokalen Cache angezeigt; Aktualisierungen laufen im Hintergrund.
+- Ein Klick auf Kategorien während eines laufenden Imports startet keinen zweiten parallelen Kataloglauf.
+- SnapUpdates speichert den Importstand nach jeder gelesenen Seite atomar, damit ein Abbruch keine bereits geladenen Seiten verliert.
+- Beim Beenden werden laufende Snap-Katalogjobs kooperativ unterbrochen; Netzwerk- und snapd-Aufrufe haben begrenzte Laufzeiten.
+- APT- und Flathub-Funktionen wurden nicht geändert.
+
+### 0.1.42 – Korrektur der Fortschrittsfenster-Einstellung
+- Die Auswahl „Fenster nach erfolgreicher Aktion schließen“ wird jetzt beim Ändern sowohl im gemeinsamen Einstellungsschlüssel als auch im Aktionsschlüssel gespeichert.
+- Verhindert, dass Installationsabläufe die gespeicherte Auswahl beim Öffnen des Fortschrittsfensters durch den Standardwert überschreiben.
+
+### 0.1.42 – Architekturabhängige Paketkataloge
+- APT zeigt native Pakete der Debian-Systemarchitektur sowie architekturunabhängige Pakete (`all`); fremde Multiarch-Varianten werden aus dem normalen Katalog ausgeschlossen.
+- Flathub-Katalog und installierte Anwendungen werden mit der von Flatpak ermittelten Host-Architektur (`aarch64`, `x86_64` usw.) abgefragt. Der Katalogcache ist je Architektur getrennt.
+- Snap-Suchergebnisse aus der öffentlichen Store-Suche werden gegen die Ergebnisse der lokalen snapd-Suche geprüft, damit nur auf dem Gerät verfügbare Snaps angezeigt werden. Der Snap-Cache ist je Debian-Architektur getrennt.
+- Versionsnummer bleibt 0.1.42.
+
+## 0.1.42 – Flathub-Status und Kontextmenü
+- Nach Flatpak-Installationen und -Deinstallationen zeigt die Statuszeile den laufenden Flathub-Katalogabgleich und anschließend dessen Abschluss bzw. einen Fehler an.
+- Kontextmenüeinträge für Flathub werden im englischen UI-Modus jetzt ebenfalls auf Englisch angezeigt.
