@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstr
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.42"
+VERSION="0.1.43"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
@@ -1017,9 +1017,10 @@ class Window(QMainWindow):
         self.table.verticalScrollBar().valueChanged.connect(lambda _value: self._load_visible_apt_icons() if not self.flatpak_mode else None)
         # Snap-Symbole werden bedarfsgesteuert für sichtbare Tabellenzeilen geladen.
         self._snap_icon_job = None
+        self._snap_icon_prefetch_job = None
         self._snap_icon_pending = set()
         self._snap_icon_timer = QTimer(self)
-        self._snap_icon_timer.setInterval(650)
+        self._snap_icon_timer.setInterval(180)
         self._snap_icon_timer.timeout.connect(self._load_visible_snap_icons)
         self._snap_icon_timer.start()
         row=QHBoxLayout()
@@ -1740,14 +1741,24 @@ class Window(QMainWindow):
         dlg.exec()
 
     def closeEvent(self, event):
-        # Lange Snap-Katalogimporte laufen unabhängig vom GUI-Thread. Beim
-        # Schließen werden sie kooperativ gestoppt; der bis dahin importierte
-        # Stand ist nach jeder Seite bereits atomar gespeichert.
-        running_jobs = [job for job in list(FunctionJob._live_jobs) if job.isRunning()]
+        # Icon-Nachladen beim Beenden sofort stoppen. Diese Jobs haben kurze
+        # Netzwerk-Timeouts und werden separat begrenzt abgewartet.
+        icon_timer = getattr(self, "_snap_icon_timer", None)
+        if icon_timer is not None:
+            icon_timer.stop()
+        icon_jobs = []
+        for attr in ("_snap_icon_job", "_snap_icon_prefetch_job"):
+            job = getattr(self, attr, None)
+            if job is not None and job.isRunning():
+                icon_jobs.append(job)
+                job.requestInterruption()
+        for job in icon_jobs:
+            job.wait(4500)
+        # Andere laufende Hintergrundarbeiten wie bisher kooperativ stoppen.
+        running_jobs = [job for job in list(FunctionJob._live_jobs)
+                        if job.isRunning() and job not in icon_jobs]
         for job in running_jobs:
             job.requestInterruption()
-        # Netzwerkzugriffe besitzen kurze Timeouts. Nicht endlos auf einen
-        # kompletten Katalogimport warten, sondern nur den aktuellen Request.
         for job in running_jobs:
             job.wait(14000)
         if self.remember_window_enabled:
@@ -2219,7 +2230,7 @@ class Window(QMainWindow):
             return cached
 
         base="https://snapupdates.popey.com"
-        headers={"User-Agent":"LunaPaket/0.1.42 (Snap catalogue; read-only)",
+        headers={"User-Agent":"LunaPaket/0.1.43 (Snap catalogue; read-only)",
                  "Accept":"text/html,application/xhtml+xml"}
         def fetch(url):
             request=urllib.request.Request(url, headers=headers)
@@ -2322,7 +2333,7 @@ class Window(QMainWindow):
             request = urllib.request.Request(url, headers={
                 "Accept": "application/json", "Snap-Device-Series": "16",
                 "Snap-Device-Architecture": str(architecture),
-                "User-Agent": "LunaPaket/0.1.42"
+                "User-Agent": "LunaPaket/0.1.43"
             })
             with urllib.request.urlopen(request, timeout=12) as response:
                 payload = json.loads(response.read(8 * 1024 * 1024).decode("utf-8"))
@@ -2636,7 +2647,7 @@ class Window(QMainWindow):
                 url += "?" + urllib.parse.urlencode(params)
             request = urllib.request.Request(url, headers={
                 "Accept": "application/json", "X-Ubuntu-Series": "16",
-                "User-Agent": "LunaPaket/0.1.42"
+                "User-Agent": "LunaPaket/0.1.43"
             })
             try:
                 # Store liefert paginierte Ergebnisse; Folgeseiten ebenfalls lesen.
@@ -2645,7 +2656,7 @@ class Window(QMainWindow):
                 while next_url and pages < 8 and not Window._snap_import_cancelled():
                     req = urllib.request.Request(next_url, headers={
                         "Accept": "application/json", "X-Ubuntu-Series": "16",
-                        "User-Agent": "LunaPaket/0.1.42"
+                        "User-Agent": "LunaPaket/0.1.43"
                     })
                     with urllib.request.urlopen(req, timeout=8) as response:
                         payload = json.loads(response.read(16 * 1024 * 1024).decode("utf-8"))
@@ -2904,10 +2915,17 @@ class Window(QMainWindow):
             target = folder / (kind + "-" + digest + suffix)
             if target.is_file() and target.stat().st_size:
                 return str(target)
-            req = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.42"})
-            with urllib.request.urlopen(req, timeout=18) as response:
-                data = response.read(12 * 1024 * 1024)
+            req = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.43"})
+            # Kurze Netzwerk-Timeouts halten das Beenden zuverlässig flott.
+            # Icon-Worker prüfen zusätzlich vor und nach dem Request den Abbruch.
+            current = QThread.currentThread()
+            if current is not None and current.isInterruptionRequested():
+                return ""
+            with urllib.request.urlopen(req, timeout=4) as response:
+                data = response.read(4 * 1024 * 1024)
                 content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].lower()
+            if current is not None and current.isInterruptionRequested():
+                return ""
             if suffix == ".img":
                 suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
                           "image/svg+xml": ".svg"}.get(content_type, ".img")
@@ -2950,6 +2968,7 @@ class Window(QMainWindow):
                 self.snap_catalog = [tuple(row) for row in cached if isinstance(row, (list, tuple)) and len(row) >= 8]
                 if self.snap_catalog:
                     self.apply_table_filters()
+                    self._preload_snap_catalog_icons()
                 self._update_snap_channel_labels()
             except (OSError, ValueError, TypeError):
                 pass
@@ -2989,6 +3008,9 @@ class Window(QMainWindow):
             self._update_snap_channel_labels()
             if not self.snap_mode: return
             self.apply_table_filters()
+            # Symbole für den gesamten geladenen Katalog vorladen, nicht erst
+            # dann, wenn eine Zeile beim Scrollen sichtbar wird.
+            self._preload_snap_catalog_icons()
             post_action_message = getattr(self, "snap_post_action_message", "")
             if post_action_message:
                 self.snap_post_action_message = ""
@@ -3015,8 +3037,32 @@ class Window(QMainWindow):
         self.snap_job.failed.connect(failed)
         self.snap_job.start()
 
+    def _snap_icon_cache_path(snap_name, url):
+        """Gibt den deterministischen lokalen Cachepfad für ein Store-Icon zurück."""
+        suffix = Path(urllib.parse.urlparse(str(url)).path).suffix.lower()
+        if suffix not in (".png", ".jpg", ".jpeg", ".webp", ".svg"):
+            suffix = ".img"
+        digest = hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:16]
+        folder = Path.home() / ".cache" / "LunaPaket" / "snap-media" / re.sub(r"[^a-z0-9-]", "", str(snap_name).lower())
+        expected = folder / ("icon-" + digest + suffix)
+        if suffix == ".img" and not expected.is_file():
+            matches = list(folder.glob("icon-" + digest + ".*"))
+            if matches:
+                return matches[0]
+        return expected
+
+    def _preload_snap_catalog_icons(self):
+        """Startet nur das Laden der sichtbaren Symbole; kein Vollkatalog-Download."""
+        if not getattr(self, "snap_mode", False) or not self.snap_catalog:
+            return
+        # Das frühere Vorladen sämtlicher Store-Bilder blockierte sichtbare
+        # Symbole und ließ beim Schließen zahlreiche HTTP-Aufträge zurück.
+        # Die regelmäßige Sichtbarkeitsprüfung lädt nun kleine, priorisierte
+        # Portionen und legt jedes Bild sofort nach Fertigstellung in die UI.
+        self._load_visible_snap_icons()
+
     def _load_visible_snap_icons(self):
-        """Lädt fehlende Snap-Icons nur für aktuell sichtbare Zeilen, höchstens zwei parallel."""
+        """Lädt nur sichtbare Snap-Icons in kleinen, abbrechbaren Portionen."""
         if not getattr(self, "snap_mode", False):
             return
         job = getattr(self, "_snap_icon_job", None)
@@ -3044,41 +3090,68 @@ class Window(QMainWindow):
             url = str(meta.get("icon_url") or "")
             if not url.startswith(("https://", "http://")):
                 continue
+            cached = Window._snap_icon_cache_path(str(row[0]), url)
+            if cached.is_file() and cached.stat().st_size:
+                model.set_icon_path(source_row, str(cached))
+                continue
             candidates.append((source_row, str(row[0]), url))
         if not candidates:
             return
-        # Nur aktuell sichtbare Symbole; maximal zwei Downloads parallel.
-        candidates = candidates[:24]
+        # Kleine Portion: schnelles Scrollen kann den nächsten sichtbaren
+        # Bereich erreichen, ohne hinter hunderten Hintergrund-Downloads zu warten.
+        candidates = candidates[:8]
         self._snap_icon_pending.update(item[0] for item in candidates)
 
-        def fetch_icons():
+        def fetch_icons(_progress, emit):
             results = []
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = {
-                    pool.submit(Window._snap_cached_media, name, url, "icon"): source_row
-                    for source_row, name, url in candidates
-                }
+            pool = ThreadPoolExecutor(max_workers=2)
+            futures = {
+                pool.submit(Window._snap_cached_media, name, url, "icon"): (source_row, name, url)
+                for source_row, name, url in candidates
+            }
+            try:
                 for future in as_completed(futures):
+                    if QThread.currentThread().isInterruptionRequested():
+                        for pending in futures:
+                            pending.cancel()
+                        break
+                    source_row, name, url = futures[future]
                     try:
                         path = future.result()
                     except Exception:
                         path = ""
                     if path:
-                        results.append((futures[future], path))
+                        # Sofortige Einzelmeldung statt erst nach dem gesamten Batch.
+                        emit(json.dumps({"row": source_row, "name": name, "url": url, "path": path}))
+                        results.append(source_row)
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
             return results
 
-        job = FunctionJob(fetch_icons)
+        job = FunctionJob(fetch_icons, with_progress_detail_output=True)
         self._snap_icon_job = job
 
-        def icons_loaded(results):
-            for source_row, icon_path in results or []:
-                self.table.package_model.set_icon_path(source_row, icon_path)
+        def icon_loaded(payload):
+            try:
+                item = json.loads(payload)
+                source_row = int(item.get("row", -1))
+                # Nach Suche/Filterwechsel niemals ein Icon in eine fremde
+                # Tabellenzeile schreiben.
+                rows = self.table.package_model.rows
+                if (0 <= source_row < len(rows) and str(rows[source_row][0]) == item.get("name")
+                        and str((rows[source_row][7] or {}).get("icon_url", "")) == item.get("url")):
+                    self.table.package_model.set_icon_path(source_row, item["path"])
+            except Exception:
+                pass
+
+        def icons_done(_rows):
             self._snap_icon_pending.difference_update(item[0] for item in candidates)
 
         def icons_failed(_error):
             self._snap_icon_pending.difference_update(item[0] for item in candidates)
 
-        job.result.connect(icons_loaded)
+        job.output.connect(icon_loaded)
+        job.result.connect(icons_done)
         job.failed.connect(icons_failed)
         job.start()
 

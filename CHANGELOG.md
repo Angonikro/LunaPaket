@@ -1,3 +1,11 @@
+## 0.1.43 – Snap-Symbolvorladung und Ladeoptimierung
+- Fehlerkorrektur: Keine aggressive Vollkatalog-Vorladung mehr, die sichtbare Symbole beim Scrollen ausbremst.
+- Snap-Symbole werden in kleinen Portionen nur für sichtbare Zeilen geladen; höchstens zwei Downloads laufen parallel.
+- Fertige Symbole erscheinen einzeln sofort in der Paketliste, statt erst nach Abschluss eines großen Download-Batches.
+- Bereits lokal gespeicherte Symbole werden direkt aus `~/.cache/LunaPaket/snap-media/` übernommen.
+- Die Sichtbarkeitsprüfung reagiert schneller auf Scrollbewegungen.
+- Icon-Downloads haben kurze Zeitlimits und werden beim Beenden gezielt unterbrochen; der Icon-Timer wird vorher gestoppt.
+
 ## 0.1.42
 - Snap-Verwaltung als dritten Paketmodus neben APT und Flathub ergänzt.
 - Snap-Store-Suche und Store-Bereiche über `snap find`; installierte Anwendungen über `snap list`.
