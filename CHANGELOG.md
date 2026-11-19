@@ -1,4 +1,15 @@
+## 0.1.44 – Genauere Snap-Fortschrittsanzeige
+- Snap-Fortschritt unterscheidet jetzt messbare Aufgabenfortschritte von Einrichtungs- und Aktivierungsphasen, für die snapd keine Prozentwerte liefert.
+- In nicht messbaren Phasen wechselt die Anzeige in eine laufende/unbestimmte Aktivität, statt minutenlang bei einem scheinbar exakten Wert wie 95 % stehenzubleiben.
+- Sobald snapd wieder messbare Fortschrittsdaten liefert, wird die Prozentanzeige fortgesetzt.
+- Gilt für vorgemerkte Snap-Installationen/-Entfernungen und Snap-Updates.
+- Die bisherige Snap-Symbolvorladung und Ladeoptimierung bleiben erhalten.
+- Problem Apps zu makieren beim kopieren und deinstalieren von vielen Datein behoben.
+
 ## 0.1.43 – Snap-Symbolvorladung und Ladeoptimierung
+- Snap-Installationen, -Entfernungen und -Updates verwenden jetzt die echten Aufgabenfortschritte von snapd über dessen lokalen REST-Socket statt eines künstlichen Fortschrittszählers anhand der Terminalzeilen.
+- Download-, Einrichtungs- und weitere Snap-Aufgaben fließen in den angezeigten Gesamtfortschritt ein; 100 % erscheinen erst nach dem tatsächlichen Abschluss.
+- Wenn snapd vorübergehend keine messbaren Fortschrittsdaten liefert, zeigt der Balken eine laufende/unbestimmte Aktivität statt einer irreführenden Prozentzahl.
 - Fehlerkorrektur: Keine aggressive Vollkatalog-Vorladung mehr, die sichtbare Symbole beim Scrollen ausbremst.
 - Snap-Symbole werden in kleinen Portionen nur für sichtbare Zeilen geladen; höchstens zwei Downloads laufen parallel.
 - Fertige Symbole erscheinen einzeln sofort in der Paketliste, statt erst nach Abschluss eines großen Download-Batches.
@@ -238,3 +249,8 @@
 ## 0.1.42 – Flathub-Status und Kontextmenü
 - Nach Flatpak-Installationen und -Deinstallationen zeigt die Statuszeile den laufenden Flathub-Katalogabgleich und anschließend dessen Abschluss bzw. einen Fehler an.
 - Kontextmenüeinträge für Flathub werden im englischen UI-Modus jetzt ebenfalls auf Englisch angezeigt.
+
+### Korrekturen innerhalb von Version 0.1.44
+- Flatpak-Katalog nach abgeschlossenen Installations- und Deinstallationsaktionen auch dann neu laden, wenn bereits ein Katalog im Speicher vorhanden ist.
+- Installationsstatus der Flathub-Anwendungen und Paketanzahl nach Aktionen aktualisieren, ohne einen Neustart zu benötigen.
+

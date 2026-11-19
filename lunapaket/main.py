@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstr
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.43"
+VERSION="0.1.44"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
@@ -336,13 +336,74 @@ def privileged(args):
     return list(args) if os.geteuid() == 0 else ["pkexec", *args]
 
 
-def run_snap_command_live(command, emit_output, timeout=1800):
-    """Run snap on a pseudo-terminal so snapd's interactive progress is flushed live."""
+def _snapd_in_progress_changes():
+    """Read live task progress from snapd's local REST socket (open endpoint)."""
+    class _SnapdUnixHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(1.0)
+            self.sock.connect("/run/snapd.socket")
+    connection = None
+    try:
+        connection = _SnapdUnixHTTPConnection("localhost", timeout=1.0)
+        connection.request("GET", "/v2/changes?select=in-progress")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8", "replace"))
+        result = payload.get("result", [])
+        return result if response.status == 200 and isinstance(result, list) else []
+    except Exception:
+        return []
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _snapd_change_progress(change):
+    """Return a task-weighted percentage and a useful active-task description."""
+    tasks=change.get("tasks", [])
+    if not tasks:
+        return None
+    fractions=[]
+    active=[]
+    for task in tasks:
+        status=str(task.get("status", ""))
+        progress=task.get("progress") or {}
+        done=progress.get("done", 0)
+        total=progress.get("total", 0)
+        if status == "Done":
+            fraction=1.0
+        elif isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
+            fraction=max(0.0, min(1.0, done / total))
+        else:
+            fraction=0.0
+        fractions.append(fraction)
+        if status in ("Doing", "Undoing", "Wait"):
+            label=progress.get("label") or task.get("summary") or change.get("summary", "Snap-Aktion")
+            active.append(str(label))
+            # snapd meldet für manche Einrichtungs-/Aktivierungsschritte
+            # keinen messbaren Byte- oder Teilfortschritt. In dieser Phase
+            # darf der Balken keinen scheinbar exakten Prozentwert vortäuschen.
+            measurable = (isinstance(done, (int, float)) and
+                          isinstance(total, (int, float)) and total > 0)
+            if status in ("Doing", "Undoing") and not measurable:
+                return None, str(label)
+    if not fractions:
+        return None
+    percent=max(0, min(99, int(sum(fractions) * 100 / len(fractions))))
+    return percent, (active[-1] if active else str(change.get("summary", "Snap-Aktion")))
+
+
+def run_snap_command_live(command, emit_output, timeout=1800, progress_callback=None):
+    """Run snap with live terminal output and snapd's real task progress."""
     master_fd, slave_fd = pty.openpty()
     process = None
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pending = ""
     started = time.monotonic()
+    last_progress_poll = 0.0
+    known_change_ids = {str(item.get("id")) for item in _snapd_in_progress_changes() if item.get("id")}
+    active_change_id = None
+    last_reported_progress = 0
     try:
         env = {**os.environ, "LC_ALL": "C", "LANG": "C", "TERM": "xterm"}
         process = subprocess.Popen(
@@ -352,7 +413,32 @@ def run_snap_command_live(command, emit_output, timeout=1800):
         os.close(slave_fd)
         slave_fd = -1
         while True:
-            if time.monotonic() - started > timeout:
+            now = time.monotonic()
+            if progress_callback and now - last_progress_poll >= 0.7:
+                last_progress_poll = now
+                changes = _snapd_in_progress_changes()
+                if active_change_id is None:
+                    candidates = [item for item in changes if str(item.get("id")) not in known_change_ids]
+                    if candidates:
+                        active_change_id = str(candidates[-1].get("id"))
+                if active_change_id is not None:
+                    current = next((item for item in changes if str(item.get("id")) == active_change_id), None)
+                    if current:
+                        measured = _snapd_change_progress(current)
+                        if measured:
+                            try:
+                                if measured[0] is None:
+                                    # Nicht messbare Snap-Phasen (z. B. Setup)
+                                    # als laufende Aktivität anzeigen, nicht bei
+                                    # einem alten Prozentwert stehen bleiben.
+                                    progress_callback(None, measured[1])
+                                else:
+                                    # Messbare Phasen bleiben monoton.
+                                    last_reported_progress = max(last_reported_progress, measured[0])
+                                    progress_callback(last_reported_progress, measured[1])
+                            except Exception:
+                                pass
+            if now - started > timeout:
                 process.terminate()
                 try:
                     process.wait(timeout=5)
@@ -2230,7 +2316,7 @@ class Window(QMainWindow):
             return cached
 
         base="https://snapupdates.popey.com"
-        headers={"User-Agent":"LunaPaket/0.1.43 (Snap catalogue; read-only)",
+        headers={"User-Agent":"LunaPaket/0.1.44 (Snap catalogue; read-only)",
                  "Accept":"text/html,application/xhtml+xml"}
         def fetch(url):
             request=urllib.request.Request(url, headers=headers)
@@ -2333,7 +2419,7 @@ class Window(QMainWindow):
             request = urllib.request.Request(url, headers={
                 "Accept": "application/json", "Snap-Device-Series": "16",
                 "Snap-Device-Architecture": str(architecture),
-                "User-Agent": "LunaPaket/0.1.43"
+                "User-Agent": "LunaPaket/0.1.44"
             })
             with urllib.request.urlopen(request, timeout=12) as response:
                 payload = json.loads(response.read(8 * 1024 * 1024).decode("utf-8"))
@@ -2647,7 +2733,7 @@ class Window(QMainWindow):
                 url += "?" + urllib.parse.urlencode(params)
             request = urllib.request.Request(url, headers={
                 "Accept": "application/json", "X-Ubuntu-Series": "16",
-                "User-Agent": "LunaPaket/0.1.43"
+                "User-Agent": "LunaPaket/0.1.44"
             })
             try:
                 # Store liefert paginierte Ergebnisse; Folgeseiten ebenfalls lesen.
@@ -2656,7 +2742,7 @@ class Window(QMainWindow):
                 while next_url and pages < 8 and not Window._snap_import_cancelled():
                     req = urllib.request.Request(next_url, headers={
                         "Accept": "application/json", "X-Ubuntu-Series": "16",
-                        "User-Agent": "LunaPaket/0.1.43"
+                        "User-Agent": "LunaPaket/0.1.44"
                     })
                     with urllib.request.urlopen(req, timeout=8) as response:
                         payload = json.loads(response.read(16 * 1024 * 1024).decode("utf-8"))
@@ -2915,7 +3001,7 @@ class Window(QMainWindow):
             target = folder / (kind + "-" + digest + suffix)
             if target.is_file() and target.stat().st_size:
                 return str(target)
-            req = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.43"})
+            req = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.44"})
             # Kurze Netzwerk-Timeouts halten das Beenden zuverlässig flott.
             # Icon-Worker prüfen zusätzlich vor und nach dem Request den Abbruch.
             current = QThread.currentThread()
@@ -3295,7 +3381,13 @@ class Window(QMainWindow):
                                 chunks.append(line)
                                 emit_output(line)
                             channel = str(self.snap_channel_combo.currentData() or "latest/stable")
-                            rc=run_snap_command_live(["snap", "refresh", name, "--channel=" + channel], capture, timeout=1800)
+                            def snap_progress(percent, detail):
+                                if percent is None:
+                                    report(-1, total, f"{name}: {detail}")
+                                else:
+                                    report((index - 1) * 100 + percent, total * 100, f"{name}: {detail}")
+                            rc=run_snap_command_live(["snap", "refresh", name, "--channel=" + channel], capture,
+                                                     timeout=1800, progress_callback=snap_progress)
                         except Exception as error:
                             rc=1
                             chunks.append(str(error))
@@ -3306,23 +3398,18 @@ class Window(QMainWindow):
                 progress = ActionProgressDialog(self, "Snap-Updates installieren" if not english else "Install Snap updates",
                                                 "Snap-Updates werden installiert. Bitte warten …" if not english else "Snap updates are being installed. Please wait …",
                                                 english=english, settings=self.settings, setting_key="progress/auto_close_after_success")
-                # Snap liefert keine verlässlichen Prozentwerte für einen einzelnen
-                # Installationslauf. Deshalb beginnt der Balken bei 0 und zeigt
-                # anhand eintreffender PTY-Statuszeilen laufende Aktivität (max. 95 %).
-                # 100 % werden ausschließlich nach erfolgreichem Abschluss gesetzt.
-                progress.progress.setRange(0, 100)
-                progress.progress.setValue(0)
-                progress._snap_activity_value = 0
+                # Echte snapd-Taskfortschritte statt künstlichem Zeilenzähler.
+                progress.progress.setRange(0, 0)
                 progress.close_button.setText("Installation läuft …" if not english else "Installation in progress …")
                 self.snap_update_job=FunctionJob(update, with_progress_detail_output=True)
-                def append_snap_update_output(line):
-                    progress.append_output(line)
-                    progress._snap_activity_value = min(95, progress._snap_activity_value + 1)
-                    progress.progress.setValue(progress._snap_activity_value)
-                self.snap_update_job.output.connect(append_snap_update_output)
+                self.snap_update_job.output.connect(progress.append_output)
                 def update_progress(done, total, message):
-                    if done >= total and total > 0:
-                        progress.progress.setValue(min(95, int(done * 100 / total)))
+                    if done < 0:
+                        progress.progress.setRange(0, 0)
+                    elif total > 0:
+                        if progress.progress.maximum() == 0:
+                            progress.progress.setRange(0, 100)
+                        progress.progress.setValue(max(0, min(99, int(done * 100 / total))))
                     progress.current.setText(("Aktuell: " if not english else "Current: ") + message)
                 self.snap_update_job.progress_detail.connect(update_progress)
                 def updated(results):
@@ -3477,8 +3564,13 @@ class Window(QMainWindow):
             pass
         return rows
 
-    def load_flatpak_catalog(self, preload=False):
-        if self.flatpak_loading or self.flatpak_catalog:
+    def load_flatpak_catalog(self, preload=False, force_refresh=False):
+        # Nach Installationen/Entfernungen muss der vorhandene Tabellenkatalog
+        # ausdrücklich neu eingelesen werden. Ein gefüllter Cache darf diesen
+        # Statusabgleich nicht blockieren. Laufende Abfragen bleiben geschützt.
+        if self.flatpak_loading:
+            return
+        if self.flatpak_catalog and not force_refresh:
             return
         self.flatpak_loading = True
         if self.flatpak_mode and not self.snap_mode:
@@ -4959,7 +5051,11 @@ class Window(QMainWindow):
                         def capture(line):
                             chunks.append(line)
                             emit_output(line)
-                        rc=run_snap_command_live(command, capture, timeout=1800)
+                        def snap_progress(percent, detail):
+                            report((index - 1) * 100 + percent, total * 100,
+                                   f"{snap_name}: {detail}")
+                        rc=run_snap_command_live(command, capture, timeout=1800,
+                                                 progress_callback=snap_progress)
                     except Exception as error:
                         rc=1
                         chunks.append(str(error))
@@ -4971,21 +5067,21 @@ class Window(QMainWindow):
             progress = ActionProgressDialog(self, "Snap-Änderungen ausführen" if not english else "Apply Snap changes",
                                             "Vorgemerkte Snap-Aktionen werden ausgeführt. Bitte warten …" if not english else "Queued Snap actions are running. Please wait …",
                                             english=english, settings=self.settings, setting_key="progress/auto_close_after_success")
-            # Snap stellt für einen einzelnen Vorgang keinen Prozentwert bereit.
-            # Der Balken startet deshalb sichtbar bei 0 und bewegt sich mit jeder
-            # live empfangenen PTY-Statuszeile bis höchstens 95 %.
-            progress.progress.setRange(0, 100)
-            progress.progress.setValue(0)
-            progress._snap_activity_value = 0
+            # Prozentwerte kommen aus den echten snapd-Taskfortschritten.
+            # Ohne verfügbare API-Daten bleibt der Balken bewusst unbestimmt,
+            # statt einen erfundenen Fortschritt aus Terminalzeilen abzuleiten.
+            progress.progress.setRange(0, 0)
             self.snap_queue_job = FunctionJob(run_snap_queue, with_progress_detail_output=True)
             def append_snap_queue_output(line):
                 progress.append_output(line)
-                progress._snap_activity_value = min(95, progress._snap_activity_value + 1)
-                progress.progress.setValue(progress._snap_activity_value)
             self.snap_queue_job.output.connect(append_snap_queue_output)
             def update_snap_queue_progress(done, total, message):
-                if total > 1 and done > 0:
-                    progress.progress.setValue(min(95, int(done * 100 / total)))
+                if done < 0:
+                    progress.progress.setRange(0, 0)
+                elif total > 0:
+                    if progress.progress.maximum() == 0:
+                        progress.progress.setRange(0, 100)
+                    progress.progress.setValue(max(0, min(99, int(done * 100 / total))))
                 progress.current.setText(("Aktuell: " if not english else "Current: ") + message)
             self.snap_queue_job.progress_detail.connect(update_snap_queue_progress)
             progress.close_button.setText("Installation läuft …" if not english else "Installation in progress …")
@@ -5063,7 +5159,9 @@ class Window(QMainWindow):
                         post_action = ("Installation/removal completed." if english else "Installation/Deinstallation abgeschlossen.")
                     self.flatpak_post_action_message = post_action
                     self.status.setText(post_action + (" Flathub catalog is refreshing in the background …" if english else " Flathub-Katalog wird im Hintergrund aktualisiert …"))
-                    self.load_flatpak_catalog()
+                    # Lokale Installationszustände und Paketanzahl unmittelbar
+                    # nach allen vorgemerkten Aktionen neu ermitteln.
+                    self.load_flatpak_catalog(force_refresh=True)
                     progress.finish(1 if failures else 0)
                     if failures:
                         QMessageBox.warning(

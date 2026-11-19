@@ -1,4 +1,4 @@
-# LunaPaket 0.1.43 – APT, Flathub und Snap
+# LunaPaket 0.1.44 – APT, Flathub und Snap
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
 LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates sowie Flatpak-Anwendungen aus Flathub und Snap-Anwendungen über eine
@@ -85,7 +85,7 @@ ZIP-Datei entpacken und in den Projektordner wechseln:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.43_ApplicationStart.zip -d ~/Programme
+unzip LunaPaket_0.1.44_ApplicationStart.zip -d ~/Programme
 cd ~/Programme/LunaPaket
 ```
 
@@ -118,7 +118,7 @@ Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./lunapaket_0.1.43_all.deb
+sudo apt install ./lunapaket_0.1.44_all.deb
 ```
 
 Anschließend über das Anwendungsmenü oder mit `lunapaket` starten.
@@ -135,7 +135,7 @@ chmod +x build_deb.sh
 ./build_deb.sh
 ```
 
-Das Skript erstellt `dist/lunapaket_0.1.43_all.deb`.
+Das Skript erstellt `dist/lunapaket_0.1.44_all.deb`.
 Zum Bauen wird `dpkg-deb` benötigt.
 
 
