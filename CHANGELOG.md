@@ -1,3 +1,12 @@
+## 0.1.45 – Snap-Kanalwechsel installierter Anwendungen
+- Installationsstatus und Store-Kanal werden getrennt behandelt: Der installierte Snap-Tracking-Kanal wird aus der `Tracking`-Spalte von `snap list` gelesen.
+- Bereits installierte Anwendungen bleiben in jedem der vier Store-Kataloge als installiert erkennbar, auch wenn ihr installierter Kanal vom aktuell ausgewählten Katalog abweicht.
+- Die Snap-Details zeigen zusätzlich die tatsächlich installierte Version und den installierten Tracking-Kanal.
+- Das Snap-Rechtsklickmenü bietet für installierte Anwendungen „Kanal wechseln“ mit Stable, Candidate, Beta und Edge.
+- Ein Kanalwechsel wird als vorgemerkte Aktion geführt und mit `snap refresh <name> --channel=<track/channel>` ausgeführt; eine vorherige Deinstallation ist nicht erforderlich.
+- Nach Abschluss werden Installationsstatus und Tracking-Kanal durch erneutes Einlesen von `snap list` aktualisiert.
+- Die vier getrennten Snap-Kataloge, der gemeinsame Master-Katalog und die bestehenden APT-/Flathub-Abläufe bleiben erhalten.
+
 ## 0.1.44 – Genauere Snap-Fortschrittsanzeige
 - Snap-Fortschritt unterscheidet jetzt messbare Aufgabenfortschritte von Einrichtungs- und Aktivierungsphasen, für die snapd keine Prozentwerte liefert.
 - In nicht messbaren Phasen wechselt die Anzeige in eine laufende/unbestimmte Aktivität, statt minutenlang bei einem scheinbar exakten Wert wie 95 % stehenzubleiben.

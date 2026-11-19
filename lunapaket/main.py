@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstr
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.44"
+VERSION="0.1.45"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
@@ -2316,7 +2316,7 @@ class Window(QMainWindow):
             return cached
 
         base="https://snapupdates.popey.com"
-        headers={"User-Agent":"LunaPaket/0.1.44 (Snap catalogue; read-only)",
+        headers={"User-Agent":"LunaPaket/0.1.45 (Snap catalogue; read-only)",
                  "Accept":"text/html,application/xhtml+xml"}
         def fetch(url):
             request=urllib.request.Request(url, headers=headers)
@@ -2419,7 +2419,7 @@ class Window(QMainWindow):
             request = urllib.request.Request(url, headers={
                 "Accept": "application/json", "Snap-Device-Series": "16",
                 "Snap-Device-Architecture": str(architecture),
-                "User-Agent": "LunaPaket/0.1.44"
+                "User-Agent": "LunaPaket/0.1.45"
             })
             with urllib.request.urlopen(request, timeout=12) as response:
                 payload = json.loads(response.read(8 * 1024 * 1024).decode("utf-8"))
@@ -2539,6 +2539,7 @@ class Window(QMainWindow):
         rc, installed_output = query(["snap", "list"], 12)
         if rc != 0:
             raise RuntimeError("snapd ist nicht erreichbar: " + installed_output.strip())
+        # snap list meldet den installierten Tracking-Kanal zusätzlich zur Version.
         installed = {}
         excluded = {"snapd", "core", "core16", "core18", "core20", "core22", "core24", "bare", "gtk-common-themes"}
         table_started = False
@@ -2546,8 +2547,6 @@ class Window(QMainWindow):
             fields = line.split()
             if not fields:
                 continue
-            # snapd kann vor der eigentlichen Tabelle Warnungen ausgeben
-            # (z.B. "WARNING: There is ..."). Diese Zeilen sind keine Snaps.
             if fields[0].lower() == "name" and len(fields) >= 3 and fields[1].lower() == "version":
                 table_started = True
                 continue
@@ -2557,7 +2556,25 @@ class Window(QMainWindow):
             if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
                 continue
             if name not in excluded and not name.startswith(("gnome-", "mesa-")):
-                installed[name] = fields[1]
+                tracking = fields[3] if len(fields) >= 4 and "/" in fields[3] else "unbekannt"
+                installed[name] = {"version": fields[1], "tracking": tracking}
+
+        def apply_installed_state(row):
+            """Speichert den lokalen Installationskanal getrennt vom Store-Kanal."""
+            if not isinstance(row, list):
+                row = list(row)
+            info = installed.get(str(row[0]))
+            row[2] = "Installiert" if info else "Nicht installiert"
+            while len(row) < 8:
+                row.append({})
+            meta = dict(row[7]) if isinstance(row[7], dict) else {}
+            meta.pop("installed_version", None)
+            meta.pop("installed_channel", None)
+            if info:
+                meta["installed_version"] = info.get("version", "")
+                meta["installed_channel"] = info.get("tracking", "unbekannt")
+            row[7] = meta
+            return row
 
         term = search_term.strip()
         selected_channel = str(channel or "latest/stable")
@@ -2584,7 +2601,7 @@ class Window(QMainWindow):
                 for cached_row in search_cache_rows:
                     row = list(cached_row)
                     if len(row) >= 8:
-                        row[2] = "Installiert" if row[0] in installed else "Nicht installiert"
+                        row = apply_installed_state(row)
                         if row[5] and not Path(str(row[5])).is_file():
                             row[5] = ""
                         refreshed.append(tuple(row))
@@ -2661,7 +2678,7 @@ class Window(QMainWindow):
             refreshed_cache_rows = []
             for cached_row in cache_rows:
                 cached_row = list(cached_row)
-                cached_row[2] = "Installiert" if cached_row[0] in installed else "Nicht installiert"
+                cached_row = apply_installed_state(cached_row)
                 if len(cached_row) > 5 and cached_row[5] and not Path(str(cached_row[5])).is_file():
                     cached_row[5] = ""
                 refreshed_cache_rows.append(tuple(cached_row))
@@ -2672,7 +2689,7 @@ class Window(QMainWindow):
         # SnapUpdates-/Store-Download und keine erneuten Einzelabfragen beim Wechsel.
         if master_rows and not term:
             for master_row in master_rows:
-                master_row[2] = "Installiert" if master_row[0] in installed else "Nicht installiert"
+                apply_installed_state(master_row)
             channel_rows, checked_count, failed_count, enriched_master = Window._snap_rows_for_channel(
                 master_rows, selected_channel, native_arch, allow_network=False)
             if enriched_master:
@@ -2690,7 +2707,7 @@ class Window(QMainWindow):
         store_rows = {} if term else {r[0]: list(r) for r in cache_rows}
         if fresh and not term:
             for cached_name, cached_row in store_rows.items():
-                cached_row[2] = "Installiert" if cached_name in installed else "Nicht installiert"
+                cached_row = apply_installed_state(cached_row)
                 # Veraltete lokale Icon-Pfade nicht als gültige Bilder ausgeben.
                 if len(cached_row) > 5 and cached_row[5] and not Path(str(cached_row[5])).is_file():
                     cached_row[5] = ""
@@ -2733,7 +2750,7 @@ class Window(QMainWindow):
                 url += "?" + urllib.parse.urlencode(params)
             request = urllib.request.Request(url, headers={
                 "Accept": "application/json", "X-Ubuntu-Series": "16",
-                "User-Agent": "LunaPaket/0.1.44"
+                "User-Agent": "LunaPaket/0.1.45"
             })
             try:
                 # Store liefert paginierte Ergebnisse; Folgeseiten ebenfalls lesen.
@@ -2742,7 +2759,7 @@ class Window(QMainWindow):
                 while next_url and pages < 8 and not Window._snap_import_cancelled():
                     req = urllib.request.Request(next_url, headers={
                         "Accept": "application/json", "X-Ubuntu-Series": "16",
-                        "User-Agent": "LunaPaket/0.1.44"
+                        "User-Agent": "LunaPaket/0.1.45"
                     })
                     with urllib.request.urlopen(req, timeout=8) as response:
                         payload = json.loads(response.read(16 * 1024 * 1024).decode("utf-8"))
@@ -2962,9 +2979,8 @@ class Window(QMainWindow):
             except Exception:
                 pass
 
-        for name, version in installed.items():
-            if name in store_rows:
-                store_rows[name][2] = "Installiert"
+        for name in list(store_rows):
+            store_rows[name] = apply_installed_state(store_rows[name])
         # Alle gefundenen Kandidaten (Store-Suche und Community-Katalog) werden
         # anhand der offiziellen Snapcraft-v2-channel-map für Track, Channel und
         # native Architektur geprüft. Stable wird niemals als Ersatz verwendet.
@@ -2981,7 +2997,7 @@ class Window(QMainWindow):
 
         # Persist accumulated results, not only the last search. This makes
         # discovered applications available offline until the configured expiry.
-        rows = sorted((tuple(row) for row in store_rows.values()), key=lambda row: str(row[0]).casefold())
+        rows = sorted((tuple(apply_installed_state(list(row))) for row in store_rows.values()), key=lambda row: str(row[0]).casefold())
         if not term:
             _snap_cache_write(catalog_id, rows)
         if term:
@@ -3001,7 +3017,7 @@ class Window(QMainWindow):
             target = folder / (kind + "-" + digest + suffix)
             if target.is_file() and target.stat().st_size:
                 return str(target)
-            req = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.44"})
+            req = urllib.request.Request(url, headers={"User-Agent": "LunaPaket/0.1.45"})
             # Kurze Netzwerk-Timeouts halten das Beenden zuverlässig flott.
             # Icon-Worker prüfen zusätzlich vor und nach dem Request den Abbruch.
             current = QThread.currentThread()
@@ -3251,13 +3267,17 @@ class Window(QMainWindow):
             return
         meta = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
         summary = row[3] or meta.get("description", "")
+        installed_channel = str(meta.get("installed_channel") or "—")
+        installed_version = str(meta.get("installed_version") or "—")
         fields = [("Snap", snap_name), ("Version", row[1] or "—"),
+                  ("Installierte Version", installed_version), ("Installierter Kanal", installed_channel),
                   ("Status", row[2]), ("Quelle", "Snap Store / snapd"),
                   ("Herausgeber", meta.get("publisher") or "Keine Angabe im Store-Katalog"),
                   ("Lizenz", meta.get("license") or "Keine Angabe im Store-Katalog"),
                   ("Website", meta.get("website") or "Keine Angabe im Store-Katalog")]
         if self.language == "en":
             fields = [("Snap", snap_name), ("Version", row[1] or "—"),
+                      ("Installed version", installed_version), ("Installed channel", installed_channel),
                       ("Status", "Installed" if row[2] == "Installiert" else "Not installed"),
                       ("Source", "Snap Store / snapd"),
                       ("Publisher", meta.get("publisher") or "Not provided in store catalog"),
@@ -4791,6 +4811,17 @@ class Window(QMainWindow):
                 menu.addSeparator()
             if self.snap_mode:
                 english = self.language == "en"
+                if installed:
+                    snap_meta = row[7] if len(row) > 7 and isinstance(row[7], dict) else {}
+                    installed_channel = str(snap_meta.get("installed_channel") or "unbekannt")
+                    channel_menu = menu.addMenu(("Change channel (installed: " if english else "Kanal wechseln (installiert: ") + installed_channel + ")")
+                    channel_labels = (("latest/stable", "Stable"), ("latest/candidate", "Candidate"),
+                                      ("latest/beta", "Beta"), ("latest/edge", "Edge"))
+                    for target_channel, target_label in channel_labels:
+                        channel_action = channel_menu.addAction(target_label)
+                        channel_action.setEnabled(installed_channel != target_channel and not queued)
+                        channel_action.triggered.connect(lambda checked=False, app=app_id, ch=target_channel: self.queue_flatpak_action(app, "channel:" + ch))
+                    menu.addSeparator()
                 if queued:
                     menu.addAction("Cancel queued action" if english else "Vormerkung aufheben", lambda: self.queue_flatpak_action(app_id, None))
                 elif installed:
@@ -4959,7 +4990,12 @@ class Window(QMainWindow):
             labels_en = {"install":"Install", "reinstall":"Reinstall", "remove":"Remove", "purge":"Purge", "hold":"Hold", "unhold":"Unhold"}
             labels = labels_en if self.language == "en" else labels_de
             prefix = "Queued: " if self.language == "en" else "Vorgemerkt: "
-            self.queue_label.setText(prefix + ", ".join(f"{k} ({labels.get(v, v)})" for k, v in active_queue.items()))
+            def describe_action(value):
+                if isinstance(value, str) and value.startswith("channel:"):
+                    target = value.split(":", 1)[1]
+                    return ("Kanalwechsel → " if self.language != "en" else "Switch channel → ") + target
+                return labels.get(value, value)
+            self.queue_label.setText(prefix + ", ".join(f"{k} ({describe_action(v)})" for k, v in active_queue.items()))
 
     def show_properties(self):
         name = self.selected()
@@ -5019,8 +5055,13 @@ class Window(QMainWindow):
         if self.snap_mode:
             if action == "install":
                 channel = str(self.snap_channel_combo.currentData() or "latest/stable")
-                return ["snap", "install", "--channel=" + channel, app_id]
-            return ["snap", "remove", app_id]
+                return privileged(["snap", "install", "--channel=" + channel, app_id])
+            if isinstance(action, str) and action.startswith("channel:"):
+                target_channel = action.split(":", 1)[1]
+                if not re.fullmatch(r"[a-z0-9-]+/[a-z0-9-]+", target_channel):
+                    raise ValueError("Ungültiger Snap-Kanal: " + target_channel)
+                return privileged(["snap", "refresh", app_id, "--channel=" + target_channel])
+            return privileged(["snap", "remove", app_id])
         row = next((item for item in self.flatpak_catalog if item and item[0] == app_id), None)
         meta = row[7] if row and len(row) > 7 and isinstance(row[7], dict) else {}
         if action == "install":
@@ -5095,6 +5136,8 @@ class Window(QMainWindow):
                 self.update_queue_label()
                 if failures:
                     action_message = (("Snap-Aktionen teilweise fehlgeschlagen (" if self.language == "de" else "Some Snap actions failed (") + ", ".join(failures) + ").")
+                elif any(isinstance(action, str) and action.startswith("channel:") for _name, action in actions.items()):
+                    action_message = ("Snap-Kanalwechsel abgeschlossen." if self.language == "de" else "Snap channel switch completed.")
                 else:
                     action_message = ("Installation/Deinstallation abgeschlossen." if self.language == "de" else "Installation/removal completed.")
                 self.snap_post_action_message = action_message
