@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstr
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.45"
+VERSION="0.1.46"
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
@@ -889,6 +889,8 @@ class ActionProgressDialog(QDialog):
         layout.addWidget(self.progress)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
+        self.output.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.output.customContextMenuRequested.connect(self.show_output_context_menu)
         layout.addWidget(self.output, 1)
         self.auto_close = QCheckBox("Close window after successful action" if english else "Fenster nach erfolgreicher Aktion schließen")
         self._settings = settings
@@ -930,29 +932,128 @@ class ActionProgressDialog(QDialog):
         self.close_button.clicked.connect(self.accept)
         layout.addWidget(self.close_button)
 
+    def show_output_context_menu(self, position):
+        menu = QMenu(self.output)
+        copy_action = menu.addAction("Copy" if self.english else "Kopieren")
+        copy_action.setEnabled(bool(self.output.textCursor().hasSelection()))
+        copy_action.triggered.connect(self.output.copy)
+        select_action = menu.addAction("Select all" if self.english else "Alles auswählen")
+        select_action.setEnabled(bool(self.output.toPlainText()))
+        select_action.triggered.connect(self.output.selectAll)
+        menu.exec(self.output.mapToGlobal(position))
+
     def append_output(self, line):
-        if line:
-            # APT may inherit the desktop locale through pkexec despite the
-            # worker locale. Keep the original command output, but present the
-            # standard APT progress prefixes in English in the English UI.
-            if self.english:
-                replacements = (
-                    ("Holen:", "Get:"), ("Ign:", "Ign:"), ("Treffer:", "Hit:"), ("Fehl:", "Err:"),
-                    ("Paketlisten werden gelesen", "Reading package lists"),
-                    ("Abhängigkeitsbaum wird aufgebaut", "Building dependency tree"),
-                    ("Statusinformationen werden eingelesen", "Reading state information"),
-                    ("Entpacken von ", "Unpacking "), ("Entpacke ", "Unpacking "),
-                    ("Vorbereitung zum Entpacken von ", "Preparing to unpack "),
-                    ("Einrichten von ", "Setting up "), ("Richte ein ", "Setting up "),
-                    ("Verarbeite Trigger für ", "Processing triggers for "),
-                    ("Trigger werden verarbeitet für ", "Processing triggers for "),
-                    ("Wird verarbeitet: ", "Processing: "),
-                    ("Paket wird verarbeitet", "Processing package"),
-                    ("Pakete werden heruntergeladen", "Downloading packages"),
-                )
-                for old, new in replacements:
-                    line = line.replace(old, new)
-            self.output.append(line)
+        if not line:
+            return
+
+        # Normalize only stable APT/dpkg status text. Package identifiers,
+        # versions, paths and free-form error details are deliberately kept.
+        if self.english:
+            replacements = (
+                ("Paketlisten werden gelesen", "Reading package lists"),
+                ("Abhängigkeitsbaum wird aufgebaut", "Building dependency tree"),
+                ("Statusinformationen werden eingelesen", "Reading state information"),
+                ("Datenbank wird gelesen", "Reading database"),
+                ("Vorbereitung zum Entfernen", "Preparing for removal"),
+                ("Vorbereitung zum Entpacken von ", "Preparing to unpack "),
+                ("Vorbereitung zum Entpacken", "Preparing to unpack"),
+                ("Entpacken von ", "Unpacking "),
+                ("Entpacken", "Unpacking"),
+                ("Einrichten von ", "Setting up "),
+                ("Einrichten", "Setting up"),
+                ("Entfernen von ", "Removing "),
+                ("Entfernen", "Removing"),
+                ("Trigger werden verarbeitet für ", "Processing triggers for "),
+                ("Trigger werden verarbeitet", "Processing triggers"),
+                ("Verarbeite Trigger für ", "Processing triggers for "),
+                ("Konfigurieren", "Configuring"),
+                ("Installiert", "Installed"),
+                ("Holen:", "Get:"),
+                ("Treffer:", "Hit:"),
+                ("Ignoriert:", "Ign:"),
+                ("Fehler:", "Err:"),
+                ("Paketlisten sind aktuell.", "All packages are up to date."),
+                ("Alle Pakete sind aktuell.", "All packages are up to date."),
+                ("Die folgenden Pakete werden aktualisiert:", "The following packages will be upgraded:"),
+                ("Die folgenden Pakete werden ENTFERNT:", "The following packages will be REMOVED:"),
+                ("Die folgenden NEUEN Pakete werden installiert:", "The following NEW packages will be installed:"),
+                ("Die folgenden Pakete werden HERABGESTUFT:", "The following packages will be DOWNGRADED:"),
+                ("Möchten Sie fortfahren?", "Do you want to continue?"),
+                ("Abbruch.", "Aborted."),
+                ("Paket wird verarbeitet", "Processing package"),
+                ("Pakete werden heruntergeladen", "Downloading packages"),
+            )
+            for old, new in replacements:
+                line = line.replace(old, new)
+            line = re.sub(r"^\(Datenbank wird gelesen …\s*(\d+)\s*%\)$",
+                          r"(Reading database ... \1%)", line)
+            line = re.sub(
+                r"^\(Datenbank wird gelesen …\s*(\d+) Dateien und Verzeichnisse sind derzeit installiert\.\)$",
+                r"(Reading database ... \1 files and directories currently installed.)", line)
+            line = re.sub(r"^Es wurden ([\d.,]+) ([^ ]+) in ([\d.,]+) ([^ ]+) geholt\.$",
+                          r"Fetched \1 \2 in \3 \4.", line)
+        else:
+            replacements = (
+                ("Reading package lists", "Paketlisten werden gelesen"),
+                ("Building dependency tree", "Abhängigkeitsbaum wird aufgebaut"),
+                ("Reading state information", "Statusinformationen werden eingelesen"),
+                ("Reading database", "Datenbank wird gelesen"),
+                ("Preparing for removal", "Vorbereitung zum Entfernen"),
+                ("Preparing to unpack ", "Vorbereitung zum Entpacken von "),
+                ("Preparing to unpack", "Vorbereitung zum Entpacken"),
+                ("Unpacking ", "Entpacken von "),
+                ("Unpacking", "Entpacken"),
+                ("Setting up ", "Einrichten von "),
+                ("Setting up", "Einrichten"),
+                ("Removing ", "Entfernen von "),
+                ("Removing", "Entfernen"),
+                ("Processing triggers for ", "Trigger werden verarbeitet für "),
+                ("Processing triggers", "Trigger werden verarbeitet"),
+                ("Configuring", "Konfigurieren"),
+                ("Installed", "Installiert"),
+                ("Get:", "Holen:"),
+                ("Hit:", "Treffer:"),
+                ("Ign:", "Ignoriert:"),
+                ("Err:", "Fehler:"),
+                ("All packages are up to date.", "Alle Pakete sind aktuell."),
+                ("The following packages will be upgraded:", "Die folgenden Pakete werden aktualisiert:"),
+                ("The following packages will be REMOVED:", "Die folgenden Pakete werden ENTFERNT:"),
+                ("The following NEW packages will be installed:", "Die folgenden NEUEN Pakete werden installiert:"),
+                ("The following packages will be DOWNGRADED:", "Die folgenden Pakete werden HERABGESTUFT:"),
+                ("Do you want to continue?", "Möchten Sie fortfahren?"),
+                ("Aborted.", "Abbruch."),
+                ("Processing package", "Paket wird verarbeitet"),
+                ("Downloading packages", "Pakete werden heruntergeladen"),
+            )
+            for old, new in replacements:
+                line = line.replace(old, new)
+
+            # dpkg status-fd lines: keep the machine fields, translate only the action.
+            match = re.match(
+                r"^(pmstatus:[^:]+:[^:]+:)(Preparing for removal|Removing|Preparing to unpack|Unpacking|Configuring|Setting up|Installed)(.*)$",
+                line)
+            if match:
+                labels = {
+                    "Preparing for removal": "Vorbereitung zum Entfernen",
+                    "Removing": "Entfernen",
+                    "Preparing to unpack": "Vorbereitung zum Entpacken",
+                    "Unpacking": "Entpacken",
+                    "Configuring": "Konfigurieren",
+                    "Setting up": "Einrichten",
+                    "Installed": "Installiert",
+                }
+                line = match.group(1) + labels[match.group(2)] + match.group(3)
+
+            # dpkg database counters; leave the numeric count untouched.
+            line = re.sub(r"^\(Reading database \.{3}\s*(\d+)%\)$",
+                          r"(Datenbank wird gelesen … \1 %)", line)
+            line = re.sub(
+                r"^\(Reading database \.{3}\s*(\d+) files and directories currently installed\.\)$",
+                r"(Datenbank wird gelesen … \1 Dateien und Verzeichnisse sind derzeit installiert.)", line)
+            line = re.sub(r"^Fetched ([\d.,]+) ([^ ]+) in ([\d.,]+) ([^ ]+)\.$",
+                          r"\1 \2 wurden in \3 \4 geholt.", line)
+
+        self.output.append(line)
 
     def set_progress(self, percent, message):
         if percent is not None:

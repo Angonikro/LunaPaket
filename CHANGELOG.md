@@ -1,3 +1,12 @@
+## 0.1.46 – APT/dpkg-Ausgaben und Aktions-Kontextmenü
+
+- APT-/dpkg-Statusmeldungen werden in beiden Richtungen übersetzt: unter anderem Paketlisten-/Datenbankstatus, Holen/Treffer/Ignoriert/Fehler, Entpacken, Einrichten, Entfernen, Trigger und übliche Rückfragen.
+- Dynamische Paketnamen, Versionsnummern, Pfade, Zähler und freie Fehlerdetails bleiben soweit möglich unverändert.
+- Paketnamen, Versionen, Pfade und technische Diagnoseinhalte bleiben unverändert.
+- Das Rechtsklick-Menü im Ausgabefeld der gemeinsamen Aktionsfenster ist sprachabhängig: Deutsch „Kopieren“ / „Alles auswählen“, Englisch „Copy“ / „Select all“.
+- Gilt für alle Aktionen, die den gemeinsamen Aktionsdialog verwenden, einschließlich Paketinstallationen/-entfernungen, Systemaktualisierungen und Sicherheitsupdate-Installationen.
+- Alle übrigen Funktionen aus 0.1.45 bleiben erhalten.
+
 ## 0.1.45 – Snap-Kanalwechsel installierter Anwendungen
 - Installationsstatus und Store-Kanal werden getrennt behandelt: Der installierte Snap-Tracking-Kanal wird aus der `Tracking`-Spalte von `snap list` gelesen.
 - Bereits installierte Anwendungen bleiben in jedem der vier Store-Kataloge als installiert erkennbar, auch wenn ihr installierter Kanal vom aktuell ausgewählten Katalog abweicht.
