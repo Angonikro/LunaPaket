@@ -1,4 +1,4 @@
-# LunaPaket 0.1.46 – APT, Flathub und Snap
+# LunaPaket 0.1.47 – APT, Flathub und Snap
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
 LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates sowie Flatpak-Anwendungen aus Flathub und Snap-Anwendungen über eine
@@ -13,6 +13,7 @@ grafische Oberfläche auf Basis von Python 3 und PySide6.
 - Umschaltung zwischen APT-, Flathub- und Snap-Ansicht direkt in der Oberfläche
 - Snap-Store-Suche mit Suchbegriffen und Store-Kategorien; Suchtreffer werden durch snapd passend zur Gerätearchitektur gefiltert
 - Installierte und verfügbare Snaps unterscheiden
+- Unter „Installiert“ System-Snaps und installierte Flatpak-Laufzeitumgebungen über „System-Apps anzeigen“ optional ein- und ausblenden; der lokale Paketbestand bleibt vollständig erhalten
 - Snap-Kanäle Stable, Candidate, Beta und Edge getrennt nach `channel-map` der offiziellen Snapcraft-v2-API prüfen; ein Store-Metadatenabruf liefert die Releases aller vier Kanäle
 - Ein gemeinsamer Snap-Master-Katalog je Gerätearchitektur lädt die Store-Kandidaten und die vollständige `channel-map` jedes Snaps einmalig (`~/.cache/LunaPaket/snap_catalog_store-master-<arch>.sqlite3`); Stable, Candidate, Beta und Edge werden daraus lokal abgeleitet und zusätzlich getrennt je Kanal gespeichert
 - Die Kanal-Auswahl zeigt die Anzahl der Einträge im jeweils gespeicherten, channel-geprüften Katalog
@@ -121,7 +122,7 @@ Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./lunapaket_0.1.46_all.deb
+sudo apt install ./lunapaket_0.1.47_all.deb
 ```
 
 Anschließend über das Anwendungsmenü oder mit `lunapaket` starten.
@@ -138,7 +139,7 @@ chmod +x build_deb.sh
 ./build_deb.sh
 ```
 
-Das Skript erstellt `dist/lunapaket_0.1.46_all.deb`.
+Das Skript erstellt `dist/lunapaket_0.1.47_all.deb`.
 Zum Bauen wird `dpkg-deb` benötigt.
 
 

@@ -1,3 +1,39 @@
+# Changelog
+
+## 0.1.47 – Snap-Katalog-Neuaufbau und Aktualisierungsstatus
+- Marker-Festschreibung vereinfacht: Sobald der Snap-Download-Worker erfolgreich fertig ist und sein Ergebnis zurückmeldet, wird der Einmal-Marker sofort gesetzt – ohne Prüfung von Trefferzahlen, Master-Katalog oder Channel-Dateien.
+- Einmaliger Snap-Neuaufbau: Erfolgsmarker wird direkt nach erfolgreichem Worker-Ergebnis gesetzt; leere Channels oder fehlende vorab angelegte Channel-Dateien lösen keinen erneuten Komplett-Neuaufbau bei jedem Programmstart aus.
+- Abschlussprüfung korrigiert: Auch ein leerer ausgewählter Snap-Channel (z. B. Beta/Edge) gilt als erfolgreich, sobald Master-Katalog und alle vier Channel-Datenbanken vorhanden sind; der Einmal-Marker wird dann gesetzt.
+- Alte Snap-Neuaufbau-Marker (Datei- und QSettings-Marker aus vorherigen 0.1.47-Testläufen) werden vor der Migration entfernt; ausschließlich der neue v3-Marker wird nach erfolgreichem Neuaufbau gesetzt.
+- Beim ersten Start nach diesem Update werden ausschließlich die LunaPaket-Snap-Katalogdatenbanken entfernt und der vollständige Snap-Katalog neu aufgebaut. APT-, Flathub- und Programmeinstellungen bleiben unberührt.
+- Ein unvollständiger Snap-Neuaufbau mit weniger als 25 Anwendungen gilt nicht als abgeschlossen und wird beim nächsten Programmstart erneut versucht.
+- Snap-Katalog und gemeinsamer Master-Katalog beachten die eingestellte Cache-Laufzeit von sieben Tagen; ein abgelaufener Master-Katalog löst wieder einen Online-Neuaufbau aus.
+- Der öffentliche SnapUpdates-Katalog verwendet ebenfalls die konfigurierte 7-Tage-Laufzeit statt einer festen 6-Stunden-Frist.
+- Separate Schaltflächen zur manuellen Aktualisierung des vollständigen Snap- bzw. Flathub-Katalogs ergänzt; die bisherigen Update-Prüfungen bleiben bestehen.
+- Laufende Katalogaktualisierungen zeigen einen sichtbaren Aktivitätsbalken und Statusmeldungen. APT-Paketlistenaktualisierung zeigt denselben Aktivitätsstatus.
+- Rechtsklick-Menüs im Paket-Suchfeld und im schreibgeschützten Detailfeld vollständig auf Deutsch umgesetzt.
+- Menüaktionen sind kontextabhängig aktiviert (z. B. Kopieren nur bei markiertem Text).
+# Katalogaktualisierung und Snap-Neuaufbau
+- Snap-Katalog wird nach dem Update einmalig neu aufgebaut; ausschließlich LunaPaket-Snap-Katalogdaten werden dafür entfernt. APT- und Flathub-Kataloge bleiben erhalten.
+- Snap-Katalog wird bei erfolgreichem Neuaufbau dauerhaft als initialisiert markiert; danach gilt wieder die konfigurierte 7-Tage-Aufbewahrung.
+- Manuelle Aktualisierung von APT-Paketlisten sowie Flathub- und Snap-Katalogen ist unter Einstellungen → Paketquellen erreichbar.
+- Globale Aktivitätsanzeige bleibt beim Wechsel zwischen den Paketquellen sichtbar und meldet beim Snap-Import die bisher gefundene Anzahl; die Abschlusszahl erscheint erst nach Ende des Imports.
+- Rechtsklick-Kontextmenüs und bestehende Snap-Channel-Verwaltung bleiben unverändert.
+# Snap-Kanal- und Ansichtswechsel korrigiert
+- Beim Wechsel des Snap-Kanals wird sofort ausschließlich dessen eigener persistenter Katalog angezeigt.
+- Die Filter „Alle“, „Installiert“ und „Nicht installiert“ arbeiten lokal auf dem geladenen Snap-Katalog, ohne einen unnötigen Store-Reload auszulösen.
+- Beim Wechsel zwischen APT, Flathub und Snap wird die Tabelle unmittelbar aus dem jeweils passenden Katalog aufgebaut; alte Einträge des vorherigen Anbieters bleiben nicht als Platzhalter stehen.
+# Korrektur: Aktualisierung der installierten Snaps
+- Beim Öffnen von „Installiert“ wird `snap list` jetzt unabhängig vom Store-Katalog direkt neu ausgeführt.
+- Der lokale Installationsbestand wird mit dem ausgewählten Channel-Katalog abgeglichen und in dessen Cache gespeichert.
+- Installierte lokale Snaps ohne Store-Metadaten werden ergänzt; Bases, Runtimes, Themes und snapd werden nicht mehr aus dem Installationsbestand herausgefiltert.
+- Der Filter „Installiert“ wird nicht zusätzlich durch Themenkategorien eingeschränkt.
+# Umschaltbarer System-App-Filter
+- Unter „Installiert“ ergänzt die Checkbox „System-Apps anzeigen“ einen umschaltbaren Filter für technische Snap-Systemkomponenten.
+- Snap-Bases, Desktop-Runtimes, Grafik-Stacks und technische System-Snaps bleiben im installierten Bestand erhalten und werden bei deaktiviertem Filter nur ausgeblendet.
+- Installierte Flatpak-Laufzeitumgebungen werden zusätzlich über `flatpak list --runtime` erfasst und können mit derselben Checkbox ein- oder ausgeblendet werden.
+- Die Einstellung wird gespeichert; der Filter verändert weder Paketbestand noch Katalog-Cache.
+
 ## 0.1.46 – APT/dpkg-Ausgaben und Aktions-Kontextmenü
 
 - APT-/dpkg-Statusmeldungen werden in beiden Richtungen übersetzt: unter anderem Paketlisten-/Datenbankstatus, Holen/Treffer/Ignoriert/Fehler, Entpacken, Einrichten, Entfernen, Trigger und übliche Rückfragen.
@@ -271,4 +307,3 @@
 ### Korrekturen innerhalb von Version 0.1.44
 - Flatpak-Katalog nach abgeschlossenen Installations- und Deinstallationsaktionen auch dann neu laden, wenn bereits ein Katalog im Speicher vorhanden ist.
 - Installationsstatus der Flathub-Anwendungen und Paketanzahl nach Aktionen aktualisieren, ohne einen Neustart zu benötigen.
-
