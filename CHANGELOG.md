@@ -1,5 +1,19 @@
 # Änderungsprotokoll
 
+## 0.1.49 – Update-Wächter und Tray
+- Update-Wächter zeigt verfügbare Updates getrennt nach APT, Flatpak/Flathub und Snap einschließlich Paket-/App-Namen.
+- AppImages werden weiterhin erkannt und gezählt; ohne passende Updatequelle wird ausdrücklich keine Versionsprüfung behauptet.
+- Tray-Symbol mit Öffnen, Jetzt prüfen und Beenden.
+- Neue Einstellung: Tray-Symbol aktivieren. Bei aktiviertem Tray wird das Hauptfenster beim Schließen ausgeblendet und LunaPaket läuft weiter.
+- Das Tray zeigt die Anzahl verfügbarer Updates im Tooltip und meldet neu erkannte Updates per Desktop-Benachrichtigung.
+- Keine Updates werden automatisch installiert.
+# Update-Prüfung bei jedem Start und sichtbare Fundmeldung
+- Automatische Update-Prüfung fünf Sekunden nach jedem Programmstart, auch wenn die periodische Hintergrundprüfung ausgeschaltet ist.
+- Bei laufenden Paket-/Katalogaufgaben wird die Startprüfung nach 15 Sekunden erneut versucht, statt übersprungen zu werden.
+- Bei JEDEM Prüflauf mit verfügbaren Updates erscheint ein sichtbares Fenster mit den gefundenen Paket-/Anwendungsnamen – auch bei unveränderter Update-Liste und wenn das Hauptfenster im Tray verborgen ist.
+- Wiederkehrende Hintergrundprüfungen bleiben über den Update-Wächter separat steuerbar.
+
+
 ## 0.1.48 – Direkter Zugriff auf AppImage und Update-Wächter
 - AppImage-Verwaltung und Update-Wächter sind jetzt als eigene Schaltflächen direkt in der Hauptoberfläche erreichbar.
 - Der Update-Wächter zeigt direkt in der Hauptoberfläche seinen Ein-/Aus-Status sowie das eingestellte Prüfintervall.

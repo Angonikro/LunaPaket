@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstr
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.48"
+VERSION="0.1.49"
 
 
 def _desktop_user_account():
@@ -703,7 +703,7 @@ def log_apt_problem(args, returncode, output):
     """Schreibt ausschließlich fehlgeschlagene APT-Aufrufe in ein begrenztes Benutzer-Log."""
     try:
         from datetime import datetime
-        uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+        uid = int(os.environ.get("LUNAPAKET_DESKTOP_UID", os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid()))))
         account = pwd.getpwuid(uid)
         home = Path(account.pw_dir)
         log_dir = home / ".local" / "share" / "LunaPaket" / "logs"
@@ -752,11 +752,15 @@ def relaunch_as_root():
     if os.geteuid() == 0:
         return
     env = os.environ.copy()
-    # pkexec entfernt absichtlich fast alle Umgebungsvariablen. Nur die für
-    # die bestehende grafische Sitzung notwendigen Werte explizit übergeben.
+    # pkexec entfernt absichtlich fast alle Umgebungsvariablen. Die GUI muss
+    # trotzdem in der bereits angemeldeten Desktop-Sitzung laufen: insbesondere
+    # Tray/D-Bus und die Einstellungen des aufrufenden Benutzers.
+    desktop_uid = os.getuid()
     keep = ["DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
-            "DBUS_SESSION_BUS_ADDRESS", "QT_QPA_PLATFORM", "QT_QPA_PLATFORM_PLUGIN_PATH"]
-    command = ["pkexec", "/usr/bin/env"]
+            "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE",
+            "XDG_DATA_DIRS", "DESKTOP_SESSION", "SESSION_MANAGER",
+            "QT_QPA_PLATFORM", "QT_QPA_PLATFORM_PLUGIN_PATH"]
+    command = ["pkexec", "/usr/bin/env", f"LUNAPAKET_DESKTOP_UID={desktop_uid}"]
     for key in keep:
         value = env.get(key)
         if value:
@@ -1300,7 +1304,7 @@ class Window(QMainWindow):
         self._theme_placeholder = True
         # Auch bei pkexec muss LunaPaket die Einstellungen des angemeldeten
         # Desktop-Benutzers verwenden und nicht /root/.config.
-        desktop_uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+        desktop_uid = int(os.environ.get("LUNAPAKET_DESKTOP_UID", os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid()))))
         desktop_user = pwd.getpwuid(desktop_uid)
         config_home = os.environ.get("XDG_CONFIG_HOME") if desktop_uid == os.getuid() else None
         if not config_home:
@@ -1384,7 +1388,7 @@ class Window(QMainWindow):
         self.repo_btn.setToolTip("APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren")
         self.repo_btn.clicked.connect(self.manage_sources)
         h.addWidget(self.repo_btn)
-        self.flatpak_update_btn = QPushButton("Flathub-Updates suchen")
+        self.flatpak_update_btn = QPushButton("Flatpak-Updates suchen")
         self.flatpak_update_btn.clicked.connect(self.check_flatpak_updates)
         self.flatpak_update_btn.setVisible(False)
         h.addWidget(self.flatpak_update_btn)
@@ -1435,6 +1439,10 @@ class Window(QMainWindow):
         self.update_watcher_timer = QTimer(self)
         self.update_watcher_timer.timeout.connect(self.check_all_updates_silently)
         self.configure_update_watcher()
+        self._init_tray_icon()
+        # Beim JEDEN Programmstart einmal prüfen – unabhängig davon, ob die
+        # wiederkehrende Hintergrundprüfung in den Einstellungen aktiv ist.
+        QTimer.singleShot(5000, self.check_all_updates_silently)
         bar=QHBoxLayout(); self.search=QLineEdit(); self.search.setPlaceholderText("Pakete suchen …"); self.search.returnPressed.connect(self.search_pkgs); self.search.setContextMenuPolicy(Qt.CustomContextMenu); self.search.customContextMenuRequested.connect(lambda pos, w=self.search: self.show_german_text_context_menu(w, pos)); bar.addWidget(self.search,1)
         self.filter=QComboBox(); self.filter.addItems(["Suchergebnisse","Installierte Pakete"]); self.filter.currentIndexChanged.connect(self.search_pkgs); bar.addWidget(self.filter)
         b=QPushButton("Suchen"); b.clicked.connect(self.search_pkgs); bar.addWidget(b); l.addLayout(bar)
@@ -3019,56 +3027,202 @@ class Window(QMainWindow):
         enabled = self.settings.value("updates/watcher_enabled", False, type=bool)
         minutes = max(30, self.settings.value("updates/watcher_interval_minutes", 360, type=int))
         self.update_watcher_timer.stop()
-        if enabled: self.update_watcher_timer.start(minutes * 60 * 1000)
+        if enabled:
+            self.update_watcher_timer.start(minutes * 60 * 1000)
         self._refresh_update_watcher_toolbar()
 
-    @staticmethod
-    def _collect_update_watcher_status():
+    def _collect_update_watcher_status(self):
+        """Collect concrete pending package names from each supported package manager."""
         results = {}
         checks = (
             ("APT", ["apt-get", "--just-print", "upgrade"]),
-            ("Flatpak", ["flatpak", "remote-ls", "--updates"]),
+            ("Flatpak", ["flatpak", "remote-ls", "--updates", "--all"]),
             ("Snap", ["snap", "refresh", "--list"]),
         )
         for name, command in checks:
             if not shutil.which(command[0]):
-                results[name] = None
+                results[name] = {"available": False, "count": 0, "packages": [], "error": "Nicht installiert"}
                 continue
             try:
                 p = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
                 output = p.stdout.strip()
-                if name == "APT":
-                    lines = [x for x in output.splitlines() if re.search(r"^Inst\s+", x)]
-                else:
-                    lines = [x for x in output.splitlines() if x and not x.lower().startswith(("name", "ref", "tracking", "---", "no updates", "all snaps up to date", "nothing to do"))]
-                results[name] = len(lines) if p.returncode == 0 else None
-            except Exception:
-                results[name] = None
+                packages = []
+                snap_table_started = False
+                if p.returncode == 0:
+                    for line in output.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if name == "APT":
+                            match = re.match(r"^Inst\s+([^\s]+)", line)
+                            if match:
+                                packages.append(match.group(1))
+                        elif name == "Flatpak":
+                            if line.lower().startswith(("ref", "name", "no updates", "nothing to do", "application", "runtime")):
+                                continue
+                            # remote-ls --updates prints refs; preserve the full ref for clarity.
+                            packages.append(line.split()[0])
+                        else:
+                            # snap refresh --list liefert eine Tabelle. Warnungen
+                            # (z. B. "WARNING: ...") stehen außerhalb der Tabelle
+                            # und dürfen niemals als Update gezählt werden.
+                            fields = line.split()
+                            if len(fields) >= 3 and fields[0].lower() == "name" and fields[1].lower() == "version" and fields[2].lower() == "rev":
+                                snap_table_started = True
+                                continue
+                            if not snap_table_started or len(fields) < 3:
+                                continue
+                            snap_name, _version, revision = fields[:3]
+                            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", snap_name):
+                                continue
+                            if not revision.isdigit():
+                                continue
+                            packages.append(snap_name)
+                results[name] = {"available": True, "count": len(packages), "packages": packages,
+                                 "error": "" if p.returncode == 0 else output or f"Exit-Code {p.returncode}"}
+            except Exception as exc:
+                results[name] = {"available": True, "count": 0, "packages": [], "error": str(exc)}
         appimages = self._discover_appimages_for_watcher()
         updater = _find_appimage_updater()
-        results["AppImage"] = {"count": len(appimages), "updater": bool(updater)}
+        results["AppImage"] = {"available": True, "count": 0, "packages": [],
+                                "detected": len(appimages), "updater": bool(updater),
+                                "note": "Nur Dateien erkannt; keine Updatequelle/Versionsprüfung."}
         return results
 
     def _discover_appimages_for_watcher(self):
         folder = self.settings.value("appimage/import_folder", str(self._appimage_directory()), type=str)
         return {str(path) for path in _discover_user_appimages([folder])}
 
+    def _format_update_watcher_message(self, results):
+        en = self.language == "en"
+        lines = []
+        total = 0
+        for key in ("APT", "Flatpak", "Snap"):
+            item = results.get(key, {})
+            if not isinstance(item, dict):
+                continue
+            count = int(item.get("count", 0)); total += count
+            label = {"APT": "APT (Debian)", "Flatpak": "Flatpak / Flathub", "Snap": "Snap"}[key]
+            if count:
+                lines.append(f"{label}: {count} " + ("update(s)" if en else "Update(s)"))
+                lines.extend("  • " + name for name in item.get("packages", []))
+            elif item.get("error"):
+                lines.append(f"{label}: " + ("check failed" if en else "Prüfung fehlgeschlagen") + f" ({item['error']})")
+            else:
+                lines.append(f"{label}: " + ("no updates" if en else "keine Updates"))
+        app = results.get("AppImage", {})
+        detected = int(app.get("detected", 0))
+        lines.append((f"AppImages: {detected} detected; no version check available" if en else
+                      f"AppImages: {detected} erkannt; keine Versionsprüfung verfügbar"))
+        return total, "\n".join(lines)
+
+    def _init_tray_icon(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        # Einheitliches LunaPaket-Programmsymbol statt des generischen Computer-Icons.
+        icon_path = Path(__file__).resolve().parent / "icons" / "lunapaket.png"
+        app_icon = QIcon(str(icon_path)) if icon_path.is_file() else QIcon.fromTheme("system-software-install")
+        self.tray_icon.setIcon(app_icon)
+        self.tray_menu = QMenu()
+        self.tray_open_action = QAction("LunaPaket öffnen", self)
+        self.tray_open_action.triggered.connect(self._show_from_tray)
+        self.tray_check_action = QAction("Jetzt nach Updates suchen", self)
+        self.tray_check_action.triggered.connect(self.check_all_updates_silently)
+        self.tray_menu.addAction(self.tray_open_action)
+        self.tray_menu.addAction(self.tray_check_action)
+        self.tray_menu.addSeparator()
+        quit_action = QAction("LunaPaket beenden", self)
+        quit_action.triggered.connect(self._quit_from_tray)
+        self.tray_menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.messageClicked.connect(self._show_tray_update_results)
+        self._tray_update_message = ""
+        self._quit_requested = False
+        self._apply_tray_setting()
+
+    def _apply_tray_setting(self):
+        if not hasattr(self, "tray_icon"):
+            return
+        enabled = self.settings.value("tray/enabled", False, type=bool)
+        if enabled:
+            self.tray_icon.show()
+            self._update_tray_tooltip()
+        else:
+            self.tray_icon.hide()
+
+    def _update_tray_tooltip(self, total=None):
+        if not hasattr(self, "tray_icon"):
+            return
+        if total is None:
+            raw = self.settings.value("updates/last_results", "{}", type=str)
+            try:
+                results = json.loads(raw)
+                total = sum(int(results.get(k, {}).get("count", 0)) for k in ("APT", "Flatpak", "Snap"))
+            except Exception:
+                total = 0
+        label = (f"LunaPaket – {total} Updates verfügbar" if self.language == "de" else f"LunaPaket – {total} updates available") if total else "LunaPaket"
+        self.tray_icon.setToolTip(label)
+
+    def _show_from_tray(self):
+        self.showNormal(); self.raise_(); self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            self._show_from_tray()
+        elif reason == QSystemTrayIcon.MessageClicked:
+            self._show_tray_update_results()
+
+    def _show_tray_update_results(self):
+        message = getattr(self, "_tray_update_message", "")
+        if not message:
+            self._show_from_tray()
+            return
+        self._show_from_tray()
+        title = "LunaPaket – Updates gefunden"
+        dialog = QMessageBox(QMessageBox.Information, title, message, QMessageBox.Ok, self)
+        dialog.setMinimumWidth(520)
+        dialog.exec()
+
+    def _quit_from_tray(self):
+        self._quit_requested = True
+        self.tray_icon.hide()
+        QApplication.quit()
+
     def check_all_updates_silently(self):
-        if getattr(self, "_update_watcher_running", False) or getattr(self, "_busy", False): return
+        if getattr(self, "_update_watcher_running", False):
+            return
+        if getattr(self, "_busy", False):
+            # Wenn beim Start gerade ein Katalog-/Paketjob läuft, die Prüfung
+            # nicht verlieren, sondern nach dessen Ende erneut versuchen.
+            QTimer.singleShot(15000, self.check_all_updates_silently)
+            return
         self._update_watcher_running = True
         self.update_watcher_job = FunctionJob(self._collect_update_watcher_status)
         def done(results):
             self._update_watcher_running = False
             self.settings.setValue("updates/last_check", __import__("datetime").datetime.now().astimezone().strftime("%d.%m.%Y %H:%M"))
             self.settings.setValue("updates/last_results", json.dumps(results, ensure_ascii=False)); self.settings.sync()
-            counts = [v for k, v in results.items() if k != "AppImage" and isinstance(v, int)]
-            total = sum(counts)
-            self.status.setText((f"Update watcher: {total} update(s) found" if self.language == "en" else f"Update-Wächter: {total} Update(s) gefunden"))
-            old = self.settings.value("updates/last_notified_total", -1, type=int)
-            if total > 0 and total != old:
-                message = (f"{total} available update(s) were found. Open LunaPaket to use the respective update functions." if self.language == "en" else f"Es wurden {total} verfügbare Updates erkannt. Öffne LunaPaket, um die jeweiligen Update-Funktionen zu verwenden.")
-                QMessageBox.information(self, "LunaPaket – Update Watcher" if self.language == "en" else "LunaPaket – Update-Wächter", message)
-            self.settings.setValue("updates/last_notified_total", total); self.settings.sync()
+            total, message = self._format_update_watcher_message(results)
+            self.status.setText((f"Update-Wächter: {total} Update(s) gefunden" if self.language == "de" else f"Update watcher: {total} update(s) found"))
+            self._update_tray_tooltip(total)
+            # Im Tray-Modus eine echte Desktop-Benachrichtigung anzeigen.
+            # Ein Klick auf die Meldung öffnet anschließend die vollständige Liste.
+            if total > 0:
+                tray_enabled = self.settings.value("tray/enabled", False, type=bool)
+                if tray_enabled and self.tray_icon.isVisible():
+                    self._tray_update_message = message
+                    body = (f"{total} Updates verfügbar – anklicken für Details" if self.language == "de"
+                            else f"{total} updates available – click for details")
+                    self.tray_icon.showMessage(
+                        "LunaPaket – Updates verfügbar" if self.language == "de" else "LunaPaket – Updates available",
+                        body, QSystemTrayIcon.Information, 10000)
+                else:
+                    title = "LunaPaket – Updates gefunden"
+                    dialog = QMessageBox(QMessageBox.Information, title, message, QMessageBox.Ok, self)
+                    dialog.setMinimumWidth(520)
+                    dialog.exec()
+            self.settings.setValue("updates/last_notified_total", total)
+            self.settings.sync()
         def failed(error):
             self._update_watcher_running = False
             self.status.setText(("Update watcher failed: " if self.language == "en" else "Update-Wächter fehlgeschlagen: ") + str(error))
@@ -3080,6 +3234,9 @@ class Window(QMainWindow):
         layout = QVBoxLayout(dlg)
         enabled = QCheckBox("Automatically check for updates" if en else "Automatisch nach Updates suchen")
         enabled.setChecked(self.settings.value("updates/watcher_enabled", False, type=bool))
+        tray_enabled = QCheckBox("Tray-Symbol aktivieren und beim Schließen im Tray weiterlaufen lassen" if not en else "Enable tray icon and keep running when the window is closed")
+        tray_enabled.setChecked(self.settings.value("tray/enabled", False, type=bool))
+        layout.addWidget(tray_enabled)
         interval_row = QHBoxLayout(); interval_row.addWidget(QLabel("Check interval:" if en else "Prüfintervall:"))
         interval = QComboBox()
         for label, value in ((("Every 30 minutes",30),("Hourly",60),("Every 6 hours",360),("Daily",1440)) if en else (("Alle 30 Minuten",30),("Stündlich",60),("Alle 6 Stunden",360),("Täglich",1440))): interval.addItem(label, value)
@@ -3094,7 +3251,8 @@ class Window(QMainWindow):
         layout.addWidget(buttons)
         def save():
             self.settings.setValue("updates/watcher_enabled", enabled.isChecked()); self.settings.setValue("updates/watcher_interval_minutes", interval.currentData())
-            self.settings.sync(); self.configure_update_watcher(); dlg.accept()
+            self.settings.setValue("tray/enabled", tray_enabled.isChecked())
+            self.settings.sync(); self.configure_update_watcher(); self._apply_tray_setting(); dlg.accept()
         buttons.accepted.connect(save); buttons.rejected.connect(dlg.reject); dlg.exec()
 
     def show_settings(self):
@@ -3120,6 +3278,8 @@ class Window(QMainWindow):
         layout.addLayout(theme_row)
         remember = QCheckBox()
         remember.setChecked(self.remember_window_enabled)
+        tray_enabled = QCheckBox()
+        tray_enabled.setChecked(self.settings.value("tray/enabled", False, type=bool))
         cache = QCheckBox()
         catalog_label = QLabel()
         catalog_retention = QComboBox()
@@ -3175,6 +3335,7 @@ class Window(QMainWindow):
             english = self.language == "en"
             dlg.setWindowTitle("LunaPaket – Settings" if english else "LunaPaket – Einstellungen")
             remember.setText("Remember window size and position" if english else "Fenstergröße und Fensterposition merken")
+            tray_enabled.setText("Enable tray icon; keep LunaPaket running when closing" if english else "Tray-Symbol aktivieren; LunaPaket beim Schließen weiterlaufen lassen")
             remember.setToolTip("Saves the window size and position on exit and restores them next time." if english else "Speichert Größe und Position beim Schließen und stellt sie beim nächsten Start wieder her.")
             cache.setText("Delete downloaded package files after successful installation" if english else "Heruntergeladene Paketdateien nach erfolgreicher Installation löschen")
             catalog_label.setText("Keep APT image catalog:" if english else "APT-Bilderkatalog speichern für:")
@@ -3200,6 +3361,7 @@ class Window(QMainWindow):
         cache.setChecked(self.clean_cache_enabled)
         cache.setChecked(self.clean_cache_enabled)
         layout.addWidget(remember)
+        layout.addWidget(tray_enabled)
         layout.addWidget(cache)
         layout.addLayout(catalog_row)
         layout.addLayout(flathub_catalog_row)
@@ -3229,6 +3391,11 @@ class Window(QMainWindow):
         layout.addWidget(buttons)
         update_settings_language()
         remember.toggled.connect(self.set_remember_window)
+        def tray_setting_changed(enabled):
+            self.settings.setValue("tray/enabled", bool(enabled))
+            self.settings.sync()
+            self._apply_tray_setting()
+        tray_enabled.toggled.connect(tray_setting_changed)
         def language_changed(index):
             self.language = language_combo.currentData()
             self.settings.setValue("language", self.language)
@@ -3386,6 +3553,11 @@ class Window(QMainWindow):
         dlg.exec()
 
     def closeEvent(self, event):
+        if (not getattr(self, "_quit_requested", False)
+                and self.settings.value("tray/enabled", False, type=bool)):
+            event.ignore()
+            self.hide()
+            return
         # Icon-Nachladen beim Beenden sofort stoppen. Diese Jobs haben kurze
         # Netzwerk-Timeouts und werden separat begrenzt abgewartet.
         icon_timer = getattr(self, "_snap_icon_timer", None)
@@ -3487,7 +3659,7 @@ class Window(QMainWindow):
         self.snap_catalog_refresh_btn.setVisible(False)
         self.snap_channel_label.setVisible(snap)
         self.snap_channel_combo.setVisible(snap)
-        self.flatpak_update_btn.setText("Check for Flathub updates" if self.language == "en" else "Flathub-Updates suchen")
+        self.flatpak_update_btn.setText("Check for Flatpak updates" if self.language == "en" else "Flatpak-Updates suchen")
         self.snap_update_btn.setText("Check for Snap updates" if self.language == "en" else "Snap-Updates suchen")
         self.flatpak_catalog_refresh_btn.setText("Refresh Flathub catalog" if self.language == "en" else "Flathub-Katalog aktualisieren")
         self.snap_catalog_refresh_btn.setText("Refresh Snap catalog" if self.language == "en" else "Snap-Katalog aktualisieren")
@@ -7295,8 +7467,8 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Flatpak", "Flatpak is not installed." if english else "Flatpak ist nicht installiert.")
             return
         self.flatpak_update_btn.setEnabled(False)
-        self._update_progress_start("flatpak_updates", "Checking Flathub updates …" if english else "Flathub-Updates werden gesucht …")
-        self.status.setText("Checking Flathub updates …" if english else "Flathub-Updates werden gesucht …")
+        self._update_progress_start("flatpak_updates", "Checking Flatpak updates …" if english else "Flatpak-Updates werden gesucht …")
+        self.status.setText("Checking Flatpak updates …" if english else "Flatpak-Updates werden gesucht …")
 
         def scan():
             found = []
@@ -7304,7 +7476,7 @@ class Window(QMainWindow):
             for scope, flag in (("user", "--user"), ("system", "--system")):
                 # remote-ls erwartet das Remote als Positionsargument. Ohne
                 # "flathub" wird die Update-Abfrage nicht zuverlässig ausgeführt.
-                flatpak_args = ["flatpak", "remote-ls", "--updates", "--columns=ref", flag, "flathub"]
+                flatpak_args = ["flatpak", "remote-ls", "--updates", "--all", "--columns=ref", flag]
                 rc, output = flatpak_user_cmd(flatpak_args) if scope == "user" else cmd(flatpak_args)
                 if rc != 0:
                     errors.append((scope, output.strip()))
@@ -7398,11 +7570,11 @@ class Window(QMainWindow):
                 dlg.accept()
                 self.flatpak_update_btn.setEnabled(False)
                 self.set_busy(True)
-                self._update_progress_start("flatpak_update_install", "Installing Flatpak updates …" if english else "Flathub-Updates werden installiert …")
+                self._update_progress_start("flatpak_update_install", "Installing Flatpak updates …" if english else "Flatpak-Updates werden installiert …")
                 self.status.setText("Installing Flatpak updates …" if english else "Flatpak-Updates werden installiert …")
                 progress = ActionProgressDialog(
                     self,
-                    "Installing Flatpak updates" if english else "Flathub-Updates installieren",
+                    "Installing Flatpak updates" if english else "Flatpak-Updates installieren",
                     (f"Installing {len(selected)} selected Flatpak update(s)." if english
                      else f"{len(selected)} ausgewählte Flatpak-Updates werden installiert."),
                     english=english, settings=self.settings,
@@ -8924,6 +9096,9 @@ def main():
     relaunch_as_root()
     app=QApplication(sys.argv)
     app.setApplicationName("LunaPaket")
+    icon_path = Path(__file__).resolve().parent / "icons" / "lunapaket.png"
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
     win=Window(); win.show()
     # Aufruf über Dateimanager: --open-deb [datei.deb].
     # Manche Dateimanager übergeben lokale Dateien als file://-URI.
