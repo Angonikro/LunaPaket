@@ -1,4 +1,4 @@
-# LunaPaket 0.1.49 – APT, Flathub, Snap und AppImage
+# LunaPaket 0.1.50 – APT, Flathub, Snap und AppImage
 
 Grafische Paketverwaltung für Debian 13 (Trixie) und kompatible Debian-Systeme.
 LunaPaket verwaltet APT-Pakete, Paketquellen und Sicherheitsupdates sowie Flatpak-Anwendungen aus Flathub und Snap-Anwendungen über eine
@@ -92,7 +92,7 @@ ZIP-Datei entpacken und in den Projektordner wechseln:
 
 ```bash
 mkdir -p ~/Programme
-unzip LunaPaket_0.1.49_GITHUB.zip -d ~/Programme
+unzip LunaPaket_0.1.50_GITHUB.zip -d ~/Programme
 cd ~/Programme/LunaPaket
 ```
 
@@ -125,7 +125,7 @@ Daher zunächst normal aus der grafischen Sitzung starten und nicht mit `sudo`.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./lunapaket_0.1.49_all.deb
+sudo apt install ./lunapaket_0.1.50_all.deb
 ```
 
 Anschließend über das Anwendungsmenü oder mit `lunapaket` starten.
@@ -142,7 +142,7 @@ chmod +x build_deb.sh
 ./build_deb.sh
 ```
 
-Das Skript erstellt `dist/lunapaket_0.1.49_all.deb`.
+Das Skript erstellt `dist/lunapaket_0.1.50_all.deb`.
 Zum Bauen wird `dpkg-deb` benötigt.
 
 
@@ -187,14 +187,3 @@ normalen Deinstallation erhalten.
 ---
 
 73 de DO2QG Andreas
-### Update-Wächter und Tray (0.1.49)
-Der Update-Wächter prüft APT, Flatpak/Flathub und Snap und listet gefundene Updates getrennt nach Paket bzw. Anwendung auf. AppImages werden erkannt, aber ohne eine unterstützte Updatequelle nicht auf neue Versionen geprüft. Es werden niemals automatisch Updates installiert.
-
-Unter **Einstellungen** kann das Tray-Symbol aktiviert werden. Bei aktiviertem Tray blendet das Schließen-Kreuz das Fenster nur aus; LunaPaket läuft im Hintergrund weiter. Das Tray-Menü bietet „LunaPaket öffnen“, „Jetzt nach Updates suchen“ und „LunaPaket beenden“. Bei gefundenen Updates zeigt das Tray eine Benachrichtigung und die Anzahl im Tooltip.
-
-
-### Ergänzung 0.1.49 – Prüfung bei jedem Start und Update-Fenster
-- LunaPaket prüft APT, Flatpak/Flathub und Snap fünf Sekunden nach JEDEM Programmstart automatisch – unabhängig davon, ob die wiederkehrende Hintergrundprüfung aktiviert ist.
-- Ist LunaPaket beim Start noch mit einer anderen Aufgabe beschäftigt, wird die Prüfung nach 15 Sekunden erneut versucht.
-- Bei jedem Prüflauf mit verfügbaren Updates erscheint ein sichtbares Informationsfenster mit den betroffenen Paketnamen, auch wenn dieselben Updates bereits beim vorherigen Prüflauf gefunden wurden und LunaPaket im Tray verborgen ist.
-- Die wiederkehrende Prüfung bleibt separat über den Update-Wächter und dessen Prüfintervall steuerbar.

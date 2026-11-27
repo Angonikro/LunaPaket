@@ -4,10 +4,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstractTableModel, QModelIndex
-from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
+from PySide6.QtGui import QAction, QIcon, QPixmap, QImage, QPainter, QFont, QColor, QPen
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.49"
+VERSION="0.1.50"
 
 
 def _desktop_user_account():
@@ -3121,6 +3121,7 @@ class Window(QMainWindow):
         # Einheitliches LunaPaket-Programmsymbol statt des generischen Computer-Icons.
         icon_path = Path(__file__).resolve().parent / "icons" / "lunapaket.png"
         app_icon = QIcon(str(icon_path)) if icon_path.is_file() else QIcon.fromTheme("system-software-install")
+        self._tray_base_icon = app_icon
         self.tray_icon.setIcon(app_icon)
         self.tray_menu = QMenu()
         self.tray_open_action = QAction("LunaPaket öffnen", self)
@@ -3162,6 +3163,35 @@ class Window(QMainWindow):
                 total = 0
         label = (f"LunaPaket – {total} Updates verfügbar" if self.language == "de" else f"LunaPaket – {total} updates available") if total else "LunaPaket"
         self.tray_icon.setToolTip(label)
+        # Draw the current update count directly onto the tray icon. The
+        # tooltip alone is not sufficient: the number must remain visible
+        # without hovering over the icon.
+        base_icon = getattr(self, "_tray_base_icon", self.tray_icon.icon())
+        if total > 0:
+            size = QSize(64, 64)
+            pixmap = base_icon.pixmap(size)
+            if pixmap.isNull():
+                pixmap = QPixmap(size)
+                pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            badge_text = str(total) if total < 100 else "99+"
+            diameter = 27 if len(badge_text) <= 2 else 34
+            x = size.width() - diameter - 1
+            y = size.height() - diameter - 1
+            painter.setPen(QPen(QColor("white"), 2))
+            painter.setBrush(QColor("#d93025"))
+            painter.drawEllipse(x, y, diameter, diameter)
+            font = QFont()
+            font.setBold(True)
+            font.setPixelSize(16 if len(badge_text) <= 2 else 13)
+            painter.setFont(font)
+            painter.setPen(QColor("white"))
+            painter.drawText(x, y, diameter, diameter, Qt.AlignCenter, badge_text)
+            painter.end()
+            self.tray_icon.setIcon(QIcon(pixmap))
+        else:
+            self.tray_icon.setIcon(base_icon)
 
     def _show_from_tray(self):
         self.showNormal(); self.raise_(); self.activateWindow()
@@ -3187,6 +3217,12 @@ class Window(QMainWindow):
         self._quit_requested = True
         self.tray_icon.hide()
         QApplication.quit()
+
+    def _schedule_post_install_update_check(self):
+        """Refresh the saved update count after a successful package update."""
+        # Do not clear the tray count optimistically: the next real scan decides
+        # whether updates remain. A short delay lets package-manager locks settle.
+        QTimer.singleShot(8000, self.check_all_updates_silently)
 
     def check_all_updates_silently(self):
         if getattr(self, "_update_watcher_running", False):
@@ -5403,6 +5439,8 @@ class Window(QMainWindow):
                     progress.progress.setRange(0, 100)
                     progress.finish(1 if failures else 0)
                     self.status.setText(("Fehler bei: " if not english else "Failed: ")+", ".join(failures) if failures else ("Snap-Updates abgeschlossen." if not english else "Snap updates completed."))
+                    if any(rc == 0 for _name, rc, _output in results):
+                        self._schedule_post_install_update_check()
                     self.load_snap_catalog()
                 def update_failed(error):
                     self._update_progress_finish("snap_update_install")
@@ -7613,6 +7651,8 @@ class Window(QMainWindow):
                         else:
                             self.status.setText("Flatpak updates completed." if english else "Flatpak-Updates abgeschlossen.")
                             QMessageBox.information(self, "Flatpak", "All selected Flatpak updates were installed." if english else "Alle ausgewählten Flatpak-Updates wurden installiert.")
+                        if any(rc == 0 for _scope, _ref, rc, _output in results):
+                            self._schedule_post_install_update_check()
                         self.load_flatpak_catalog()
                         return
                     scope, ref = selected[index]
@@ -8467,6 +8507,7 @@ class Window(QMainWindow):
                     if en else
                     ("Sicherheitsaktualisierungen abgeschlossen" if security_only else "Systemaktualisierung abgeschlossen")
                 )
+                self._schedule_post_install_update_check()
                 self.catalog_cache = None
                 self._table_catalog_ready = False
             else:

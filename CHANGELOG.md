@@ -1,5 +1,12 @@
 # Änderungsprotokoll
 
+## 0.1.50 – Tray-Updatezähler nach Installation aktualisieren
+- Nach mindestens einer erfolgreich installierten APT-/Systemaktualisierung wird eine erneute Update-Wächter-Prüfung eingeplant.
+- Nach mindestens einer erfolgreich aktualisierten Snap-Anwendung wird der Update-Wächter erneut ausgeführt.
+- Nach mindestens einem erfolgreich installierten Flatpak-Update wird der Update-Wächter erneut ausgeführt.
+- Der Tray-Zähler wird ausschließlich anhand der anschließenden tatsächlichen Prüfung aktualisiert: Sind keine Updates mehr vorhanden, verschwindet die Zahl; verbleibende oder fehlgeschlagene Updates bleiben sichtbar.
+- Bestehende Oberfläche, Einstellungen, Paketlisten, Kategorien, Übersetzungen und bisherige Changelog-Einträge bleiben erhalten.
+
 ## 0.1.49 – Update-Wächter und Tray
 - Update-Wächter zeigt verfügbare Updates getrennt nach APT, Flatpak/Flathub und Snap einschließlich Paket-/App-Namen.
 - AppImages werden weiterhin erkannt und gezählt; ohne passende Updatequelle wird ausdrücklich keine Versionsprüfung behauptet.
