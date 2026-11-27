@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-import os, sys, subprocess, re, pwd, json, shlex, shutil, html, gzip, hashlib, time, socket, sqlite3, http.client, urllib.request, urllib.parse, xml.etree.ElementTree as ET, pty, select, errno, codecs, platform
+import os, sys, subprocess, re, pwd, json, shlex, shutil, html, gzip, hashlib, time, socket, sqlite3, http.client, urllib.request, urllib.parse, xml.etree.ElementTree as ET, pty, select, errno, codecs, platform, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
@@ -7,7 +7,203 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstr
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.47"
+VERSION="0.1.48"
+
+
+def _desktop_user_account():
+    """Return the real desktop account when LunaPaket was started through pkexec."""
+    if os.geteuid() == 0:
+        uid_text = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+        if uid_text and uid_text.isdigit():
+            try:
+                account = pwd.getpwuid(int(uid_text))
+                if account.pw_uid != 0:
+                    return account
+            except KeyError:
+                pass
+    try:
+        return pwd.getpwuid(os.getuid())
+    except KeyError:
+        return pwd.getpwuid(0)
+
+
+def _desktop_user_home():
+    """Home directory belonging to the logged-in desktop user, not root."""
+    return Path(_desktop_user_account().pw_dir)
+
+
+def _desktop_user_command(command):
+    """Prepare a command to run as the desktop user even when the GUI is root."""
+    account = _desktop_user_account()
+    env = os.environ.copy()
+    if os.geteuid() == 0 and account.pw_uid != 0:
+        setpriv = shutil.which("setpriv")
+        if not setpriv:
+            raise RuntimeError("setpriv aus util-linux fehlt; Aktion kann nicht sicher als Desktop-Benutzer ausgeführt werden.")
+        runtime_dir = f"/run/user/{account.pw_uid}"
+        env.update({"HOME": account.pw_dir, "USER": account.pw_name, "LOGNAME": account.pw_name,
+                    "XDG_CONFIG_HOME": str(Path(account.pw_dir) / ".config"),
+                    "XDG_DATA_HOME": str(Path(account.pw_dir) / ".local" / "share"),
+                    "XDG_RUNTIME_DIR": runtime_dir})
+        # pkexec/sudo may leave the privileged process connected to the wrong
+        # D-Bus session. gtk-launch must talk to the logged-in desktop user's
+        # session bus, just as it does when called from that user's terminal.
+        session_bus = Path(runtime_dir) / "bus"
+        if session_bus.exists():
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={session_bus}"
+        else:
+            env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        # Do not leak privilege-escalation markers into the launched AppImage;
+        # some AppImages use them when deciding whether desktop integration is
+        # still pending or whether they were started by a privileged installer.
+        for key in ("PKEXEC_UID", "SUDO_UID", "SUDO_GID", "SUDO_USER", "SUDO_COMMAND"):
+            env.pop(key, None)
+        command = [setpriv, f"--reuid={account.pw_uid}", f"--regid={account.pw_gid}",
+                   "--init-groups", "--", *command]
+    return command, env
+
+
+
+def _start_as_desktop_user(command, cwd=None, env=None, desktop_id=None):
+    """Launch through the logged-in user's real desktop session.
+
+    LunaPaket may run as root for package management, but AppImages must be
+    launched as the desktop user. Reuse gtk-launch, which was verified to work
+    from that user's terminal, rather than trying several experimental methods.
+    """
+    account = _desktop_user_account()
+    if account.pw_uid == 0:
+        raise RuntimeError("Kein nicht privilegierter Desktop-Benutzer ermittelt.")
+    runuser = shutil.which("runuser")
+    gtk_launch = shutil.which("gtk-launch")
+    env_bin = shutil.which("env") or "/usr/bin/env"
+    if not runuser or not gtk_launch:
+        raise RuntimeError("runuser oder gtk-launch fehlt.")
+    if not desktop_id:
+        raise RuntimeError("Kein Desktop-Starter für den AppImage-Start angegeben.")
+
+    runtime_dir = f"/run/user/{account.pw_uid}"
+    launch_env = dict(os.environ if env is None else env)
+    launch_env.update({
+        "HOME": account.pw_dir, "USER": account.pw_name, "LOGNAME": account.pw_name,
+        "XDG_CONFIG_HOME": str(Path(account.pw_dir) / ".config"),
+        "XDG_DATA_HOME": str(Path(account.pw_dir) / ".local/share"),
+        "XDG_RUNTIME_DIR": runtime_dir,
+    })
+    session_bus = Path(runtime_dir) / "bus"
+    if not session_bus.exists():
+        raise RuntimeError(f"Der Benutzerbus fehlt: {session_bus}")
+    launch_env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={session_bus}"
+    for key in ("PKEXEC_UID", "SUDO_UID", "SUDO_GID", "SUDO_USER", "SUDO_COMMAND", "DESKTOPINTEGRATION"):
+        launch_env.pop(key, None)
+
+    workdir = str(Path(cwd or account.pw_dir).expanduser())
+    if not os.path.isabs(workdir):
+        workdir = str(Path(account.pw_dir) / workdir)
+    if not Path(workdir).is_dir():
+        workdir = account.pw_dir
+
+    env_args = [f"{key}={value}" for key, value in launch_env.items()
+                if isinstance(value, str) and "\x00" not in value]
+    argv = [runuser, "-u", account.pw_name, "--preserve-environment", "--",
+            env_bin, *env_args, gtk_launch, desktop_id]
+    log_dir = Path(account.pw_dir) / ".cache/lunapaket"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if os.geteuid() == 0:
+            os.chown(log_dir, account.pw_uid, account.pw_gid)
+    except OSError:
+        pass
+    log_path = log_dir / "appimage-launch.log"
+    with open(log_path, "a", encoding="utf-8") as log:
+        log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] user={account.pw_name} "
+                  f"uid={account.pw_uid} cwd={workdir} desktop_id={desktop_id}\n")
+        log.flush()
+        proc = subprocess.Popen(argv, env=os.environ.copy(), cwd=workdir,
+                                start_new_session=True, stdout=log, stderr=log)
+    return [f"gtk-launch als {account.pw_name} (PID {proc.pid})"]
+
+def _discover_user_appimages(extra_roots=None):
+    """Find AppImages only in the user's configured AppImage installation folder."""
+    home = _desktop_user_home()
+    configured = (extra_roots or [str(home / "Applications")])[0]
+    roots = [Path(configured).expanduser()]
+    excluded = {".cache", "cache", ".trash", "trash", ".local/share/Trash",
+                "node_modules", "__pycache__", ".venv", "venv", ".mozilla",
+                ".thumbnails", ".var", "snap", ".config/chromium", ".config/google-chrome"}
+    found = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for current, dirs, files in os.walk(root, followlinks=False):
+            current_path = Path(current)
+            kept = []
+            for dirname in dirs:
+                child = (current_path / dirname)
+                try:
+                    rel = child.relative_to(home).as_posix()
+                except ValueError:
+                    rel = dirname
+                if dirname.casefold() in excluded or rel in excluded:
+                    continue
+                kept.append(dirname)
+            dirs[:] = kept
+            for filename in files:
+                if filename.casefold().endswith(".appimage"):
+                    candidate = current_path / filename
+                    try:
+                        if candidate.is_file():
+                            resolved = candidate.resolve()
+                            found[str(resolved)] = resolved
+                    except OSError:
+                        pass
+    # The configured installation folder is the single source of truth.
+    # Do not pull launchers from Downloads or other unrelated locations into
+    # the managed AppImage list.
+    # Same AppImage may exist in several folders (for example Downloads and
+    # Applications) and may also be referenced by a desktop launcher. Show one
+    # entry per application filename; prefer the newest actual file.
+    unique = {}
+    for candidate in found.values():
+        key = candidate.name.casefold()
+        try:
+            stamp = candidate.stat().st_mtime
+        except OSError:
+            stamp = 0
+        previous = unique.get(key)
+        if previous is None or stamp > previous[0]:
+            unique[key] = (stamp, candidate)
+    return sorted((entry[1] for entry in unique.values()),
+                  key=lambda item: (item.stem.casefold(), str(item).casefold()))
+
+
+def _find_appimage_updater():
+    """Find AppImageUpdate as a system command or as the user's downloaded AppImage."""
+    for command in ("appimageupdatetool", "appimageupdate", "AppImageUpdate"):
+        found = shutil.which(command)
+        if found:
+            return found
+    home = _desktop_user_home()
+    candidates = []
+    skip = {".cache", ".local/share/trash", ".mozilla", ".var", "snap",
+            "node_modules", "__pycache__", ".venv", "venv"}
+    for current, dirs, files in os.walk(home, followlinks=False):
+        base = Path(current)
+        dirs[:] = [d for d in dirs if d.casefold() not in skip]
+        for filename in files:
+            lower = filename.casefold()
+            if lower.startswith("appimageupdate") and lower.endswith(".appimage"):
+                path = base / filename
+                try:
+                    if path.is_file():
+                        candidates.append(path.resolve())
+                except OSError:
+                    pass
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0,
+                                   p.name.casefold()), reverse=True)
+    return str(candidates[0])
 
 # Thematische Filter auf dem bereits geladenen Paketbestand.
 # Die Muster durchsuchen Paketname und Kurzbeschreibung; ein Paket kann
@@ -876,6 +1072,10 @@ class ActionProgressDialog(QDialog):
             title = {"Paketaktionen": "Package actions", "Paketaktionen bestätigen": "Confirm package actions"}.get(title, title)
             description = {"1 ausgewählte Paketaktion(en) werden ausgeführt.": "1 selected package action(s) are being executed."}.get(description, description)
         self.setWindowTitle(title)
+        self._main_progress_key = "action-dialog-" + str(id(self))
+        if parent is not None and hasattr(parent, "_catalog_activity_start"):
+            parent._catalog_activity_start(self._main_progress_key, title)
+            parent._main_progress_set(None, title)
         self.resize(800, 520)
         self.setWindowModality(Qt.WindowModal)
         layout = QVBoxLayout(self)
@@ -1057,9 +1257,15 @@ class ActionProgressDialog(QDialog):
 
     def set_progress(self, percent, message):
         if percent is not None:
+            self.progress.setRange(0, 100)
             self.progress.setValue(max(0, min(100, int(percent))))
+        else:
+            self.progress.setRange(0, 0)
         if message:
             self.current.setText(("Current: " if self.english else "Aktuell: ") + message)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_main_progress_set"):
+            parent._main_progress_set(percent, message or self.windowTitle())
 
     def finish(self, code):
         if code == 0:
@@ -1070,6 +1276,12 @@ class ActionProgressDialog(QDialog):
             self.current.setText((f"Action failed (error code {code})." if self.english else f"Aktion fehlgeschlagen (Fehlercode {code})."))
             self.close_button.setText("Close" if self.english else "Schließen")
         self.close_button.setEnabled(True)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_catalog_activity_finish"):
+            parent._catalog_activity_finish(self._main_progress_key)
+            if not getattr(parent, "_catalog_activity", {}):
+                parent.catalog_activity_bar.setRange(0, 0)
+                parent.catalog_activity_bar.setTextVisible(False)
         # Nur bei erfolgreichem Abschluss automatisch schließen. Bei Fehlern
         # bleibt das Protokoll sichtbar, damit die Ursache gelesen werden kann.
         should_close = self.auto_close.isChecked()
@@ -1188,6 +1400,19 @@ class Window(QMainWindow):
         self.snap_catalog_refresh_btn.setVisible(False)
         self.upgrade_btn=QPushButton("System aktualisieren"); self.upgrade_btn.clicked.connect(self.upgrade); h.addWidget(self.upgrade_btn)
         self.security_updates_btn=QPushButton("Sicherheitsupdates verwalten"); self.security_updates_btn.clicked.connect(self.manage_security_updates); h.addWidget(self.security_updates_btn); l.addLayout(h)
+        # Direkter Zugriff auf die beiden Zusatzfunktionen – nicht nur im Dateimenü.
+        tools_row = QHBoxLayout()
+        self.appimage_toolbar_btn = QPushButton("AppImage-Verwaltung" if self.language == "de" else "AppImage Management")
+        self.appimage_toolbar_btn.setToolTip("AppImages importieren, starten, aktualisieren und entfernen" if self.language == "de" else "Import, launch, update and remove AppImages")
+        self.appimage_toolbar_btn.clicked.connect(self.manage_appimages)
+        tools_row.addWidget(self.appimage_toolbar_btn)
+        self.update_watcher_toolbar_btn = QPushButton()
+        self.update_watcher_toolbar_btn.clicked.connect(self.show_update_watcher_settings)
+        tools_row.addWidget(self.update_watcher_toolbar_btn)
+        self.update_watcher_toolbar_status = QLabel("")
+        tools_row.addWidget(self.update_watcher_toolbar_status)
+        tools_row.addStretch(1)
+        l.addLayout(tools_row)
         # Globale Aktivitätsanzeige: bleibt beim Wechsel zwischen APT, Flathub und Snap sichtbar.
         self._catalog_activity = {}
         self.catalog_activity_panel = QWidget()
@@ -1207,6 +1432,9 @@ class Window(QMainWindow):
         self.security_auto_timer = QTimer(self)
         self.security_auto_timer.timeout.connect(self.check_security_updates_silently)
         self.configure_security_timer()
+        self.update_watcher_timer = QTimer(self)
+        self.update_watcher_timer.timeout.connect(self.check_all_updates_silently)
+        self.configure_update_watcher()
         bar=QHBoxLayout(); self.search=QLineEdit(); self.search.setPlaceholderText("Pakete suchen …"); self.search.returnPressed.connect(self.search_pkgs); self.search.setContextMenuPolicy(Qt.CustomContextMenu); self.search.customContextMenuRequested.connect(lambda pos, w=self.search: self.show_german_text_context_menu(w, pos)); bar.addWidget(self.search,1)
         self.filter=QComboBox(); self.filter.addItems(["Suchergebnisse","Installierte Pakete"]); self.filter.currentIndexChanged.connect(self.search_pkgs); bar.addWidget(self.filter)
         b=QPushButton("Suchen"); b.clicked.connect(self.search_pkgs); bar.addWidget(b); l.addLayout(bar)
@@ -1280,9 +1508,9 @@ class Window(QMainWindow):
         self.flatpak_screenshot = QLabel()  # compatibility placeholder; gallery is used instead
         self.flatpak_screenshot.setVisible(False)
         self.queue_label=QLabel("Keine vorgemerkten Änderungen"); lower_layout.addWidget(self.queue_label); self.status=QLabel("Bereit"); lower_layout.addWidget(self.status)
-        self.catalog_progress_bar = QProgressBar(); self.catalog_progress_bar.setRange(0, 0)
-        self.catalog_progress_bar.setTextVisible(False); self.catalog_progress_bar.setMaximumHeight(7)
-        self.catalog_progress_bar.hide(); lower_layout.addWidget(self.catalog_progress_bar)
+        # Compatibility alias: every legacy progress call now targets the
+        # single activity bar at the top of the main window.
+        self.catalog_progress_bar = self.catalog_activity_bar
         self.work_splitter.addWidget(upper_panel); self.work_splitter.addWidget(lower_panel)
         self.work_splitter.setStretchFactor(0, 4); self.work_splitter.setStretchFactor(1, 1)
         self.work_splitter.setSizes([560, 180])
@@ -1329,6 +1557,13 @@ class Window(QMainWindow):
         history_action.setToolTip("Zuletzt installierte, entfernte und aktualisierte Pakete anzeigen")
         history_action.triggered.connect(self.show_package_history)
         file_menu.addAction(history_action)
+
+        appimage_action = QAction("AppImage Management …" if self.language == "en" else "AppImage-Verwaltung …", self)
+        appimage_action.triggered.connect(self.manage_appimages)
+        file_menu.addAction(appimage_action)
+        watcher_action = QAction("Update Watcher …" if self.language == "en" else "Update-Wächter …", self)
+        watcher_action.triggered.connect(self.show_update_watcher_settings)
+        file_menu.addAction(watcher_action)
 
         file_menu.addSeparator()
         exit_action = QAction("Beenden", self)
@@ -1589,7 +1824,8 @@ class Window(QMainWindow):
             "Paketquellen verwalten":"Manage repositories",
             "APT-Repositories hinzufügen, bearbeiten, aktivieren oder deaktivieren":"Add, edit, enable or disable APT repositories",
             "Paketlisten aktualisieren":"Refresh package lists","System aktualisieren":"Upgrade system",
-            "Sicherheitsupdates verwalten":"Manage security updates","Pakete suchen …":"Search packages …",
+            "Sicherheitsupdates verwalten":"Manage security updates","AppImage-Verwaltung":"AppImage Management",
+            "Pakete suchen …":"Search packages …",
             "Suchergebnisse":"Search results","Installierte Pakete":"Installed packages","Suchen":"Search",
             "Paket":"Package","Version":"Version","Status":"Status","Beschreibung":"Description",
             "Vormerkung löschen":"Clear queue","Vorgemerkte Änderungen anwenden":"Apply queued changes",
@@ -1783,6 +2019,1083 @@ class Window(QMainWindow):
         ok_btn.clicked.connect(lambda: (save(), d.accept()))
         self.translate_dialog(d)
         d.exec()
+
+    def _appimage_directory(self):
+        account = _desktop_user_account()
+        path = Path(account.pw_dir) / "Applications"
+        path.mkdir(parents=True, exist_ok=True)
+        if os.geteuid() == 0 and account.pw_uid != 0:
+            os.chown(path, account.pw_uid, account.pw_gid)
+        return path
+
+    def _appimage_desktop_directory(self):
+        account = _desktop_user_account()
+        path = Path(account.pw_dir) / ".local" / "share" / "applications"
+        path.mkdir(parents=True, exist_ok=True)
+        if os.geteuid() == 0 and account.pw_uid != 0:
+            # Repair ownership only on the directory LunaPaket writes to.
+            os.chown(path, account.pw_uid, account.pw_gid)
+        return path
+
+    def _appimage_entries(self, extra_roots=None):
+        """Discover AppImages in the single configured installation folder."""
+        folder = self.settings.value("appimage/import_folder", str(self._appimage_directory()), type=str)
+        return _discover_user_appimages([folder])
+
+    def manage_appimages(self):
+        en = self.language == "en"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AppImage Management" if en else "AppImage-Verwaltung")
+        dlg.resize(960, 650)
+        dlg.setMinimumSize(820, 560)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        heading = QLabel("Installed AppImages" if en else "Installierte AppImages")
+        heading.setStyleSheet("font-size: 16px; font-weight: 600;")
+        layout.addWidget(heading)
+        intro = QLabel(("Manage AppImages independently. Add files by copying or moving them to a folder you choose; existing files and desktop launchers are detected." if en else "AppImages unabhängig verwalten. Dateien wahlweise kopieren oder verschieben und den Zielordner selbst auswählen; vorhandene Dateien und Anwendungsstarter werden erkannt."))
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        # One canonical folder: it is the visible installation location and the
+        # only folder scanned for managed AppImages.
+        import_row = QHBoxLayout()
+        import_folder_label = QLabel("AppImage-Installationsordner:" if not en else "AppImage installation folder:")
+        saved_import_folder = self.settings.value("appimage/import_folder", str(self._appimage_directory()), type=str)
+        import_folder_value = QLabel(saved_import_folder)
+        import_folder_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        import_folder_value.setStyleSheet("color: palette(text); font-weight: 600;")
+        import_folder_btn = QPushButton("Importordner wählen …" if not en else "Choose import folder …")
+        import_default_btn = QPushButton("Standard" if not en else "Default")
+        import_row.addWidget(import_folder_label)
+        import_row.addWidget(import_folder_value, 1)
+        import_row.addWidget(import_folder_btn)
+        import_row.addWidget(import_default_btn)
+        layout.addLayout(import_row)
+
+        listing = QListWidget()
+        listing.setIconSize(QSize(42, 42))
+        listing.setSpacing(4)
+        listing.setUniformItemSizes(False)
+        listing.setStyleSheet("QListWidget::item { padding: 7px 8px; min-height: 48px; } QListWidget::item:selected { border-radius: 5px; }")
+        layout.addWidget(listing, 1)
+        path_label = QLabel("" if en else "")
+        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        path_label.setStyleSheet("color: palette(mid); font-size: 11px;")
+        layout.addWidget(path_label)
+        status = QLabel("")
+        layout.addWidget(status)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(7)
+        add_btn = QPushButton("Add AppImage …" if en else "AppImage hinzufügen …")
+        launch_btn = QPushButton("Launch" if en else "Starten")
+        update_btn = QPushButton("Update …" if en else "Aktualisieren …")
+        remove_btn = QPushButton("Remove" if en else "Entfernen")
+        close_btn = QPushButton("Close" if en else "Schließen")
+        for button in (add_btn, launch_btn, update_btn, remove_btn):
+            button.setMinimumHeight(34)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        close_btn.setMinimumHeight(34)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        entries = []
+        # Retire the old independent scan-folder setting; the installation folder
+        # is now the single source of truth.
+        self.settings.remove("appimage/scan_folder")
+        icon_cache = _desktop_user_home() / ".local/share/lunapaket/appimage-icons"
+        # Persist AppImage metadata between dialog openings. Without this cache,
+        # every refresh re-extracts every AppImage just to rediscover its icon.
+        metadata_cache_file = _desktop_user_home() / ".cache/lunapaket/appimage-metadata-v2.json"
+        metadata_cache = {}
+        try:
+            loaded = json.loads(metadata_cache_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                metadata_cache = loaded
+        except (OSError, ValueError, TypeError):
+            pass
+
+        def save_appimage_metadata_cache():
+            try:
+                metadata_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                temp_file = metadata_cache_file.with_suffix(".tmp")
+                temp_file.write_text(json.dumps(metadata_cache, ensure_ascii=False), encoding="utf-8")
+                os.replace(temp_file, metadata_cache_file)
+                if os.geteuid() == 0:
+                    account = _desktop_user_account()
+                    os.chown(metadata_cache_file, account.pw_uid, account.pw_gid)
+            except OSError:
+                pass
+
+        def desktop_metadata(path):
+            """Extract the AppImage's real icon into the per-user cache (worker thread only)."""
+            home = _desktop_user_home()
+            icon_cache.mkdir(parents=True, exist_ok=True)
+            if os.geteuid() == 0:
+                try:
+                    account = _desktop_user_account()
+                    os.chown(icon_cache, account.pw_uid, account.pw_gid)
+                except OSError:
+                    pass
+            try:
+                stat = path.stat()
+                cache_key = hashlib.sha256((str(path.resolve()) + str(stat.st_mtime_ns) + str(stat.st_size)).encode()).hexdigest()[:24]
+            except OSError:
+                cache_key = hashlib.sha256(str(path).encode()).hexdigest()[:24]
+            cached_record = metadata_cache.get(cache_key)
+            if isinstance(cached_record, dict):
+                cached_icon = cached_record.get("icon", "")
+                if not cached_icon or Path(cached_icon).is_file():
+                    return (cached_record.get("name", ""), cached_icon,
+                            cached_record.get("categories", ""), cached_record.get("hint", ""))
+
+            def remember_metadata(name, icon, categories, hint):
+                metadata_cache[cache_key] = {"path": str(path), "name": name or "", "icon": icon or "",
+                                             "categories": categories or "", "hint": hint or ""}
+                return name, icon, categories, hint
+
+            def parse_desktop(desktop_file):
+                values = {}
+                in_entry = False
+                try:
+                    for line in desktop_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                        line = line.strip()
+                        if line == "[Desktop Entry]":
+                            in_entry = True
+                            continue
+                        if line.startswith("[") and line.endswith("]"):
+                            in_entry = False
+                        if in_entry and "=" in line:
+                            key, value = line.split("=", 1)
+                            values[key] = value
+                except OSError:
+                    pass
+                return values
+
+            def icon_candidates(root, icon_value):
+                if not root.is_dir() or not icon_value:
+                    return []
+                wanted = Path(icon_value).name
+                stems = {wanted.casefold()}
+                if Path(wanted).suffix:
+                    stems.add(Path(wanted).stem.casefold())
+                candidates = []
+                try:
+                    for base, _dirs, files in os.walk(root):
+                        for filename in files:
+                            lower = filename.casefold()
+                            stem = Path(filename).stem.casefold()
+                            if lower in stems or (not Path(wanted).suffix and stem in stems):
+                                candidate = Path(base) / filename
+                                if candidate.suffix.casefold() in {".png", ".svg", ".xpm", ".ico"}:
+                                    candidates.append(candidate)
+                except OSError:
+                    pass
+                # Prefer scalable/high-resolution artwork over tiny theme variants.
+                candidates.sort(key=lambda item: (0 if "scalable" in item.parts else 1,
+                                                   -sum(int(x) for x in re.findall(r"\d+", str(item.parent))[-2:]) if re.findall(r"\d+", str(item.parent)) else 0,
+                                                   item.suffix.casefold() != ".svg", str(item)))
+                return candidates
+
+            def cache_icon(source):
+                try:
+                    source = source.resolve(strict=True)
+                    if not source.is_file():
+                        return None
+                    ext = source.suffix.lower()
+                    if ext not in {".png", ".svg", ".xpm", ".ico"}:
+                        return None
+                    target = icon_cache / (cache_key + ext)
+                    shutil.copy2(source, target)
+                    if os.geteuid() == 0:
+                        account = _desktop_user_account()
+                        os.chown(target, account.pw_uid, account.pw_gid)
+                    return str(target)
+                except (OSError, RuntimeError):
+                    return None
+
+            # Desktop launchers often already contain the exact icon path/name.
+            desktop_roots = [home / ".local/share/applications", Path("/usr/share/applications"),
+                             Path("/usr/local/share/applications")]
+            desktop_name = ""
+            desktop_categories = ""
+            desktop_hint = ""
+            desktop_icon = ""
+            for desktop_root in desktop_roots:
+                if not desktop_root.is_dir():
+                    continue
+                try:
+                    desktop_files = list(desktop_root.glob("*.desktop"))
+                except OSError:
+                    continue
+                for desktop in desktop_files:
+                    values = parse_desktop(desktop)
+                    command = values.get("Exec", "")
+                    try:
+                        parts = shlex.split(command, posix=True)
+                    except ValueError:
+                        parts = command.split()
+                    executable = next((token for token in parts if token and not token.startswith("%")), "")
+                    if executable:
+                        candidate = Path(executable).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = desktop.parent / candidate
+                        try:
+                            matches = candidate.resolve() == path.resolve()
+                        except OSError:
+                            matches = False
+                        if matches:
+                            desktop_name = values.get("Name", "")
+                            desktop_hint = " ".join(values.get(key, "") for key in ("GenericName", "Comment", "Keywords"))
+                            if values.get("X-LunaPaket-Managed", "").lower() == "true":
+                                desktop_categories = values.get("X-LunaPaket-AppImageCategories", "")
+                                # Earlier LunaPaket versions wrote Utility for every
+                                # AppImage. It is only a fallback, not source metadata.
+                                stored = [item.strip() for item in desktop_categories.split(";") if item.strip()]
+                                if stored == ["Utility"]:
+                                    desktop_categories = ""
+                            else:
+                                desktop_categories = values.get("Categories", "")
+                            icon_value = values.get("Icon", "")
+                            direct = Path(icon_value).expanduser() if icon_value else None
+                            if direct and direct.is_file():
+                                desktop_icon = str(direct)
+                            if not desktop_icon:
+                                for candidate_icon in icon_candidates(Path("/usr/share/icons"), icon_value) + icon_candidates(Path("/usr/share/pixmaps"), icon_value):
+                                    if candidate_icon.is_file():
+                                        desktop_icon = str(candidate_icon)
+                                        break
+
+            # Reuse an icon already extracted for this AppImage after reading any
+            # matching desktop entry, so its categories are retained as well.
+            for ext in (".png", ".svg", ".xpm", ".ico"):
+                cached = icon_cache / (cache_key + ext)
+                cached_categories = [item.strip() for item in desktop_categories.split(";") if item.strip()]
+                # Only skip AppImage extraction when the cached launcher has a
+                # real primary menu category. Utility and malformed metadata
+                # must be checked against the AppImage itself.
+                known_primary_categories = {
+                    "AudioVideo", "Development", "Education", "Game", "Graphics",
+                    "Network", "Office", "Science", "Settings", "System",
+                }
+                if cached.is_file() and cached.stat().st_size and any(
+                    item in known_primary_categories for item in cached_categories
+                ):
+                    return remember_metadata(desktop_name, str(cached), desktop_categories, desktop_hint)
+
+            # Extract through the AppImage runtime; if available, unsquashfs is a fallback.
+            try:
+                with tempfile.TemporaryDirectory(prefix="lunapaket-appicon-") as temp_root:
+                    work = Path(temp_root)
+                    # pkexec runs the GUI as root, but extraction is intentionally
+                    # dropped to the desktop user. Give that user access to the
+                    # temporary directory or extraction fails with EACCES.
+                    if os.geteuid() == 0:
+                        account = _desktop_user_account()
+                        os.chown(work, account.pw_uid, account.pw_gid)
+                        os.chmod(work, 0o700)
+                    root = work / "squashfs-root"
+                    extracted = False
+                    unsquashfs = shutil.which("unsquashfs")
+                    if unsquashfs:
+                        command, env = _desktop_user_command([unsquashfs, "-no-progress", "-d", str(root), str(path)])
+                        result = subprocess.run(command, cwd=str(work), env=env, stdout=subprocess.DEVNULL,
+                                                 stderr=subprocess.DEVNULL, timeout=120, check=False)
+                        extracted = result.returncode == 0 and root.is_dir()
+                    if not extracted:
+                        command, env = _desktop_user_command([str(path), "--appimage-extract"])
+                        result = subprocess.run(command, cwd=str(work), env=env, stdout=subprocess.DEVNULL,
+                                                 stderr=subprocess.DEVNULL, timeout=120, check=False)
+                        extracted = result.returncode == 0 and root.is_dir()
+                    if extracted:
+                        embedded_desktops = []
+                        try:
+                            embedded_desktops = list(root.rglob("*.desktop"))
+                        except OSError:
+                            pass
+                        embedded_name = desktop_name
+                        embedded_categories = desktop_categories
+                        embedded_hint = desktop_hint
+                        icon_values = []
+                        for desktop in embedded_desktops:
+                            values = parse_desktop(desktop)
+                            if not embedded_name:
+                                embedded_name = values.get("Name", "")
+                            if not embedded_categories:
+                                embedded_categories = values.get("Categories", "")
+                            if not embedded_hint:
+                                embedded_hint = " ".join(values.get(key, "") for key in ("GenericName", "Comment", "Keywords"))
+                            value = values.get("Icon", "")
+                            if value and value not in icon_values:
+                                icon_values.append(value)
+
+                        # .DirIcon is commonly a symlink to usr/share/icons/...; resolve it.
+                        dir_icon = root / ".DirIcon"
+                        if dir_icon.exists() or dir_icon.is_symlink():
+                            # Treat absolute-looking AppDir symlink targets as paths
+                            # inside the extracted image, not on the host filesystem.
+                            try:
+                                target_text = os.readlink(dir_icon) if dir_icon.is_symlink() else ""
+                                if target_text.startswith("/"):
+                                    dir_icon = root / target_text.lstrip("/")
+                            except OSError:
+                                pass
+                            cached = cache_icon(dir_icon)
+                            if cached:
+                                return remember_metadata(embedded_name, cached, embedded_categories, embedded_hint)
+                        icon_roots = [root / "usr/share/icons", root / "usr/share/pixmaps",
+                                      root / "usr/share/pixmaps/hicolor", root]
+                        for icon_value in icon_values:
+                            direct = Path(icon_value)
+                            if not direct.is_absolute():
+                                direct = root / icon_value
+                            if direct.is_file():
+                                cached = cache_icon(direct)
+                                if cached:
+                                    return remember_metadata(embedded_name, cached, embedded_categories, embedded_hint)
+                            for icon_root in icon_roots:
+                                for candidate_icon in icon_candidates(icon_root, icon_value):
+                                    cached = cache_icon(candidate_icon)
+                                    if cached:
+                                        return remember_metadata(embedded_name, cached, embedded_categories, embedded_hint)
+            except Exception:
+                pass
+            return remember_metadata(desktop_name, desktop_icon, desktop_categories, desktop_hint)
+
+        class AppImageScanWorker(QThread):
+            completed = Signal(object)
+            failed = Signal(str)
+
+            def __init__(self, extra_roots):
+                super().__init__(dlg)
+                self.extra_roots = extra_roots
+
+            def run(self):
+                try:
+                    paths = self_outer._appimage_entries(self.extra_roots)
+                    result = []
+                    for app_path in paths:
+                        name, app_icon, app_categories, category_hint = desktop_metadata(app_path)
+                        result.append((str(app_path), name, app_icon, app_categories, category_hint))
+                    save_appimage_metadata_cache()
+                    self.completed.emit(result)
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        self_outer = self
+
+        def apply_scan(records):
+            nonlocal entries
+            entries = [Path(record[0]) for record in records]
+            launcher_errors = []
+            listing.clear()
+            for path_text, display_name, icon_path, categories, category_hint in records:
+                app_path = Path(path_text)
+                if not display_name:
+                    display_name = app_path.stem.replace("_", " ").replace("-", " ")
+                icon = QIcon(icon_path) if icon_path else QIcon()
+                if icon.isNull():
+                    icon = self.style().standardIcon(QStyle.SP_DesktopIcon)
+                item = QListWidgetItem(icon, display_name)
+                item.setToolTip(str(app_path))
+                item.setData(Qt.UserRole, str(app_path))
+                item.setSizeHint(QSize(0, 58))
+                listing.addItem(item)
+                try:
+                    register(app_path, icon_path, display_name, categories, category_hint)
+                except Exception as exc:
+                    # Keep the app visible in LunaPaket even if launcher creation fails.
+                    launcher_errors.append(f"{app_path.name}: {exc}")
+            status.setText(("No AppImages found." if en else "Keine AppImages gefunden.") if not entries else (f"{len(entries)} AppImage(s) found." if en else f"{len(entries)} AppImage(s) gefunden."))
+            if launcher_errors:
+                status.setText(status.text() + (" · Launcher errors: " if en else " · Starterfehler: ") + " | ".join(launcher_errors[:3]))
+            update_btn.setEnabled(bool(entries))
+            launch_btn.setEnabled(bool(entries))
+            remove_btn.setEnabled(bool(entries))
+            wanted_path = getattr(dlg, "_appimage_scan_select_path", None)
+            if wanted_path:
+                wanted = str(Path(wanted_path).resolve())
+                for i in range(listing.count()):
+                    if str(Path(listing.item(i).data(Qt.UserRole)).resolve()) == wanted:
+                        listing.setCurrentRow(i)
+                        break
+                dlg._appimage_scan_select_path = None
+
+        def scan_finished(records):
+            apply_scan(records)
+            add_btn.setEnabled(True)
+            status.setText(status.text() + (" · Scan abgeschlossen" if not en else " · Scan complete"))
+
+        def scan_failed(message):
+            status.setText(("Scan failed: " if en else "Suche fehlgeschlagen: ") + message)
+            add_btn.setEnabled(True)
+
+        def refresh(select_path=None):
+            if select_path:
+                dlg._appimage_scan_select_path = str(select_path)
+            worker = getattr(dlg, "_appimage_scan_worker", None)
+            if worker is not None and worker.isRunning():
+                return
+            install_folder = Path(import_folder_value.text()).expanduser()
+            try:
+                install_folder.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                status.setText(("Installation folder unavailable: " if en else "Installationsordner nicht verfügbar: ") + str(exc))
+                return
+            status.setText(("Loading AppImages and original icons in the installation folder …" if en else "AppImages und Originalsymbole im Installationsordner werden geladen …"))
+            add_btn.setEnabled(False)
+            worker = AppImageScanWorker([str(install_folder)])
+            dlg._appimage_scan_worker = worker
+            worker.completed.connect(scan_finished)
+            worker.failed.connect(scan_failed)
+            worker.finished.connect(lambda: setattr(dlg, "_appimage_scan_worker", None))
+            worker.start()
+
+        def configure_folder_dialog(chooser, title):
+            chooser.setWindowTitle(title)
+            chooser.setFileMode(QFileDialog.Directory)
+            chooser.setOption(QFileDialog.ShowDirsOnly, True)
+            chooser.setOption(QFileDialog.DontUseNativeDialog, True)
+            chooser.setLabelText(QFileDialog.Accept, "Auswählen" if not en else "Choose")
+            chooser.setLabelText(QFileDialog.Reject, "Abbrechen" if not en else "Cancel")
+            chooser.setLabelText(QFileDialog.LookIn, "Suchen in:" if not en else "Look in:")
+            chooser.setLabelText(QFileDialog.FileName, "Ordner:" if not en else "Folder:")
+            chooser.setLabelText(QFileDialog.FileType, "Dateityp:" if not en else "File type:")
+
+        def choose_import_folder():
+            chooser = QFileDialog(dlg)
+            configure_folder_dialog(chooser, "Importordner auswählen" if not en else "Choose import folder")
+            current = import_folder_value.text()
+            chooser.setDirectory(current if Path(current).is_dir() else str(_desktop_user_home()))
+            if chooser.exec() == QDialog.Accepted and chooser.selectedFiles():
+                selected_folder = chooser.selectedFiles()[0]
+                import_folder_value.setText(selected_folder)
+                self.settings.setValue("appimage/import_folder", selected_folder)
+                self._sync_settings_permissions()
+                refresh()
+
+        def reset_import_folder():
+            default_folder = str(self._appimage_directory())
+            import_folder_value.setText(default_folder)
+            self.settings.setValue("appimage/import_folder", default_folder)
+            self._sync_settings_permissions()
+            refresh()
+
+        def selected():
+            item = listing.currentItem()
+            return Path(item.data(Qt.UserRole)) if item else None
+
+        def register(path, icon_path="", display_name="", categories="", category_hint=""):
+            """Create a LunaPaket-owned launcher without touching other desktop entries."""
+            path = Path(path).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(str(path))
+            if not os.access(path, os.X_OK):
+                # AppImages need the executable bit; prepare the user's file as the old launcher did.
+                path.chmod(path.stat().st_mode | 0o111)
+            if not os.access(path, os.X_OK):
+                raise PermissionError(("AppImage is not executable: " if en else "AppImage ist nicht ausführbar: ") + str(path))
+
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", path.stem).strip("-.") or "appimage"
+            identity = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+            desktop = self._appimage_desktop_directory() / f"lunapaket-appimage-{safe}-{identity}.desktop"
+            # Never replace a file that is not demonstrably owned by LunaPaket.
+            if desktop.exists():
+                try:
+                    existing = desktop.read_text(encoding="utf-8", errors="replace")
+                except OSError as exc:
+                    raise RuntimeError(str(exc))
+                if "X-LunaPaket-Managed=true" not in existing:
+                    raise FileExistsError(("A foreign desktop entry already uses the launcher name: " if en else "Ein fremder Starter verwendet bereits diesen Dateinamen: ") + str(desktop))
+
+            def desktop_value(value):
+                return str(value).replace("\\", "\\\\").replace("\n", " ").replace("\r", " ")
+
+            def exec_quote(value):
+                # Desktop Entry Exec quoting (not shell quoting).
+                value = str(value).replace("%", "%%")
+                for old, replacement in (("\\", "\\\\"), ('"', '\\"'), ("`", "\\`"), ("$", "\\$")):
+                    value = value.replace(old, replacement)
+                return '"' + value + '"'
+
+            account = _desktop_user_account()
+            name = display_name.strip() if display_name else path.stem.replace("_", " ").replace("-", " ")
+            lines = ["[Desktop Entry]", "Version=1.0", "Type=Application",
+                     "Name=" + desktop_value(name),
+                     "Exec=" + exec_quote(path) + " %U",
+                     "Path=" + desktop_value(account.pw_dir),
+                     "TryExec=" + desktop_value(path),
+                     "Terminal=false", "StartupNotify=true", "DBusActivatable=false",
+                     "X-LunaPaket-Managed=true",
+                     "X-LunaPaket-AppImagePath=" + desktop_value(path)]
+            # AppImage metadata is not always valid when category tokens are malformed
+            # Categories=G;;Qt;). Keep only registered menu categories and
+            # infer a main category from the app's descriptive name when needed.
+            main_categories = {
+                "AudioVideo", "Development", "Education", "Game", "Graphics",
+                "Network", "Office", "Science", "Settings", "System", "Utility",
+            }
+            additional_categories = {
+                "Accessibility", "ActionGame", "AdventureGame", "Amusement",
+                "ArcadeGame", "Archiving", "Art", "BoardGame", "Building",
+                "Calculator", "Calendar", "CardGame", "Chart", "Chat",
+                "Compression", "ContactManagement", "Database", "Debugger",
+                "Dictionary", "Email", "Emulator", "Engineering", "FileManager",
+                "FileTools", "Finance", "FlowChart", "GUIDesigner", "HamRadio",
+                "InstantMessaging", "IRCClient", "KidsGame", "LogicGame", "Maps",
+                "Monitor", "Music", "News", "P2P", "Photography",
+                "Presentation", "ProjectManagement", "RasterGraphics",
+                "RevisionControl", "RolePlaying", "Scanning", "Science",
+                "Security", "Shooter", "Simulation", "SportsGame", "Spreadsheet",
+                "StrategyGame", "System", "Telephony", "TerminalEmulator",
+                "TextEditor", "Translation", "TV", "Video", "VideoConference",
+                "WebBrowser", "WordProcessor",
+            }
+            valid_categories = []
+            for value in categories.split(";"):
+                value = value.strip()
+                if value in main_categories or value in additional_categories:
+                    if value not in valid_categories:
+                        valid_categories.append(value)
+            description = (name + " " + path.stem + " " + categories + " " + category_hint).casefold()
+            inferred = ""
+            # System tools must be tested before graphics: "imager" contains
+            # the substring "image", but is not an image editor.
+            if re.search(r"appimageupdate|\bimager\b|system monitor|task manager|package manager|software center|\bflash(?:ing)?\b|os image|updater|update manager", description):
+                inferred = "System"
+            elif re.search(r"\bemulator\b|retroarch|pcsx2|dolphin|yuzu|\bgame\b|gaming|playstation|nintendo|xbox", description):
+                inferred = "Game"
+            elif re.search(r"video|audio|music|media|player|vlc|kodi|spotify|stream|\baudacity\b|podcast", description):
+                inferred = "AudioVideo"
+            elif re.search(r"browser|web browser|firefox|chromium|\bmeshsense\b|meshtastic|mesh network", description):
+                inferred = "Network"
+            elif re.search(r"\bphoto\b|\bimage\b|graphics|drawing|paint|gimp|inkscape|\bslicer\b|3d print|\bcad\b|prusaslicer", description):
+                inferred = "Graphics"
+            elif re.search(r"office|spreadsheet|writer|word processor|document", description):
+                inferred = "Office"
+            elif re.search(r"develop|program|code editor|ide|debugger", description):
+                inferred = "Development"
+            elif re.search(r"education|learning|training|course", description):
+                inferred = "Education"
+            elif re.search(r"science|chemistry|physics|astronomy", description):
+                inferred = "Science"
+            elif re.search(r"settings|configuration|preferences", description):
+                inferred = "Settings"
+            has_specific_main_category = any(
+                value in main_categories and value != "Utility" for value in valid_categories
+            )
+            if inferred and not has_specific_main_category:
+                valid_categories = [value for value in valid_categories if value != "Utility"]
+                valid_categories.insert(0, inferred)
+            elif not any(value in main_categories for value in valid_categories) and inferred:
+                valid_categories.insert(0, inferred)
+            normalized_categories = ";".join(valid_categories) + (";" if valid_categories else "")
+            lines.insert(11, "X-LunaPaket-AppImageCategories=" + desktop_value(normalized_categories))
+            if valid_categories:
+                lines.insert(9, "Categories=" + normalized_categories)
+            if icon_path and Path(icon_path).is_file():
+                lines.insert(5, "Icon=" + desktop_value(icon_path))
+            content = "\n".join(lines) + "\n"
+            desktop.write_text(content, encoding="utf-8")
+            desktop.chmod(0o644)
+            if os.geteuid() == 0 and account.pw_uid != 0:
+                os.chown(desktop, account.pw_uid, account.pw_gid)
+
+            validator = shutil.which("desktop-file-validate")
+            if validator:
+                command, env = _desktop_user_command([validator, str(desktop)])
+                result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, timeout=15, check=False)
+                if result.returncode != 0:
+                    desktop.unlink(missing_ok=True)
+                    raise RuntimeError((result.stderr or result.stdout or "Desktop launcher validation failed").strip())
+            updater = shutil.which("update-desktop-database")
+            if updater:
+                command, env = _desktop_user_command([updater, str(desktop.parent)])
+                subprocess.run(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=15, check=False)
+            return desktop
+
+        def choose_import_options(source):
+            options = QDialog(dlg)
+            options.setWindowTitle("Import options" if en else "Importoptionen")
+            options.setMinimumWidth(520)
+            form = QVBoxLayout(options)
+            form.addWidget(QLabel(("Choose where to store the AppImage and whether the original file should be moved or copied." if en else "Wähle den Speicherort und ob die Originaldatei verschoben oder kopiert werden soll.")))
+            folder_row = QHBoxLayout()
+            folder_edit = QLineEdit(import_folder_value.text())
+            browse = QPushButton("Browse …" if en else "Ordner wählen …")
+            folder_row.addWidget(folder_edit, 1)
+            folder_row.addWidget(browse)
+            form.addWidget(QLabel("Destination folder:" if en else "Zielordner:"))
+            form.addLayout(folder_row)
+            copy_radio = QRadioButton("Copy original (keep source file)" if en else "Original kopieren (Quelldatei behalten)")
+            move_radio = QRadioButton("Move original (remove it from source folder)" if en else "Original verschieben (Quelldatei am Ursprungsort entfernen)")
+            copy_radio.setChecked(True)
+            form.addWidget(copy_radio)
+            form.addWidget(move_radio)
+            box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            box.button(QDialogButtonBox.Ok).setText("Import" if en else "Importieren")
+            box.button(QDialogButtonBox.Cancel).setText("Cancel" if en else "Abbrechen")
+            form.addWidget(box)
+            def browse_folder():
+                chooser = QFileDialog(options)
+                configure_folder_dialog(chooser, "Choose destination folder" if en else "Zielordner auswählen")
+                chooser.setDirectory(folder_edit.text())
+                if chooser.exec() == QDialog.Accepted and chooser.selectedFiles():
+                    folder_edit.setText(chooser.selectedFiles()[0])
+            browse.clicked.connect(browse_folder)
+            box.accepted.connect(options.accept)
+            box.rejected.connect(options.reject)
+            if options.exec() != QDialog.Accepted:
+                return None
+            destination = Path(folder_edit.text()).expanduser()
+            if not destination.is_absolute():
+                QMessageBox.warning(options, "Invalid folder" if en else "Ungültiger Ordner", "Please choose an absolute folder path." if en else "Bitte einen absoluten Ordnerpfad auswählen.")
+                return None
+            self.settings.setValue("appimage/import_folder", str(destination))
+            self._sync_settings_permissions()
+            import_folder_value.setText(str(destination))
+            return destination, move_radio.isChecked()
+
+        def add():
+            file_dialog = QFileDialog(dlg)
+            file_dialog.setWindowTitle("Select AppImages" if en else "AppImages auswählen")
+            file_dialog.setDirectory(str(_desktop_user_home()))
+            file_dialog.setFileMode(QFileDialog.ExistingFiles)
+            file_dialog.setNameFilter("AppImage (*.AppImage *.appimage);;All files (*)" if en else "AppImage (*.AppImage *.appimage);;Alle Dateien (*)")
+            file_dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+            file_dialog.setLabelText(QFileDialog.Accept, "Öffnen" if not en else "Open")
+            file_dialog.setLabelText(QFileDialog.Reject, "Abbrechen" if not en else "Cancel")
+            file_dialog.setLabelText(QFileDialog.LookIn, "Suchen in:" if not en else "Look in:")
+            file_dialog.setLabelText(QFileDialog.FileName, "Dateiname:" if not en else "File name:")
+            file_dialog.setLabelText(QFileDialog.FileType, "Dateityp:" if not en else "File type:")
+            button_box = file_dialog.findChild(QDialogButtonBox)
+            if button_box is not None:
+                for button in button_box.buttons():
+                    role = button_box.buttonRole(button)
+                    if role == QDialogButtonBox.AcceptRole:
+                        button.setText("Open" if en else "Öffnen")
+                    elif role == QDialogButtonBox.RejectRole:
+                        button.setText("Cancel" if en else "Abbrechen")
+            if file_dialog.exec() != QDialog.Accepted:
+                return
+            selected_files = [Path(value) for value in file_dialog.selectedFiles()]
+            imported = None
+            for src in selected_files:
+                if not src.is_file():
+                    continue
+                choice = choose_import_options(src)
+                if choice is None:
+                    continue
+                destination_dir, move_original = choice
+                try:
+                    destination_dir.mkdir(parents=True, exist_ok=True)
+                    account = _desktop_user_account()
+                    if os.geteuid() == 0 and account.pw_uid != 0:
+                        os.chown(destination_dir, account.pw_uid, account.pw_gid)
+                    target = destination_dir / src.name
+                    if src.resolve() == target.resolve():
+                        target = src
+                    elif target.exists():
+                        confirm = QMessageBox(dlg)
+                        confirm.setIcon(QMessageBox.Warning)
+                        confirm.setWindowTitle("Replace file?" if en else "Datei ersetzen?")
+                        confirm.setText(f"{target.name} already exists. Replace it?" if en else f"{target.name} existiert bereits. Ersetzen?")
+                        yes_button = confirm.addButton("Yes" if en else "Ja", QMessageBox.YesRole)
+                        confirm.addButton("No" if en else "Nein", QMessageBox.NoRole)
+                        confirm.exec()
+                        if confirm.clickedButton() is not yes_button:
+                            continue
+                    if src.resolve() != target.resolve():
+                        if move_original:
+                            shutil.move(str(src), str(target))
+                        else:
+                            shutil.copy2(src, target)
+                    target.chmod(target.stat().st_mode | 0o111)
+                    if os.geteuid() == 0 and account.pw_uid != 0:
+                        os.chown(target, account.pw_uid, account.pw_gid)
+                    register(target)
+                    imported = target
+                except Exception as exc:
+                    detail = ("The import could not be completed: " if en else "Der Import konnte nicht abgeschlossen werden: ") + str(exc)
+                    QMessageBox.critical(dlg, "Import failed" if en else "Import fehlgeschlagen", detail)
+            refresh(imported)
+
+        def launch():
+            path = selected()
+            if not path:
+                return
+            try:
+                path = path.expanduser().resolve()
+                if not path.is_file():
+                    raise FileNotFoundError(str(path))
+                if not os.access(path, os.X_OK):
+                    path.chmod(path.stat().st_mode | 0o111)
+
+                # Prefer the exact desktop entry already used by the user's
+                # application menu. This preserves AppImage-specific arguments,
+                # environment variables, working directory and integration.
+                account = _desktop_user_account()
+                data_home = Path(account.pw_dir) / ".local/share"
+                desktop_dirs = [data_home / "applications", Path("/usr/local/share/applications"),
+                                Path("/usr/share/applications")]
+                matches = []
+                target = str(path)
+                for directory in desktop_dirs:
+                    if not directory.is_dir():
+                        continue
+                    try:
+                        candidates = sorted(directory.glob("*.desktop"))
+                    except OSError:
+                        continue
+                    for desktop_file in candidates:
+                        # Include LunaPaket-managed launchers too: they are valid
+                        # existing menu entries and must be reused on subsequent
+                        # Start clicks instead of prompting to create another one.
+                        try:
+                            content = desktop_file.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        if not any(line.startswith("Exec=") and target in line for line in content.splitlines()):
+                            continue
+                        if "X-LunaPaket-Managed=true" in content and not any(line.startswith("Path=") for line in content.splitlines()):
+                            updated = content.rstrip("\n") + "\nPath=" + str(account.pw_dir) + "\n"
+                            desktop_file.write_text(updated, encoding="utf-8")
+                            if os.geteuid() == 0 and account.pw_uid != 0:
+                                os.chown(desktop_file, account.pw_uid, account.pw_gid)
+                        matches.append(desktop_file)
+
+                if matches:
+                    # Do not delegate to gtk-launch: LunaPaket itself may be
+                    # running as root, and the desktop launcher can then be
+                    # resolved/executed through a second session mechanism.
+                    # Execute the matching user's Desktop Entry directly after
+                    # dropping privileges with setpriv.
+                    matches.sort(key=lambda item: (0 if item.parent == desktop_dirs[0] else 1,
+                                                   -len(item.name), item.name))
+                    desktop_file = matches[0]
+                    desktop_values = {}
+                    in_entry = False
+                    for raw_line in desktop_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                        line = raw_line.strip()
+                        if line.startswith("[") and line.endswith("]"):
+                            in_entry = (line == "[Desktop Entry]")
+                            continue
+                        if in_entry and "=" in line and not line.startswith("#"):
+                            key, value = line.split("=", 1)
+                            desktop_values[key] = value
+                    exec_line = desktop_values.get("Exec", "").strip()
+                    if not exec_line:
+                        raise RuntimeError(f"Der Starter {desktop_file.name} enthält keinen Exec-Eintrag.")
+                    # Desktop Entry field codes are arguments supplied by the
+                    # desktop shell. For a plain app launch, file/URL codes
+                    # are omitted; literal %% becomes %.
+                    argv = shlex.split(exec_line, posix=True)
+                    field_codes = {"%f", "%F", "%u", "%U", "%i", "%c", "%k", "%d", "%D", "%n", "%N", "%v", "%m"}
+                    cleaned = []
+                    for arg in argv:
+                        if arg in field_codes:
+                            continue
+                        arg = arg.replace("%%", "%")
+                        for code in field_codes:
+                            arg = arg.replace(code, "")
+                        if arg:
+                            cleaned.append(arg)
+                    if not cleaned:
+                        raise RuntimeError(f"Der Starter {desktop_file.name} enthält keinen ausführbaren Befehl.")
+                    working_dir = desktop_values.get("Path", "").strip() or account.pw_dir
+                    working_dir = os.path.expanduser(working_dir)
+                    if not os.path.isabs(working_dir):
+                        working_dir = os.path.join(account.pw_dir, working_dir)
+                    # Desktop Entry files may use an absolute executable or
+                    # rely on PATH. Preserve the desktop user's session env.
+                    desktop_id = desktop_file.name[:-len(".desktop")]
+                    _start_as_desktop_user(cleaned, cwd=working_dir, desktop_id=desktop_id)
+                    return
+
+                # No existing menu launcher: ask before creating a LunaPaket
+                # launcher, rather than silently starting an AppImage in a
+                # different way from the user's normal menu entry.
+                question = ("Kein vorhandener Startmenüeintrag für dieses AppImage gefunden.\n"
+                            "Soll LunaPaket einen eigenen Starter anlegen?") if not en else (
+                            "No existing application-menu entry was found for this AppImage.\n"
+                            "Should LunaPaket create its own launcher?")
+                answer = QMessageBox.question(dlg, "AppImage-Starter" if not en else "AppImage launcher",
+                                              question, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
+                launcher = register(path)
+                desktop_id = Path(launcher).name[:-len(".desktop")]
+                _start_as_desktop_user([str(path)], cwd=account.pw_dir, desktop_id=desktop_id)
+            except Exception as exc:
+                detail = ("The AppImage could not be started: " if en else "Das AppImage konnte nicht gestartet werden: ") + str(exc)
+                QMessageBox.critical(dlg, "Launch AppImage" if en else "AppImage starten", detail)
+
+        def update_one():
+            path = selected()
+            if not path:
+                return
+            updater = _find_appimage_updater()
+            if not updater:
+                QMessageBox.information(dlg, "AppImageUpdate", ("AppImageUpdate was not found. Place its AppImage in your home folder or install its command-line version." if en else "AppImageUpdate wurde nicht gefunden. Lege die AppImage-Datei in deinem Benutzerordner ab oder installiere die Kommandozeilenversion."))
+                return
+            if updater.lower().endswith(".appimage"):
+                try:
+                    updater_path = Path(updater)
+                    updater_path.chmod(updater_path.stat().st_mode | 0o111)
+                    account = _desktop_user_account()
+                    if os.geteuid() == 0 and account.pw_uid != 0:
+                        os.chown(updater_path, account.pw_uid, account.pw_gid)
+                except OSError as exc:
+                    detail = ("AppImageUpdate could not be prepared: " if en else "AppImageUpdate konnte nicht vorbereitet werden: ") + str(exc)
+                    QMessageBox.critical(dlg, "AppImageUpdate", detail)
+                    return
+            if getattr(dlg, "_appimage_update_process", None) is not None and dlg._appimage_update_process.poll() is None:
+                return
+            label = ("Updating AppImage: " if en else "AppImage wird aktualisiert: ") + path.name
+            status.setText(label)
+            close_btn.setEnabled(False)
+            self._catalog_activity_start("appimage_update", label)
+            self._main_progress_set(None, label)
+            try:
+                updater_executable = updater
+                updater_is_cli = Path(updater).name.casefold() in {"appimageupdatetool", "appimageupdate"}
+                # The legacy AppImageUpdate GUI bundle often also contains the CLI
+                # helper. Prefer that helper so progress and errors stay inside LunaPaket.
+                if updater.lower().endswith(".appimage"):
+                    tool_cache = _desktop_user_home() / ".local/share/lunapaket/tools/appimageupdatetool"
+                    if not tool_cache.is_file():
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="lunapaket-updater-") as temp_dir:
+                                extract_command, extract_env = _desktop_user_command([updater, "--appimage-extract", "usr/bin/appimageupdatetool"])
+                                subprocess.run(extract_command, cwd=temp_dir, env=extract_env, stdout=subprocess.DEVNULL,
+                                               stderr=subprocess.DEVNULL, timeout=60, check=False)
+                                extracted = Path(temp_dir) / "squashfs-root/usr/bin/appimageupdatetool"
+                                if extracted.is_file():
+                                    tool_cache.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(extracted, tool_cache)
+                                    tool_cache.chmod(tool_cache.stat().st_mode | 0o111)
+                                    if os.geteuid() == 0:
+                                        account = _desktop_user_account()
+                                        os.chown(_desktop_user_home() / ".local/share/lunapaket", account.pw_uid, account.pw_gid)
+                                        os.chown(tool_cache.parent, account.pw_uid, account.pw_gid)
+                                        os.chown(tool_cache, account.pw_uid, account.pw_gid)
+                        except Exception:
+                            pass
+                    if tool_cache.is_file():
+                        updater_executable = str(tool_cache)
+                        updater_is_cli = True
+                update_args = ([updater_executable, "-O", str(path)] if updater_is_cli
+                               else [updater_executable, str(path)])
+                update_command, update_env = _desktop_user_command(update_args)
+                process = subprocess.Popen(update_command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, env=update_env)
+                dlg._appimage_update_process = process
+                dlg._appimage_update_output = []
+                dlg._appimage_update_timer = QTimer(dlg)
+                def poll_update():
+                    try:
+                        if process.stdout:
+                            fd = process.stdout.fileno()
+                            os.set_blocking(fd, False)
+                            try:
+                                raw_chunk = os.read(fd, 65536)
+                            except BlockingIOError:
+                                raw_chunk = b""
+                            chunk = raw_chunk.decode("utf-8", errors="replace") if raw_chunk else ""
+                            if chunk:
+                                dlg._appimage_update_output.append(chunk)
+                                joined = "".join(dlg._appimage_update_output)
+                                matches = re.findall(r"(?<!\d)(\d{1,3})\s*%", joined)
+                                self._main_progress_set(max(0, min(99, int(matches[-1]))) if matches else None, label)
+                                status.setText(("Updater output: " if en else "Updater-Ausgabe: ") + joined[-500:].strip())
+                        code = process.poll()
+                        if code is None:
+                            return
+                        dlg._appimage_update_timer.stop()
+                        close_btn.setEnabled(True)
+                        self._catalog_activity_finish("appimage_update")
+                        if code == 0:
+                            self._main_progress_set(100, "AppImage update completed" if en else "AppImage-Aktualisierung abgeschlossen")
+                            status.setText("Update completed." if en else "Aktualisierung abgeschlossen.")
+                            refresh(path)
+                        else:
+                            output = "".join(dlg._appimage_update_output)[-700:]
+                            status.setText(("Update failed: " if en else "Aktualisierung fehlgeschlagen: ") + output)
+                            lowered = output.casefold()
+                            if "http status 404" in lowered or "status 404" in lowered or "not found" in lowered:
+                                explanation = ("The AppImage's embedded update information points to a release or tag that the hosting service cannot find (HTTP 404). This is an upstream publishing/update-metadata problem, not an installation problem. The existing AppImage was not replaced." if en else "Die in diesem AppImage eingebetteten Update-Informationen verweisen auf eine Release oder einen Tag, den der Server nicht findet (HTTP 404). Das ist ein Problem der Upstream-Veröffentlichung bzw. Update-Metadaten, kein Installationsfehler. Das vorhandene AppImage wurde nicht ersetzt.")
+                            else:
+                                explanation = ("The updater returned an error. The existing AppImage was not replaced. Details:" if en else "Das Aktualisierungsprogramm hat einen Fehler gemeldet. Das vorhandene AppImage wurde nicht ersetzt. Details:")
+                            QMessageBox.warning(dlg, "Update failed" if en else "Aktualisierung fehlgeschlagen", explanation + "\n\n" + (output or ("No details were provided." if en else "Es wurden keine Details ausgegeben.")))
+                        QTimer.singleShot(1800, lambda: self._catalog_activity_finish("appimage_update") if not self._catalog_activity else None)
+                    except Exception as exc:
+                        dlg._appimage_update_timer.stop()
+                        close_btn.setEnabled(True)
+                        self._catalog_activity_finish("appimage_update")
+                        status.setText(("Update process error: " if en else "Fehler im Aktualisierungsvorgang: ") + str(exc))
+                dlg._appimage_update_timer.timeout.connect(poll_update)
+                dlg._appimage_update_timer.start(250)
+            except Exception as exc:
+                close_btn.setEnabled(True)
+                self._catalog_activity_finish("appimage_update")
+                status.setText(("Could not start update: " if en else "Aktualisierung konnte nicht gestartet werden: ") + str(exc))
+
+        def remove():
+            path = selected()
+            if not path:
+                return
+            question = (f"Remove {path.name} and its menu entry? The source file will be deleted." if en else f"{path.name} und den Menüeintrag entfernen? Die AppImage-Datei wird gelöscht.")
+            confirm = QMessageBox(dlg)
+            confirm.setIcon(QMessageBox.Question)
+            confirm.setWindowTitle("Remove AppImage" if en else "AppImage entfernen")
+            confirm.setText(question)
+            yes_button = confirm.addButton("Yes" if en else "Ja", QMessageBox.YesRole)
+            confirm.addButton("No" if en else "Nein", QMessageBox.NoRole)
+            confirm.exec()
+            if confirm.clickedButton() is not yes_button:
+                return
+            try:
+                path.unlink()
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "-", path.stem).strip("-.") or "appimage"
+                identity = hashlib.sha256(str(path.expanduser().resolve()).encode("utf-8")).hexdigest()[:12]
+                desktop = self._appimage_desktop_directory() / f"lunapaket-appimage-{safe}-{identity}.desktop"
+                if desktop.is_file():
+                    try:
+                        owned = "X-LunaPaket-Managed=true" in desktop.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        owned = False
+                    if owned:
+                        desktop.unlink()
+                        updater = shutil.which("update-desktop-database")
+                        if updater:
+                            command, env = _desktop_user_command([updater, str(desktop.parent)])
+                            subprocess.run(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           timeout=15, check=False)
+                refresh()
+            except Exception as exc:
+                detail = ("The AppImage could not be removed: " if en else "Das AppImage konnte nicht entfernt werden: ") + str(exc)
+                QMessageBox.critical(dlg, "Remove AppImage" if en else "AppImage entfernen", detail)
+
+        def show_selected_path():
+            path = selected()
+            path_label.setText(str(path) if path else "")
+
+        listing.currentItemChanged.connect(lambda *_: show_selected_path())
+        import_folder_btn.clicked.connect(choose_import_folder)
+        import_default_btn.clicked.connect(reset_import_folder)
+        add_btn.clicked.connect(add)
+        launch_btn.clicked.connect(launch)
+        update_btn.clicked.connect(update_one)
+        remove_btn.clicked.connect(remove)
+        def close_dialog():
+            worker = getattr(dlg, "_appimage_scan_worker", None)
+            if worker is not None and worker.isRunning():
+                worker.wait()
+            dlg.accept()
+        close_btn.clicked.connect(close_dialog)
+        refresh()
+        dlg.exec()
+
+    def _refresh_update_watcher_toolbar(self):
+        if not hasattr(self, "update_watcher_toolbar_btn"):
+            return
+        enabled = self.settings.value("updates/watcher_enabled", False, type=bool)
+        minutes = max(30, self.settings.value("updates/watcher_interval_minutes", 360, type=int))
+        if self.language == "en":
+            self.update_watcher_toolbar_btn.setText("Update Watcher: ON" if enabled else "Update Watcher: OFF")
+            labels = {30: "every 30 minutes", 60: "hourly", 360: "every 6 hours", 1440: "daily"}
+            self.update_watcher_toolbar_status.setText(f"Background check {labels.get(minutes, f'every {minutes} minutes')}" if enabled else "Background checking disabled")
+        else:
+            self.update_watcher_toolbar_btn.setText("Update-Wächter: EIN" if enabled else "Update-Wächter: AUS")
+            labels = {30: "alle 30 Minuten", 60: "stündlich", 360: "alle 6 Stunden", 1440: "täglich"}
+            self.update_watcher_toolbar_status.setText(f"Hintergrundprüfung {labels.get(minutes, f'alle {minutes} Minuten')}" if enabled else "Hintergrundprüfung deaktiviert")
+
+    def configure_update_watcher(self):
+        enabled = self.settings.value("updates/watcher_enabled", False, type=bool)
+        minutes = max(30, self.settings.value("updates/watcher_interval_minutes", 360, type=int))
+        self.update_watcher_timer.stop()
+        if enabled: self.update_watcher_timer.start(minutes * 60 * 1000)
+        self._refresh_update_watcher_toolbar()
+
+    @staticmethod
+    def _collect_update_watcher_status():
+        results = {}
+        checks = (
+            ("APT", ["apt-get", "--just-print", "upgrade"]),
+            ("Flatpak", ["flatpak", "remote-ls", "--updates"]),
+            ("Snap", ["snap", "refresh", "--list"]),
+        )
+        for name, command in checks:
+            if not shutil.which(command[0]):
+                results[name] = None
+                continue
+            try:
+                p = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+                output = p.stdout.strip()
+                if name == "APT":
+                    lines = [x for x in output.splitlines() if re.search(r"^Inst\s+", x)]
+                else:
+                    lines = [x for x in output.splitlines() if x and not x.lower().startswith(("name", "ref", "tracking", "---", "no updates", "all snaps up to date", "nothing to do"))]
+                results[name] = len(lines) if p.returncode == 0 else None
+            except Exception:
+                results[name] = None
+        appimages = self._discover_appimages_for_watcher()
+        updater = _find_appimage_updater()
+        results["AppImage"] = {"count": len(appimages), "updater": bool(updater)}
+        return results
+
+    def _discover_appimages_for_watcher(self):
+        folder = self.settings.value("appimage/import_folder", str(self._appimage_directory()), type=str)
+        return {str(path) for path in _discover_user_appimages([folder])}
+
+    def check_all_updates_silently(self):
+        if getattr(self, "_update_watcher_running", False) or getattr(self, "_busy", False): return
+        self._update_watcher_running = True
+        self.update_watcher_job = FunctionJob(self._collect_update_watcher_status)
+        def done(results):
+            self._update_watcher_running = False
+            self.settings.setValue("updates/last_check", __import__("datetime").datetime.now().astimezone().strftime("%d.%m.%Y %H:%M"))
+            self.settings.setValue("updates/last_results", json.dumps(results, ensure_ascii=False)); self.settings.sync()
+            counts = [v for k, v in results.items() if k != "AppImage" and isinstance(v, int)]
+            total = sum(counts)
+            self.status.setText((f"Update watcher: {total} update(s) found" if self.language == "en" else f"Update-Wächter: {total} Update(s) gefunden"))
+            old = self.settings.value("updates/last_notified_total", -1, type=int)
+            if total > 0 and total != old:
+                message = (f"{total} available update(s) were found. Open LunaPaket to use the respective update functions." if self.language == "en" else f"Es wurden {total} verfügbare Updates erkannt. Öffne LunaPaket, um die jeweiligen Update-Funktionen zu verwenden.")
+                QMessageBox.information(self, "LunaPaket – Update Watcher" if self.language == "en" else "LunaPaket – Update-Wächter", message)
+            self.settings.setValue("updates/last_notified_total", total); self.settings.sync()
+        def failed(error):
+            self._update_watcher_running = False
+            self.status.setText(("Update watcher failed: " if self.language == "en" else "Update-Wächter fehlgeschlagen: ") + str(error))
+        self.update_watcher_job.result.connect(done); self.update_watcher_job.failed.connect(failed); self.update_watcher_job.start()
+
+    def show_update_watcher_settings(self):
+        en = self.language == "en"
+        dlg = QDialog(self); dlg.setWindowTitle("Update Watcher" if en else "Update-Wächter"); dlg.setMinimumWidth(480)
+        layout = QVBoxLayout(dlg)
+        enabled = QCheckBox("Automatically check for updates" if en else "Automatisch nach Updates suchen")
+        enabled.setChecked(self.settings.value("updates/watcher_enabled", False, type=bool))
+        interval_row = QHBoxLayout(); interval_row.addWidget(QLabel("Check interval:" if en else "Prüfintervall:"))
+        interval = QComboBox()
+        for label, value in ((("Every 30 minutes",30),("Hourly",60),("Every 6 hours",360),("Daily",1440)) if en else (("Alle 30 Minuten",30),("Stündlich",60),("Alle 6 Stunden",360),("Täglich",1440))): interval.addItem(label, value)
+        current = self.settings.value("updates/watcher_interval_minutes", 360, type=int)
+        idx = interval.findData(current); interval.setCurrentIndex(idx if idx >= 0 else 2)
+        interval_row.addWidget(interval, 1); layout.addWidget(enabled); layout.addLayout(interval_row)
+        info = QLabel(("Checks APT, Flatpak and Snap in the background. No updates are installed automatically. AppImages in common user folders are detected; AppImageUpdate is needed for in-place updates." if en else "Prüft APT, Flatpak und Snap im Hintergrund. Es werden keine Updates automatisch installiert. AppImages in üblichen Benutzerordnern werden erkannt; für Aktualisierungen an Ort und Stelle wird AppImageUpdate benötigt."))
+        info.setWordWrap(True); layout.addWidget(info)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Save" if en else "Speichern")
+        buttons.button(QDialogButtonBox.Cancel).setText("Cancel" if en else "Abbrechen")
+        layout.addWidget(buttons)
+        def save():
+            self.settings.setValue("updates/watcher_enabled", enabled.isChecked()); self.settings.setValue("updates/watcher_interval_minutes", interval.currentData())
+            self.settings.sync(); self.configure_update_watcher(); dlg.accept()
+        buttons.accepted.connect(save); buttons.rejected.connect(dlg.reject); dlg.exec()
 
     def show_settings(self):
         dlg = QDialog(self)
@@ -3364,6 +4677,8 @@ class Window(QMainWindow):
             return ""
 
     def _catalog_activity_start(self, key, label):
+        self.catalog_activity_bar.setRange(0, 0)
+        self.catalog_activity_bar.setTextVisible(False)
         self._catalog_activity[key] = label
         self.catalog_activity_label.setText("  •  ".join(self._catalog_activity.values()))
         self.catalog_activity_panel.show()
@@ -3379,6 +4694,37 @@ class Window(QMainWindow):
             self.catalog_activity_label.setText("  •  ".join(self._catalog_activity.values()))
         else:
             self.catalog_activity_panel.hide()
+
+    def _main_progress_set(self, percent=None, message=None):
+        """Spiegelt echten Paketmanager-Fortschritt in den einzigen Balken oben."""
+        if not hasattr(self, "catalog_activity_bar"):
+            return
+        if percent is None:
+            self.catalog_activity_bar.setRange(0, 0)
+            self.catalog_activity_bar.setTextVisible(False)
+        else:
+            value = max(0, min(100, int(percent)))
+            self.catalog_activity_bar.setRange(0, 100)
+            self.catalog_activity_bar.setValue(value)
+            self.catalog_activity_bar.setTextVisible(False)
+            if message:
+                self.catalog_activity_label.setText(f"{message} ({value}%)")
+        if message and percent is None:
+            self.catalog_activity_label.setText(message)
+        self.catalog_activity_panel.show()
+
+    def _update_progress_start(self, key, label):
+        """Zeigt Update-Aktivität ausschließlich oben im Hauptfenster."""
+        self._catalog_activity_start(key, label)
+        self._main_progress_set(None, "  •  ".join(self._catalog_activity.values()))
+
+    def _update_progress_finish(self, key):
+        self._catalog_activity_finish(key)
+        if not self._catalog_activity:
+            self.catalog_activity_bar.setRange(0, 0)
+            self.catalog_activity_bar.setTextVisible(False)
+        else:
+            self.catalog_activity_bar.setRange(0, 0)
 
     def snap_catalog_progress(self, current, total):
         """Zeigt den laufenden Snap-Katalogfortschritt unabhängig von der Ansicht."""
@@ -3775,6 +5121,7 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Snap", "snapd is not installed." if english else "snapd ist nicht installiert.")
             return
         self.snap_update_btn.setEnabled(False)
+        self._update_progress_start("snap_updates", "Checking Snap updates …" if english else "Snap-Updates werden gesucht …")
         self.status.setText("Checking Snap updates …" if english else "Snap-Updates werden gesucht …")
         def scan():
             proc=subprocess.run(["snap", "refresh", "--list"], text=True, stdout=subprocess.PIPE,
@@ -3805,6 +5152,7 @@ class Window(QMainWindow):
             return sorted(set(updates))
         self.snap_update_scan_job=FunctionJob(scan)
         def ready(updates):
+            self._update_progress_finish("snap_updates")
             self.snap_update_btn.setEnabled(True)
             if not updates:
                 self.status.setText("Keine Snap-Updates verfügbar." if not english else "No Snap updates available.")
@@ -3834,6 +5182,7 @@ class Window(QMainWindow):
                 if confirm.clickedButton() is not yes_button:
                     return
                 dlg.accept(); self.set_busy(True); self.snap_update_btn.setEnabled(False)
+                self._update_progress_start("snap_update_install", "Installing Snap updates …" if english else "Snap-Updates werden installiert …")
                 def update(report, emit_output):
                     results=[]
                     total = len(names)
@@ -3868,15 +5217,13 @@ class Window(QMainWindow):
                 self.snap_update_job=FunctionJob(update, with_progress_detail_output=True)
                 self.snap_update_job.output.connect(progress.append_output)
                 def update_progress(done, total, message):
-                    if done < 0:
-                        progress.progress.setRange(0, 0)
-                    elif total > 0:
-                        if progress.progress.maximum() == 0:
-                            progress.progress.setRange(0, 100)
-                        progress.progress.setValue(max(0, min(99, int(done * 100 / total))))
-                    progress.current.setText(("Aktuell: " if not english else "Current: ") + message)
+                    if done < 0 or total <= 0:
+                        progress.set_progress(None, message)
+                    else:
+                        progress.set_progress(max(0, min(99, int(done * 100 / total))), message)
                 self.snap_update_job.progress_detail.connect(update_progress)
                 def updated(results):
+                    self._update_progress_finish("snap_update_install")
                     self.set_busy(False); self.snap_update_btn.setEnabled(True)
                     output = "\n\n".join(out.strip() or f"{name}: exit {rc}" for name,rc,out in results)
                     self.details.setPlainText(output)
@@ -3886,6 +5233,7 @@ class Window(QMainWindow):
                     self.status.setText(("Fehler bei: " if not english else "Failed: ")+", ".join(failures) if failures else ("Snap-Updates abgeschlossen." if not english else "Snap updates completed."))
                     self.load_snap_catalog()
                 def update_failed(error):
+                    self._update_progress_finish("snap_update_install")
                     self.set_busy(False); self.snap_update_btn.setEnabled(True)
                     progress.progress.setRange(0, 100); progress.append_output(str(error)); progress.finish(1)
                 self.snap_update_job.result.connect(updated)
@@ -3907,7 +5255,11 @@ class Window(QMainWindow):
                     f"{len(self.snap_catalog)} Snap applications loaded"
                 )
         self.snap_update_scan_job.result.connect(ready)
-        self.snap_update_scan_job.failed.connect(lambda error:(self.snap_update_btn.setEnabled(True),self.status.setText("Snap-Updateprüfung fehlgeschlagen: "+str(error))))
+        def snap_scan_failed(error):
+            self._update_progress_finish("snap_updates")
+            self.snap_update_btn.setEnabled(True)
+            self.status.setText(("Snap update check failed: " if english else "Snap-Updateprüfung fehlgeschlagen: ") + str(error))
+        self.snap_update_scan_job.failed.connect(snap_scan_failed)
         self.snap_update_scan_job.start()
 
     @staticmethod
@@ -4440,10 +5792,16 @@ class Window(QMainWindow):
             self.apply_theme()
             self.status.setText((f"Font size set to {size} pt" if self.language == "en" else f"Schriftgröße auf {size} pt gesetzt"))
     def search_pkgs(self):
+        if getattr(self, "snap_mode", False):
+            # Der Suchknopf muss exakt denselben Aktualisierungspfad auslösen
+            # wie die Snap-Schaltfläche. set_package_mode("snap") setzt den
+            # Themenfilter zurück, aktiviert "Alle Anwendungen" und startet
+            # anschließend load_snap_catalog(), das den aktuellen Suchbegriff
+            # direkt aus self.search übernimmt.
+            self.set_package_mode("snap")
+            return
         if getattr(self, "flatpak_mode", False):
-            if self.snap_mode:
-                self.load_snap_catalog()
-            elif self.flatpak_catalog:
+            if self.flatpak_catalog:
                 self.apply_table_filters()
             else:
                 self.load_flatpak_catalog()
@@ -5937,6 +7295,7 @@ class Window(QMainWindow):
             QMessageBox.warning(self, "Flatpak", "Flatpak is not installed." if english else "Flatpak ist nicht installiert.")
             return
         self.flatpak_update_btn.setEnabled(False)
+        self._update_progress_start("flatpak_updates", "Checking Flathub updates …" if english else "Flathub-Updates werden gesucht …")
         self.status.setText("Checking Flathub updates …" if english else "Flathub-Updates werden gesucht …")
 
         def scan():
@@ -5960,6 +7319,7 @@ class Window(QMainWindow):
 
         self.flatpak_update_scan_job = FunctionJob(scan)
         def ready(result):
+            self._update_progress_finish("flatpak_updates")
             self.flatpak_update_btn.setEnabled(True)
             updates, errors = result
             if not updates:
@@ -6038,6 +7398,7 @@ class Window(QMainWindow):
                 dlg.accept()
                 self.flatpak_update_btn.setEnabled(False)
                 self.set_busy(True)
+                self._update_progress_start("flatpak_update_install", "Installing Flatpak updates …" if english else "Flathub-Updates werden installiert …")
                 self.status.setText("Installing Flatpak updates …" if english else "Flatpak-Updates werden installiert …")
                 progress = ActionProgressDialog(
                     self,
@@ -6068,6 +7429,7 @@ class Window(QMainWindow):
                 def start_next_flatpak_update():
                     index = current_index["value"]
                     if index >= len(selected):
+                        self._update_progress_finish("flatpak_update_install")
                         progress.finish(1 if any(item[2] != 0 for item in results) else 0)
                         self.set_busy(False)
                         self.flatpak_update_btn.setEnabled(True)
@@ -6088,7 +7450,16 @@ class Window(QMainWindow):
                     command = privileged(args) if scope == "system" else user_command(args)
                     job = CommandStreamJob(command)
                     self.flatpak_update_stream = job
-                    job.output.connect(progress.append_output)
+                    def flatpak_output(line, index=index, ref=ref):
+                        progress.append_output(line)
+                        matches = re.findall(r"(?<!\d)(\d{1,3})\s*%", line)
+                        if matches:
+                            local_percent = max(0, min(99, int(matches[-1])))
+                            overall = int((index * 100 + local_percent) / max(1, len(selected)))
+                            progress.set_progress(overall, ref)
+                        elif line.strip():
+                            progress.set_progress(None, ref)
+                    job.output.connect(flatpak_output)
                     def one_finished(rc, output, scope=scope, ref=ref, index=index):
                         results.append((scope, ref, rc, output))
                         details.append(output.strip() or f"{ref}: exit {rc}")
@@ -6110,7 +7481,12 @@ class Window(QMainWindow):
             self.status.setText((f"{len(updates)} Flatpak update(s) available." if english else f"{len(updates)} Flatpak-Updates verfügbar."))
             dlg.exec()
         self.flatpak_update_scan_job.result.connect(ready)
-        self.flatpak_update_scan_job.failed.connect(lambda error: (self.flatpak_update_btn.setEnabled(True), self.status.setText("Flatpak update check failed" if english else "Flatpak-Updateprüfung fehlgeschlagen"), QMessageBox.warning(self, "Flatpak", str(error))))
+        def flatpak_scan_failed(error):
+            self._update_progress_finish("flatpak_updates")
+            self.flatpak_update_btn.setEnabled(True)
+            self.status.setText("Flatpak update check failed" if english else "Flatpak-Updateprüfung fehlgeschlagen")
+            QMessageBox.warning(self, "Flatpak", str(error))
+        self.flatpak_update_scan_job.failed.connect(flatpak_scan_failed)
         self.flatpak_update_scan_job.start()
 
     def show_snap_cleanup_dialog(self):

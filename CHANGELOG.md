@@ -1,4 +1,30 @@
-# Changelog
+# Änderungsprotokoll
+
+## 0.1.48 – Direkter Zugriff auf AppImage und Update-Wächter
+- AppImage-Verwaltung und Update-Wächter sind jetzt als eigene Schaltflächen direkt in der Hauptoberfläche erreichbar.
+- Der Update-Wächter zeigt direkt in der Hauptoberfläche seinen Ein-/Aus-Status sowie das eingestellte Prüfintervall.
+- Beschriftungen und Statusanzeige unterstützen Deutsch und Englisch.
+- Bestehende APT-, Flathub- und Snap-Bedienelemente sowie Snap-Katalog- und Suchabläufe bleiben unverändert.
+# AppImage-Erkennung und echter Hauptfortschritt (Nachtrag)
+- AppImage-Verwaltung sucht vorhandene `.AppImage`-Dateien eigenständig in üblichen Benutzerordnern sowie in Pfaden, die von lokalen Desktop-Startern referenziert werden. Es wird keine Fremdverwaltung angesprochen oder eingebunden.
+- Bereits vorhandene AppImages werden in der LunaPaket-Liste erkannt; beim Anzeigen werden eigene Menüeinträge für gefundene AppImages registriert. Neue Importe bleiben in `~/Applications`.
+- Update-Wächter zählt AppImages aus denselben allgemeinen Suchorten mit.
+- Der doppelte untere Fortschrittsbalken wurde entfernt. Alle Fortschrittsanzeigen laufen über den einen Balken oben im Hauptfenster.
+- APT-, Flatpak-, Snap- und AppImage-Aktionsfortschritt wird, soweit vom jeweiligen Werkzeug gemeldet, an den oberen Balken gespiegelt. Ohne belastbare Prozentmeldung wird ein indeterminierter Laufbalken angezeigt, statt Prozentwerte zu erfinden.
+- AppImageUpdate läuft asynchron; erkannte Prozentmeldungen werden im oberen Hauptbalken angezeigt und der Dialog bleibt während des Vorgangs gegen versehentliches Schließen gesperrt.
+- Deutsch/Englisch für die neuen AppImage-Erkennungshinweise ergänzt.
+- Neue AppImage-Verwaltung: AppImages nach `~/Applications` importieren, ausführbar machen, im Anwendungsmenü registrieren, starten und entfernen. Aktualisierung über AppImageUpdate, sofern installiert.
+- Neuer konfigurierbarer Update-Wächter für APT, Flatpak und Snap mit Hintergrundprüfung und Benachrichtigung. Es werden keine Updates automatisch installiert.
+- Bestehende Snap-Suche, Snap-Kanäle und getrennte Katalog-Caches unverändert gelassen.
+- Der Suchknopf im Snap-Fenster löst denselben Aktualisierungspfad wie die Snap-Schaltfläche aus; APT- und Flathub-Suchpfade bleiben getrennt.
+# AppImage-Starter sicher und zuverlässig
+- LunaPaket erzeugt beim Einlesen jeder ausführbaren AppImage-Datei automatisch einen eigenen Startmenüeintrag – auch dann, wenn kein Originalsymbol gefunden wurde.
+- Starter erhalten eindeutige Dateinamen mit Pfad-Hash und die Kennzeichnung `X-LunaPaket-Managed=true`; fremde `.desktop`-Dateien werden nicht überschrieben.
+- Startbefehle verwenden korrekt quotierte Desktop-Entry-Pfade und unterstützen Dateipfade mit Leerzeichen und Sonderzeichen.
+- Vorhandene Symbole und erkannte Anwendungsnamen werden übernommen; ohne Symbol wird ein normaler System-Programmeintrag erzeugt.
+- Beim Entfernen wird ausschließlich der zugehörige, eindeutig als LunaPaket-eigen markierte Starter entfernt.
+- Die Desktop-Datenbank wird nach dem Anlegen oder Entfernen aktualisiert, sofern `update-desktop-database` verfügbar ist.
+- AppImage-Dateiauswahl akzeptiert sowohl `.AppImage` als auch `.appimage`.
 
 ## 0.1.47 – Snap-Katalog-Neuaufbau und Aktualisierungsstatus
 - Marker-Festschreibung vereinfacht: Sobald der Snap-Download-Worker erfolgreich fertig ist und sein Ergebnis zurückmeldet, wird der Einmal-Marker sofort gesetzt – ohne Prüfung von Trefferzahlen, Master-Katalog oder Channel-Dateien.
