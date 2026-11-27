@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QSize, QThread, Signal, QSettings, QTimer, QAbstr
 from PySide6.QtGui import QAction, QIcon, QPixmap, QImage, QPainter, QFont, QColor, QPen
 from PySide6.QtWidgets import *
 from shiboken6 import isValid
-VERSION="0.1.50"
+VERSION="0.1.51"
 
 
 def _desktop_user_account():
@@ -3035,7 +3035,7 @@ class Window(QMainWindow):
         """Collect concrete pending package names from each supported package manager."""
         results = {}
         checks = (
-            ("APT", ["apt-get", "--just-print", "upgrade"]),
+            ("APT", ["apt", "-s", "full-upgrade"]),
             ("Flatpak", ["flatpak", "remote-ls", "--updates", "--all"]),
             ("Snap", ["snap", "refresh", "--list"]),
         )
@@ -8359,7 +8359,7 @@ class Window(QMainWindow):
         # APT nennt bei der Upgrade-Simulation die Herkunft der Zielversion.
         # Debian-Sicherheitsquellen sind an security.debian.org bzw.
         # trixie-security/bookworm-security und Debian-Security erkennbar.
-        rc, simulation = cmd(["apt", "-s", "upgrade"])
+        rc, simulation = cmd(["apt", "-s", "full-upgrade"])
         if rc != 0:
             raise RuntimeError(simulation or "Sicherheitsaktualisierungen konnten nicht erkannt werden.")
         security_names = set()
@@ -8469,7 +8469,7 @@ class Window(QMainWindow):
             names = [line.split()[0].split("/", 1)[0] for line in packages]
             args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "--only-upgrade", "install", *names])
         else:
-            args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "upgrade"])
+            args = privileged(["apt", "-o", "APT::Status-Fd=2", "-y", "full-upgrade"])
         self.upgrade_stream = StreamJob(args)
         unpacked = set()
         configured = set()

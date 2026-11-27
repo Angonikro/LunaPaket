@@ -1,5 +1,10 @@
 # Änderungsprotokoll
 
+## 0.1.51 – APT-Update-Wächter und vollständige Systemaktualisierung
+- APT-Aufruf im Update-Wächter verwendet `apt` statt `apt-get` und prüft verfügbare Änderungen mit `apt -s full-upgrade`.
+- Die Systemaktualisierung führt `apt update` und anschließend `apt -y full-upgrade` aus, damit erforderliche Abhängigkeitswechsel berücksichtigt werden.
+- Keine weiteren Funktions- oder Oberflächenänderungen.
+
 ## 0.1.50 – Tray-Updatezähler nach Installation aktualisieren
 - Nach mindestens einer erfolgreich installierten APT-/Systemaktualisierung wird eine erneute Update-Wächter-Prüfung eingeplant.
 - Nach mindestens einer erfolgreich aktualisierten Snap-Anwendung wird der Update-Wächter erneut ausgeführt.
